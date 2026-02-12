@@ -62,24 +62,6 @@ void fused_gate_up_swiglu_kernel_cu_mixed(
     const tensor::Tensor& output,
     const CudaConfig* config = nullptr);
 
-/**
- * Batched version of Fused Gate-Up-SwiGLU for prefill
- * 
- * @param input: Input tensor [batch_size, M]
- * @param w1: Gate projection weight [K, M]
- * @param w3: Up projection weight [K, M]
- * @param output: Output tensor [batch_size, K]
- * @param batch_size: Number of tokens to process
- * @param config: CUDA configuration
- */
-void batched_fused_gate_up_swiglu_kernel_cu(
-    const tensor::Tensor& input,
-    const tensor::Tensor& w1,
-    const tensor::Tensor& w3,
-    const tensor::Tensor& output,
-    int32_t batch_size,
-    const CudaConfig* config = nullptr);
-
 }  // namespace kernel
 
 #endif  // FUSED_FFN_KERNEL_CU_CUH

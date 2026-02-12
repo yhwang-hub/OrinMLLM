@@ -5,13 +5,13 @@ namespace kernel {
 #if defined (LLAMA3_SUPPORT)
 __global__ void rope_kernel_cu_fp32(int pos, int dim, int kv_dim, int head_size,
                                     const float* input_q, const float* input_k,
-                                    const float* sin_cache, const float* cos_cache) {
+                                    const float* __restrict__ sin_cache, const float* __restrict__ cos_cache) {
   int idx = threadIdx.x + blockDim.x * blockIdx.x;
 
   int num_heads = dim / head_size;
   int head_pair_count = head_size / 2;
   int total_pairs = num_heads * head_pair_count;
-  if (idx > total_pairs) {
+  if (idx >= total_pairs) {
     return;
   }
 
@@ -39,11 +39,12 @@ __global__ void rope_kernel_cu_fp32(int pos, int dim, int kv_dim, int head_size,
 __global__ void sin_cos_calc(int head_size, int max_seq_len, float* sin_cache, float* cos_cache) {
   int idx = threadIdx.x + blockDim.x * blockIdx.x;
   int head_dim = idx % head_size;
+  // Pre-compute frequency outside the loop (loop-invariant)
+  float freq = 1.0f / powf(500000.0f, static_cast<float>(head_dim) / static_cast<float>(head_size));
   for (int pos = 0; pos < max_seq_len; ++pos) {
-    float freq = 1.0f / pow(500000.0f, static_cast<float>(head_dim) / static_cast<float>(head_size));
     float val = static_cast<float>(pos) * freq;
-    float fcr = cosf(val);
-    float fci = sinf(val);
+    float fci, fcr;
+    __sincosf(val, &fci, &fcr);
     *(sin_cache + pos * head_size + head_dim) = fci;
     *(cos_cache + pos * head_size + head_dim) = fcr;
   }
@@ -51,13 +52,13 @@ __global__ void sin_cos_calc(int head_size, int max_seq_len, float* sin_cache, f
 #elif defined (QWEN2_SUPPORT) || defined (QWEN3_SUPPORT)
 __global__ void rope_kernel_cu_fp32(int pos, int dim, int kv_dim, int head_size,
                                     const float* input_q, const float* input_k,
-                                    const float* sin_cache, const float* cos_cache) {
+                                    const float* __restrict__ sin_cache, const float* __restrict__ cos_cache) {
   int idx = threadIdx.x + blockDim.x * blockIdx.x;
 
   int num_heads = dim / head_size;
   int head_pair_count = head_size / 2;
   int total_pairs = num_heads * head_pair_count;
-  if (idx >= total_pairs) {  // Fixed: was > which caused out-of-bounds access
+  if (idx >= total_pairs) {
     return;
   }
 
@@ -85,11 +86,12 @@ __global__ void rope_kernel_cu_fp32(int pos, int dim, int kv_dim, int head_size,
 __global__ void sin_cos_calc(int head_size, int max_seq_len, float* sin_cache, float* cos_cache) {
   int idx = threadIdx.x + blockDim.x * blockIdx.x;
   int head_dim = idx % head_size;
+  // Pre-compute frequency outside the loop (loop-invariant)
+  float freq = 1.0f / powf(1000000.0f, static_cast<float>(head_dim) / static_cast<float>(head_size));
   for (int pos = 0; pos < max_seq_len; ++pos) {
-    float freq = 1.0f / pow(1000000.0f, static_cast<float>(head_dim) / static_cast<float>(head_size));
     float val = static_cast<float>(pos) * freq;
-    float fcr = cosf(val);
-    float fci = sinf(val);
+    float fci, fcr;
+    __sincosf(val, &fci, &fcr);
     *(sin_cache + pos * head_size + head_dim) = fci;
     *(cos_cache + pos * head_size + head_dim) = fcr;
   }
@@ -104,7 +106,7 @@ __device__ void rope_calc(float fcr, float fci, float* vec, int32_t idx) {
 
 __global__ void rope_kernel_cu_fp32(int pos, int dim, int kv_dim, int head_size,
                                     const float* input_q, const float* input_k,
-                                    const float* sin_cache, const float* cos_cache) {
+                                    const float* __restrict__ sin_cache, const float* __restrict__ cos_cache) {
   int idx = threadIdx.x + blockDim.x * blockIdx.x;
   idx = idx * 2;
   if (idx >= dim) {
@@ -125,12 +127,12 @@ __global__ void rope_kernel_cu_fp32(int pos, int dim, int kv_dim, int head_size,
 __global__ void sin_cos_calc(int head_size, int max_seq_len, float* sin_cache, float* cos_cache) {
   int idx = threadIdx.x + blockDim.x * blockIdx.x;
   int head_dim = idx % head_size;
+  // Pre-compute frequency outside the loop (loop-invariant)
+  float freq = 1.0f / powf(5000000.0f, static_cast<float>(head_dim) / static_cast<float>(head_size));
   for (int pos = 0; pos < max_seq_len; ++pos) {
-    // Qwen3-VL uses rope_theta = 5000000 (from config.json)
-    float freq = 1.0f / pow(5000000.0f, static_cast<float>(head_dim) / static_cast<float>(head_size));
     float val = static_cast<float>(pos) * freq;
-    float fcr = cosf(val);
-    float fci = sinf(val);
+    float fci, fcr;
+    __sincosf(val, &fci, &fcr);
     *(sin_cache + pos * head_size + head_dim) = fci;
     *(cos_cache + pos * head_size + head_dim) = fcr;
   }
@@ -210,13 +212,13 @@ void rope_kernel_cu(int32_t dim, int32_t kv_dim, int32_t head_size, const tensor
 // RoPE kernel that reads position from GPU memory (for CUDA Graph optimization)
 __global__ void rope_kernel_cu_fp32_gpu_pos(const int32_t* pos_ptr, int dim, int kv_dim, int head_size,
                                             const float* input_q, const float* input_k,
-                                            const float* sin_cache, const float* cos_cache) {
+                                            const float* __restrict__ sin_cache, const float* __restrict__ cos_cache) {
   int idx = threadIdx.x + blockDim.x * blockIdx.x;
 
   int num_heads = dim / head_size;
   int head_pair_count = head_size / 2;
   int total_pairs = num_heads * head_pair_count;
-  if (idx >= total_pairs) {  // Fixed: was > which caused out-of-bounds access
+  if (idx >= total_pairs) {
     return;
   }
   
@@ -265,7 +267,7 @@ void rope_kernel_cu_gpu_pos(int32_t dim, int32_t kv_dim, int32_t head_size,
 // FP16 RoPE kernel that reads position from GPU memory (for CUDA Graph optimization)
 __global__ void rope_kernel_cu_fp16_gpu_pos_impl(const int32_t* pos_ptr, int dim, int kv_dim, int head_size,
                                                   half* input_q, half* input_k,
-                                                  const float* sin_cache, const float* cos_cache) {
+                                                  const float* __restrict__ sin_cache, const float* __restrict__ cos_cache) {
   int idx = threadIdx.x + blockDim.x * blockIdx.x;
 
   int num_heads = dim / head_size;
@@ -324,7 +326,7 @@ void rope_kernel_cu_fp16_gpu_pos(int32_t dim, int32_t kv_dim, int32_t head_size,
 // Batched RoPE kernel for prefill phase
 __global__ void batched_rope_kernel_cu_fp32(int start_pos, int seq_len, int dim, int kv_dim, int head_size,
                                             float* input_q, float* input_k,
-                                            const float* sin_cache, const float* cos_cache) {
+                                            const float* __restrict__ sin_cache, const float* __restrict__ cos_cache) {
   // blockIdx.x: position in sequence
   // threadIdx.x + blockIdx.y * blockDim.x: head pair index
   int seq_idx = blockIdx.x;
@@ -426,7 +428,7 @@ void batched_rope_kernel_cu(int32_t start_pos, int32_t seq_len, int32_t dim, int
 // Note: sin/cos cache remains FP32 for precision, Q/K are FP16
 __global__ void rope_kernel_cu_fp16_impl(int pos, int dim, int kv_dim, int head_size,
                                           half* input_q, half* input_k,
-                                          const float* sin_cache, const float* cos_cache) {
+                                          const float* __restrict__ sin_cache, const float* __restrict__ cos_cache) {
   int idx = threadIdx.x + blockDim.x * blockIdx.x;
 
   int num_heads = dim / head_size;
@@ -461,7 +463,7 @@ __global__ void rope_kernel_cu_fp16_impl(int pos, int dim, int kv_dim, int head_
 // Batched pure FP16 RoPE kernel for prefill phase
 __global__ void batched_rope_kernel_cu_fp16_impl(int start_pos, int seq_len, int dim, int kv_dim, int head_size,
                                                   half* input_q, half* input_k,
-                                                  const float* sin_cache, const float* cos_cache) {
+                                                  const float* __restrict__ sin_cache, const float* __restrict__ cos_cache) {
   int seq_idx = blockIdx.x;
   if (seq_idx >= seq_len) {
     return;
@@ -506,61 +508,6 @@ __global__ void batched_rope_kernel_cu_fp16_impl(int start_pos, int seq_len, int
   }
 }
 
-void rope_kernel_cu_pure_fp16(int32_t dim, int32_t kv_dim, int32_t head_size, 
-                               const tensor::Tensor& input_q, const tensor::Tensor& input_k, 
-                               int32_t pos, const tensor::Tensor& sin_cache, 
-                               const tensor::Tensor& cos_cache, void* stream) {
-  CHECK(input_q.data_type() == base::DataType::kDataTypeFp16);
-  CHECK(input_k.data_type() == base::DataType::kDataTypeFp16);
-  
-  int threads = 128;
-  int blocks = (dim + threads - 1) / threads;
-  
-  half* q_ptr = reinterpret_cast<half*>(const_cast<uint16_t*>(input_q.ptr<uint16_t>()));
-  half* k_ptr = reinterpret_cast<half*>(const_cast<uint16_t*>(input_k.ptr<uint16_t>()));
-  
-  if (stream) {
-    cudaStream_t stream_ = static_cast<cudaStream_t>(stream);
-    rope_kernel_cu_fp16_impl<<<blocks, threads, 0, stream_>>>(
-        pos, dim, kv_dim, head_size, q_ptr, k_ptr,
-        sin_cache.ptr<float>(), cos_cache.ptr<float>());
-  } else {
-    rope_kernel_cu_fp16_impl<<<blocks, threads>>>(
-        pos, dim, kv_dim, head_size, q_ptr, k_ptr,
-        sin_cache.ptr<float>(), cos_cache.ptr<float>());
-  }
-}
-
-void batched_rope_kernel_cu_pure_fp16(int32_t start_pos, int32_t seq_len, int32_t dim, int32_t kv_dim,
-                                       int32_t head_size, const tensor::Tensor& input_q,
-                                       const tensor::Tensor& input_k, const tensor::Tensor& sin_cache,
-                                       const tensor::Tensor& cos_cache, void* stream) {
-  CHECK(input_q.data_type() == base::DataType::kDataTypeFp16);
-  CHECK(input_k.data_type() == base::DataType::kDataTypeFp16);
-  
-  int num_heads = dim / head_size;
-  int head_pair_count = head_size / 2;
-  int total_pairs = num_heads * head_pair_count;
-  
-  int threads = 128;
-  int blocks_y = (total_pairs + threads - 1) / threads;
-  dim3 grid(seq_len, blocks_y);
-  
-  half* q_ptr = reinterpret_cast<half*>(const_cast<uint16_t*>(input_q.ptr<uint16_t>()));
-  half* k_ptr = reinterpret_cast<half*>(const_cast<uint16_t*>(input_k.ptr<uint16_t>()));
-  
-  if (stream) {
-    cudaStream_t stream_ = static_cast<cudaStream_t>(stream);
-    batched_rope_kernel_cu_fp16_impl<<<grid, threads, 0, stream_>>>(
-        start_pos, seq_len, dim, kv_dim, head_size, q_ptr, k_ptr,
-        sin_cache.ptr<float>(), cos_cache.ptr<float>());
-  } else {
-    batched_rope_kernel_cu_fp16_impl<<<grid, threads>>>(
-        start_pos, seq_len, dim, kv_dim, head_size, q_ptr, k_ptr,
-        sin_cache.ptr<float>(), cos_cache.ptr<float>());
-  }
-}
-
 // ==================== M-RoPE (Multimodal RoPE) Implementation ====================
 // M-RoPE uses 3D position encoding: (temporal, height, width)
 // mrope_section = [24, 20, 20] for Qwen3-VL (head_size=128)
@@ -600,7 +547,7 @@ __global__ void mrope_kernel_cu_fp16_impl(
     int dim, int kv_dim, int head_size,
     int section0, int section1, int section2,
     half* input_q, half* input_k,
-    const float* sin_cache, const float* cos_cache) {
+    const float* __restrict__ sin_cache, const float* __restrict__ cos_cache) {
   
   int idx = threadIdx.x + blockDim.x * blockIdx.x;
   
@@ -624,9 +571,6 @@ __global__ void mrope_kernel_cu_fp16_impl(
   int v1_idx = i + d1;
   
   // Convert section pair counts to dimension thresholds
-  // section0=24 pairs -> dims [0, 48) use T, dims [64, 112) also map to same freq range
-  // section1=20 pairs -> dims [48, 88) use H
-  // section2=20 pairs -> dims [88, 128) use W
   int dim_threshold0 = section0 * 2;  // 48
   int dim_threshold1 = dim_threshold0 + section1 * 2;  // 88
   
@@ -635,27 +579,24 @@ __global__ void mrope_kernel_cu_fp16_impl(
   if (d0 < dim_threshold0) {
     pos0 = pos_t;  // dims [0, 48)
   } else if (d0 < dim_threshold1) {
-    pos0 = pos_h;  // dims [48, 88) - but d0 only goes to 63, so this won't happen
+    pos0 = pos_h;
   } else {
-    pos0 = pos_w;  // dims [88, 128) - but d0 only goes to 63, so this won't happen
+    pos0 = pos_w;
   }
   
   // Determine position for d1 based on which section it falls in
   int pos1;
   if (d1 < dim_threshold0) {
-    pos1 = pos_t;  // dims [0, 48) - but d1 starts at 64, so this won't happen
+    pos1 = pos_t;
   } else if (d1 < dim_threshold1) {
-    pos1 = pos_h;  // dims [64, 88) - d1 in [64, 88) means pair_idx in [0, 24)
+    pos1 = pos_h;  // dims [64, 88)
   } else {
-    pos1 = pos_w;  // dims [88, 128) - d1 in [88, 128) means pair_idx in [24, 64)
+    pos1 = pos_w;  // dims [88, 128)
   }
   
-  // For HuggingFace MRoPE, both dimensions in a pair use the SAME frequency
-  // (due to cat((freqs, freqs), dim=-1)), but different positions
-  // Frequency index is pair_idx * 2 (matching standard RoPE cache layout)
   int freq_idx = pair_idx * 2;
   
-  // Look up sin/cos for each dimension using the frequency but different positions
+  // Look up sin/cos for each pair using frequency but different positions
   float sin0 = sin_cache[pos0 * head_size + freq_idx];
   float cos0 = cos_cache[pos0 * head_size + freq_idx];
   float sin1 = sin_cache[pos1 * head_size + freq_idx];
@@ -736,7 +677,7 @@ __global__ void batched_mrope_kernel_cu_fp16_impl(
     int section0, int section1, int section2,
     const int32_t* pos_t_arr, const int32_t* pos_h_arr, const int32_t* pos_w_arr,
     half* input_q, half* input_k,
-    const float* sin_cache, const float* cos_cache) {
+    const float* __restrict__ sin_cache, const float* __restrict__ cos_cache) {
   
   // Grid: (seq_len, blocks_for_pairs)
   int seq_idx = blockIdx.x;
@@ -873,7 +814,7 @@ __global__ void mrope_kernel_cu_fp16_gpu_pos_impl(
     int dim, int kv_dim, int head_size,
     int section0, int section1, int section2,
     half* input_q, half* input_k,
-    const float* sin_cache, const float* cos_cache) {
+    const float* __restrict__ sin_cache, const float* __restrict__ cos_cache) {
   
   int pos = pos_ptr[0];  // Read position from GPU memory
   

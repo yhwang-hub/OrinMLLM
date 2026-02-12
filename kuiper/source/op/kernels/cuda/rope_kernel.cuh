@@ -27,18 +27,6 @@ void batched_rope_kernel_cu(int32_t start_pos, int32_t seq_len, int32_t dim, int
                             const tensor::Tensor& input_k, const tensor::Tensor& sin_cache,
                             const tensor::Tensor& cos_cache, void* stream);
 
-// Pure FP16 RoPE kernel
-void rope_kernel_cu_pure_fp16(int32_t dim, int32_t kv_dim, int32_t head_size, 
-                               const tensor::Tensor& input_q, const tensor::Tensor& input_k, 
-                               int32_t pos, const tensor::Tensor& sin_cache, 
-                               const tensor::Tensor& cos_cache, void* stream);
-
-// Batched pure FP16 RoPE for prefill phase
-void batched_rope_kernel_cu_pure_fp16(int32_t start_pos, int32_t seq_len, int32_t dim, int32_t kv_dim,
-                                       int32_t head_size, const tensor::Tensor& input_q,
-                                       const tensor::Tensor& input_k, const tensor::Tensor& sin_cache,
-                                       const tensor::Tensor& cos_cache, void* stream);
-
 // ==================== M-RoPE (Multimodal RoPE) ====================
 // M-RoPE uses 3D position encoding: (temporal, height, width)
 // mrope_section = [24, 20, 20] for Qwen3-VL (head_size=128)

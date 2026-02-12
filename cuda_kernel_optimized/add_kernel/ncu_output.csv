@@ -1,0 +1,11 @@
+==PROF== Connected to process 3637619 (/mnt/ssd/workspace/OrinMLLM/cuda_kernel_optimized/bench_add)
+=== Running ORIGINAL kernels ===
+=== Running OPTIMIZED kernels ===
+=== All kernels completed ===
+==PROF== Disconnected from process 3637619
+==WARNING== No kernels were profiled.
+Available Kernels:
+1. add_kernel_cu_fp16_impl
+2. add_kernel_cu_fp32
+3. add_vec_fp16_kernel
+4. broadcast_add_bias_fp16_kernel

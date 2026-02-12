@@ -1,0 +1,44 @@
+==PROF== Connected to process 127921 (/mnt/ssd/workspace/OrinMLLM/cuda_kernel_optimized/swiglu_kernel/bench_swiglu)
+=== SwiGLU Kernel Benchmark on Orin (SM 8.7) ===
+
+FP32 Qwen2.5-7B decode (size=18944):
+  Original: avg=6805.81 us, min=69.89 us, max=1324552.50 us  [blocks=148, threads=128, shmem=1024]
+  Optimized: avg=58.96 us, min=51.52 us, max=84.42 us  [blocks=19, threads=256, shmem=0]
+  Speedup: 115.42x
+
+FP32 Qwen3-8B decode (size=12288):
+  Original: avg=51.52 us, min=47.49 us, max=72.64 us  [blocks=96, threads=128, shmem=1024]
+  Optimized: avg=50.63 us, min=46.40 us, max=62.53 us  [blocks=12, threads=256, shmem=0]
+  Speedup: 1.02x
+
+FP16 Qwen2.5-7B decode (size=18944):
+  Original: avg=50.69 us, min=46.62 us, max=64.19 us  [blocks=37, threads=256]
+  Optimized: avg=50.68 us, min=46.21 us, max=62.53 us  [blocks=10, threads=256]
+  Speedup: 1.00x
+
+FP16 Qwen3-8B decode (size=12288):
+  Original: avg=50.90 us, min=47.04 us, max=67.49 us  [blocks=24, threads=256]
+  Optimized: avg=50.43 us, min=46.11 us, max=64.54 us  [blocks=6, threads=256]
+  Speedup: 1.01x
+
+FP32 Qwen2.5-7B prefill-128 (size=2424832):
+  Original: avg=482.90 us, min=479.74 us, max=512.61 us  [blocks=18944, threads=128, shmem=1024]
+  Optimized: avg=202.55 us, min=199.49 us, max=261.25 us  [blocks=2368, threads=256, shmem=0]
+  Speedup: 2.38x
+
+FP32 Qwen3-8B prefill-128 (size=1572864):
+  Original: avg=329.96 us, min=326.82 us, max=355.39 us  [blocks=12288, threads=128, shmem=1024]
+  Optimized: avg=326.04 us, min=322.14 us, max=370.34 us  [blocks=1536, threads=256, shmem=0]
+  Speedup: 1.01x
+
+FP16 Qwen2.5-7B prefill-128 (size=2424832):
+  Original: avg=266.92 us, min=261.60 us, max=344.93 us  [blocks=4736, threads=256]
+  Optimized: avg=261.47 us, min=256.93 us, max=314.94 us  [blocks=1184, threads=256]
+  Speedup: 1.02x
+
+FP16 Qwen3-8B prefill-128 (size=1572864):
+  Original: avg=189.21 us, min=184.70 us, max=221.86 us  [blocks=3072, threads=256]
+  Optimized: avg=183.75 us, min=181.28 us, max=262.21 us  [blocks=768, threads=256]
+  Speedup: 1.03x
+
+=== Benchmark Complete ===

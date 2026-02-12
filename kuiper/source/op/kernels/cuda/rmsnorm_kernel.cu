@@ -1,244 +1,424 @@
 #include <device_launch_parameters.h>
-#include <cub/block/block_reduce.cuh>
 #include <cuda_fp16.h>
 #include "rmsnorm_kernel.cuh"
+
 namespace kernel {
 
-/**
- * FP16 weight RMSNorm kernel (FP32 input × FP16 weight → FP32 output)
- * weight is FP16, input/output are FP32
- */
+// =======================================================================
+// Optimized warp-shuffle based block reduction
+// Replaces cub::BlockReduce: lower latency, less shared memory,
+// fewer __syncthreads calls
+// =======================================================================
+
+__device__ __forceinline__ float warp_reduce_sum(float val) {
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1)
+    val += __shfl_down_sync(0xffffffff, val, offset);
+  return val;
+}
+
+// Block-level sum reduction with broadcast to all threads
+// Uses only NUM_WARPS * 4 bytes shared memory (vs ~512 bytes for cub)
+template <int BLOCK_SIZE>
+__device__ __forceinline__ float block_reduce_sum(float val) {
+  static_assert(BLOCK_SIZE % 32 == 0, "BLOCK_SIZE must be multiple of 32");
+  constexpr int NUM_WARPS = BLOCK_SIZE / 32;
+  __shared__ float smem_reduce[NUM_WARPS];
+
+  const int lane = threadIdx.x & 31;
+  const int wid = threadIdx.x >> 5;
+
+  // Intra-warp reduction via shuffle
+  val = warp_reduce_sum(val);
+
+  // Store each warp's partial sum
+  if (lane == 0) smem_reduce[wid] = val;
+  __syncthreads();
+
+  // First warp reduces all partial sums
+  val = (threadIdx.x < NUM_WARPS) ? smem_reduce[threadIdx.x] : 0.0f;
+  if (wid == 0) val = warp_reduce_sum(val);
+
+  // Broadcast final result to all threads
+  if (threadIdx.x == 0) smem_reduce[0] = val;
+  __syncthreads();
+  return smem_reduce[0];
+}
+
+// =======================================================================
+// row_rmsnorm_f32_fp16w: FP32 input × FP16 weight → FP32 output (1 row)
+// Optimizations: warp shuffle, uint2 vectorized FP16 weight load,
+//                __ldg for read-only weight, __restrict__, #pragma unroll
+// =======================================================================
 template <int32_t BLOCK_DIM>
-static __global__ void row_rmsnorm_f32_fp16w(float* in, const half* wei, float* out, int size, float eps) {
+static __global__ void row_rmsnorm_f32_fp16w(float* __restrict__ in,
+                                              const half* __restrict__ wei,
+                                              float* __restrict__ out,
+                                              int size, float eps) {
   const int tid = threadIdx.x;
+  const int pack_num = size >> 2;
+  const int pack_off = pack_num << 2;
 
-  constexpr int pack_size = 4;
-  const int pack_num = size / pack_size;
-  const int pack_off = pack_size * pack_num;
-
+  // Phase 1: Sum of squares with float4 vectorized loads
   float sum = 0.0f;
-  float4* in_pack = reinterpret_cast<float4*>(in);
-  for (int i = tid; i < pack_num; i += blockDim.x) {
-    float4 in_float4 = *(in_pack + i);
-    sum += in_float4.x * in_float4.x;
-    sum += in_float4.y * in_float4.y;
-    sum += in_float4.z * in_float4.z;
-    sum += in_float4.w * in_float4.w;
+  const float4* in_pack = reinterpret_cast<const float4*>(in);
+
+#pragma unroll 4
+  for (int i = tid; i < pack_num; i += BLOCK_DIM) {
+    float4 v = in_pack[i];
+    sum += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+  }
+  for (int i = pack_off + tid; i < size; i += BLOCK_DIM) {
+    float v = in[i];
+    sum += v * v;
   }
 
-  for (int i = pack_off + tid; i < size; i += blockDim.x) {
-    sum += in[i] * in[i];
-  }
-
-  using BlockReduce = cub::BlockReduce<float, BLOCK_DIM>;
-  __shared__ typename BlockReduce::TempStorage temp;
-  __shared__ float shared_val;
-  sum = BlockReduce(temp).Sum(sum);
-  if (threadIdx.x == 0) {
-    shared_val = sum;
-  }
-  __syncthreads();
-  sum = shared_val;
+  // Phase 2: Warp-shuffle block reduction
+  sum = block_reduce_sum<BLOCK_DIM>(sum);
   const float scale = rsqrtf(sum / static_cast<float>(size) + eps);
 
-  // Load FP16 weight and convert to FP32 for computation
-  // Pack 4 half values as 2 half2 for each float4 output
+  // Phase 3: Normalize and scale with vectorized FP16 weight load
   float4* out_pack = reinterpret_cast<float4*>(out);
-  
-  for (int i = tid; i < pack_num; i += blockDim.x) {
-    float4 in_float4 = *(in_pack + i);
-    // Load 4 consecutive half values
-    int base_idx = i * 4;
-    float w0 = __half2float(wei[base_idx]);
-    float w1 = __half2float(wei[base_idx + 1]);
-    float w2 = __half2float(wei[base_idx + 2]);
-    float w3 = __half2float(wei[base_idx + 3]);
-    
-    *(out_pack + i) =
-        make_float4(scale * in_float4.x * w0, scale * in_float4.y * w1,
-                    scale * in_float4.z * w2, scale * in_float4.w * w3);
-  }
+  const uint2* wei_u2 = reinterpret_cast<const uint2*>(wei);
 
-  for (int i = pack_off + tid; i < size; i += blockDim.x) {
-    out[i] = __half2float(wei[i]) * in[i] * scale;
+#pragma unroll 4
+  for (int i = tid; i < pack_num; i += BLOCK_DIM) {
+    float4 v = in_pack[i];
+    // Load 4 half weights as one 64-bit load via __ldg
+    uint2 w_raw = __ldg(wei_u2 + i);
+    float2 fw01 = __half22float2(*reinterpret_cast<const half2*>(&w_raw.x));
+    float2 fw23 = __half22float2(*reinterpret_cast<const half2*>(&w_raw.y));
+
+    out_pack[i] = make_float4(scale * v.x * fw01.x, scale * v.y * fw01.y,
+                               scale * v.z * fw23.x, scale * v.w * fw23.y);
+  }
+  for (int i = pack_off + tid; i < size; i += BLOCK_DIM) {
+    out[i] = __half2float(__ldg(wei + i)) * in[i] * scale;
   }
 }
 
-/**
- * FP16 weight RMSNorm kernel for multi-dim input
- */
-static __global__ void row_rmsnorm_f32_fp16w_dim(float* in, const half* wei, float* out, int dim_size,
-                                                  int size, float eps) {
+// =======================================================================
+// row_rmsnorm_f32_fp16w_dim: FP32 input × FP16 weight → FP32 output (batched)
+// =======================================================================
+template <int32_t BLOCK_DIM>
+static __global__ void row_rmsnorm_f32_fp16w_dim(float* __restrict__ in,
+                                                  const half* __restrict__ wei,
+                                                  float* __restrict__ out,
+                                                  int dim_size, int size, float eps) {
   const int bid = blockIdx.x;
   const int tid = threadIdx.x;
-  if (bid >= dim_size) {
-    return;
-  }
+  if (bid >= dim_size) return;
 
   float* block_in = in + bid * size;
   float* block_out = out + bid * size;
-  constexpr int pack_size = 4;
-  const int pack_num = size / pack_size;
-  const int pack_off = pack_size * pack_num;
+  const int pack_num = size >> 2;
+  const int pack_off = pack_num << 2;
 
   float sum = 0.0f;
-  float4* in_pack = reinterpret_cast<float4*>(block_in);
-  for (int i = tid; i < pack_num; i += blockDim.x) {
-    float4 in_float4 = *(in_pack + i);
-    sum += in_float4.x * in_float4.x;
-    sum += in_float4.y * in_float4.y;
-    sum += in_float4.z * in_float4.z;
-    sum += in_float4.w * in_float4.w;
-  }
+  const float4* in_pack = reinterpret_cast<const float4*>(block_in);
 
-  for (int i = pack_off + tid; i < size; i += blockDim.x) {
+#pragma unroll 4
+  for (int i = tid; i < pack_num; i += BLOCK_DIM) {
+    float4 v = in_pack[i];
+    sum += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+  }
+  for (int i = pack_off + tid; i < size; i += BLOCK_DIM) {
     sum += block_in[i] * block_in[i];
   }
 
-  using BlockReduce = cub::BlockReduce<float, 128>;
-  __shared__ typename BlockReduce::TempStorage temp;
-  __shared__ float shared_val;
-  sum = BlockReduce(temp).Sum(sum);
-  if (threadIdx.x == 0) {
-    shared_val = sum;
-  }
-  __syncthreads();
-  sum = shared_val;
+  sum = block_reduce_sum<BLOCK_DIM>(sum);
   const float scale = rsqrtf(sum / static_cast<float>(size) + eps);
 
   float4* out_pack = reinterpret_cast<float4*>(block_out);
-  for (int i = tid; i < pack_num; i += blockDim.x) {
-    float4 in_float4 = *(in_pack + i);
-    // Load 4 consecutive half values
-    int base_idx = i * 4;
-    float w0 = __half2float(wei[base_idx]);
-    float w1 = __half2float(wei[base_idx + 1]);
-    float w2 = __half2float(wei[base_idx + 2]);
-    float w3 = __half2float(wei[base_idx + 3]);
-    
-    *(out_pack + i) =
-        make_float4(scale * in_float4.x * w0, scale * in_float4.y * w1,
-                    scale * in_float4.z * w2, scale * in_float4.w * w3);
-  }
+  const uint2* wei_u2 = reinterpret_cast<const uint2*>(wei);
 
-  for (int i = pack_off + tid; i < size; i += blockDim.x) {
-    block_out[i] = __half2float(wei[i]) * block_in[i] * scale;
+#pragma unroll 4
+  for (int i = tid; i < pack_num; i += BLOCK_DIM) {
+    float4 v = in_pack[i];
+    uint2 w_raw = __ldg(wei_u2 + i);
+    float2 fw01 = __half22float2(*reinterpret_cast<const half2*>(&w_raw.x));
+    float2 fw23 = __half22float2(*reinterpret_cast<const half2*>(&w_raw.y));
+
+    out_pack[i] = make_float4(scale * v.x * fw01.x, scale * v.y * fw01.y,
+                               scale * v.z * fw23.x, scale * v.w * fw23.y);
+  }
+  for (int i = pack_off + tid; i < size; i += BLOCK_DIM) {
+    block_out[i] = __half2float(__ldg(wei + i)) * block_in[i] * scale;
   }
 }
 
-/**
- * 计算多维输入 in = (dim1, dim2), 计算在dim2维度上的rmsnorm
- */
-static __global__ void row_rmsnorm_f32_dim(float* in, float* wei, float* out, int dim_size,
-                                           int size, float eps) {
+// =======================================================================
+// row_rmsnorm_f32_dim: FP32 input × FP32 weight → FP32 output (batched)
+// =======================================================================
+template <int32_t BLOCK_DIM>
+static __global__ void row_rmsnorm_f32_dim(float* __restrict__ in,
+                                            float* __restrict__ wei,
+                                            float* __restrict__ out,
+                                            int dim_size, int size, float eps) {
   const int bid = blockIdx.x;
   const int tid = threadIdx.x;
-  if (bid >= dim_size) {
-    return;
-  }
+  if (bid >= dim_size) return;
 
   float* block_in = in + bid * size;
   float* block_out = out + bid * size;
-  constexpr int pack_size = 4;
-  const int pack_num = size / pack_size;
-  const int pack_off = pack_size * pack_num;
+  const int pack_num = size >> 2;
+  const int pack_off = pack_num << 2;
 
   float sum = 0.0f;
-  float4* in_pack = reinterpret_cast<float4*>(block_in);
-  for (int i = tid; i < pack_num; i += blockDim.x) {
-    float4 in_float4 = *(in_pack + i);
-    sum += in_float4.x * in_float4.x;
-    sum += in_float4.y * in_float4.y;
-    sum += in_float4.z * in_float4.z;
-    sum += in_float4.w * in_float4.w;
-  }
+  const float4* in_pack = reinterpret_cast<const float4*>(block_in);
 
-  for (int i = pack_off + tid; i < size; i += blockDim.x) {
+#pragma unroll 4
+  for (int i = tid; i < pack_num; i += BLOCK_DIM) {
+    float4 v = in_pack[i];
+    sum += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+  }
+  for (int i = pack_off + tid; i < size; i += BLOCK_DIM) {
     sum += block_in[i] * block_in[i];
   }
 
-  using BlockReduce = cub::BlockReduce<float, 128>;
-  __shared__ typename BlockReduce::TempStorage temp;
-  __shared__ float shared_val;
-  sum = BlockReduce(temp).Sum(sum);
-  if (threadIdx.x == 0) {
-    shared_val = sum;
-  }
-  __syncthreads();
-  sum = shared_val;
+  sum = block_reduce_sum<BLOCK_DIM>(sum);
   const float scale = rsqrtf(sum / static_cast<float>(size) + eps);
 
-  float4* wei_pack = reinterpret_cast<float4*>(wei);
+  const float4* wei_pack = reinterpret_cast<const float4*>(wei);
   float4* out_pack = reinterpret_cast<float4*>(block_out);
-  for (int i = tid; i < pack_num; i += blockDim.x) {
-    float4 in_float4 = *(in_pack + i);
-    float4 wei_float4 = *(wei_pack + i);
-    *(out_pack + i) =
-        make_float4(scale * in_float4.x * wei_float4.x, scale * in_float4.y * wei_float4.y,
-                    scale * in_float4.z * wei_float4.z, scale * in_float4.w * wei_float4.w);
-  }
 
-  for (int i = pack_off + tid; i < size; i += blockDim.x) {
+#pragma unroll 4
+  for (int i = tid; i < pack_num; i += BLOCK_DIM) {
+    float4 v = in_pack[i];
+    float4 w = __ldg(wei_pack + i);
+    out_pack[i] = make_float4(scale * v.x * w.x, scale * v.y * w.y,
+                               scale * v.z * w.z, scale * v.w * w.w);
+  }
+  for (int i = pack_off + tid; i < size; i += BLOCK_DIM) {
     block_out[i] = wei[i] * block_in[i] * scale;
   }
 }
 
+// =======================================================================
+// row_rmsnorm_f32: FP32 input × FP32 weight → FP32 output (single row)
+// =======================================================================
 template <int32_t BLOCK_DIM>
-static __global__ void row_rmsnorm_f32(float* in, float* wei, float* out, int size, float eps) {
+static __global__ void row_rmsnorm_f32(float* __restrict__ in,
+                                        float* __restrict__ wei,
+                                        float* __restrict__ out,
+                                        int size, float eps) {
   const int tid = threadIdx.x;
-
-  constexpr int pack_size = 4;
-  const int pack_num = size / pack_size;
-  const int pack_off = pack_size * pack_num;
+  const int pack_num = size >> 2;
+  const int pack_off = pack_num << 2;
 
   float sum = 0.0f;
-  float4* in_pack = reinterpret_cast<float4*>(in);
-  for (int i = tid; i < pack_num; i += blockDim.x) {
-    float4 in_float4 = *(in_pack + i);
-    sum += in_float4.x * in_float4.x;
-    sum += in_float4.y * in_float4.y;
-    sum += in_float4.z * in_float4.z;
-    sum += in_float4.w * in_float4.w;
-  }
+  const float4* in_pack = reinterpret_cast<const float4*>(in);
 
-  for (int i = pack_off + tid; i < size; i += blockDim.x) {
+#pragma unroll 4
+  for (int i = tid; i < pack_num; i += BLOCK_DIM) {
+    float4 v = in_pack[i];
+    sum += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+  }
+  for (int i = pack_off + tid; i < size; i += BLOCK_DIM) {
     sum += in[i] * in[i];
   }
 
-  using BlockReduce = cub::BlockReduce<float, BLOCK_DIM>;
-  __shared__ typename BlockReduce::TempStorage temp;
-  __shared__ float shared_val;
-  sum = BlockReduce(temp).Sum(sum);
-  if (threadIdx.x == 0) {
-    shared_val = sum;
-  }
-  __syncthreads();
-  sum = shared_val;
+  sum = block_reduce_sum<BLOCK_DIM>(sum);
   const float scale = rsqrtf(sum / static_cast<float>(size) + eps);
 
-  float4* wei_pack = reinterpret_cast<float4*>(wei);
+  const float4* wei_pack = reinterpret_cast<const float4*>(wei);
   float4* out_pack = reinterpret_cast<float4*>(out);
-  for (int i = tid; i < pack_num; i += blockDim.x) {
-    float4 in_float4 = *(in_pack + i);
-    float4 wei_float4 = *(wei_pack + i);
-    *(out_pack + i) =
-        make_float4(scale * in_float4.x * wei_float4.x, scale * in_float4.y * wei_float4.y,
-                    scale * in_float4.z * wei_float4.z, scale * in_float4.w * wei_float4.w);
-  }
 
-  for (int i = pack_off + tid; i < size; i += blockDim.x) {
+#pragma unroll 4
+  for (int i = tid; i < pack_num; i += BLOCK_DIM) {
+    float4 v = in_pack[i];
+    float4 w = __ldg(wei_pack + i);
+    out_pack[i] = make_float4(scale * v.x * w.x, scale * v.y * w.y,
+                               scale * v.z * w.z, scale * v.w * w.w);
+  }
+  for (int i = pack_off + tid; i < size; i += BLOCK_DIM) {
     out[i] = wei[i] * in[i] * scale;
   }
 }
 
-// Forward declarations for pure FP16 RMSNorm kernels
+// =======================================================================
+// row_rmsnorm_pure_fp16: Pure FP16 (single row)
+// Key optimization: 128-bit vectorized loads (uint4 = 8 halfs per load)
+// for maximum memory bandwidth on Orin
+// =======================================================================
 template <int32_t BLOCK_DIM>
-static __global__ void row_rmsnorm_pure_fp16(const half* in, const half* wei, half* out, 
-                                              int size, float eps);
+static __global__ void row_rmsnorm_pure_fp16(const half* __restrict__ in,
+                                              const half* __restrict__ wei,
+                                              half* __restrict__ out,
+                                              int size, float eps) {
+  const int tid = threadIdx.x;
 
+  // Phase 1: Sum of squares with 128-bit vectorized loads
+  const int num_vec8 = size >> 3;  // size / 8
+  const int vec8_off = num_vec8 << 3;
+  const uint4* in_vec = reinterpret_cast<const uint4*>(in);
+
+  float sum = 0.0f;
+
+#pragma unroll 2
+  for (int i = tid; i < num_vec8; i += BLOCK_DIM) {
+    uint4 raw = in_vec[i];
+    float2 f0 = __half22float2(*reinterpret_cast<const half2*>(&raw.x));
+    float2 f1 = __half22float2(*reinterpret_cast<const half2*>(&raw.y));
+    float2 f2 = __half22float2(*reinterpret_cast<const half2*>(&raw.z));
+    float2 f3 = __half22float2(*reinterpret_cast<const half2*>(&raw.w));
+    sum += f0.x * f0.x + f0.y * f0.y + f1.x * f1.x + f1.y * f1.y +
+           f2.x * f2.x + f2.y * f2.y + f3.x * f3.x + f3.y * f3.y;
+  }
+  // half2 remainder
+  const int num_h2 = size >> 1;
+  const half2* in_h2 = reinterpret_cast<const half2*>(in);
+  for (int i = (vec8_off >> 1) + tid; i < num_h2; i += BLOCK_DIM) {
+    float2 fv = __half22float2(in_h2[i]);
+    sum += fv.x * fv.x + fv.y * fv.y;
+  }
+  // Scalar remainder
+  for (int i = (num_h2 << 1) + tid; i < size; i += BLOCK_DIM) {
+    float v = __half2float(in[i]);
+    sum += v * v;
+  }
+
+  // Phase 2: Warp-shuffle reduction
+  sum = block_reduce_sum<BLOCK_DIM>(sum);
+  const float scale = rsqrtf(sum / static_cast<float>(size) + eps);
+
+  // Phase 3: Normalize with 128-bit vectorized stores
+  const uint4* wei_vec = reinterpret_cast<const uint4*>(wei);
+  uint4* out_vec = reinterpret_cast<uint4*>(out);
+
+#pragma unroll 2
+  for (int i = tid; i < num_vec8; i += BLOCK_DIM) {
+    uint4 in_raw = in_vec[i];
+    uint4 w_raw = __ldg(wei_vec + i);
+
+    float2 fi0 = __half22float2(*reinterpret_cast<const half2*>(&in_raw.x));
+    float2 fi1 = __half22float2(*reinterpret_cast<const half2*>(&in_raw.y));
+    float2 fi2 = __half22float2(*reinterpret_cast<const half2*>(&in_raw.z));
+    float2 fi3 = __half22float2(*reinterpret_cast<const half2*>(&in_raw.w));
+    float2 fw0 = __half22float2(*reinterpret_cast<const half2*>(&w_raw.x));
+    float2 fw1 = __half22float2(*reinterpret_cast<const half2*>(&w_raw.y));
+    float2 fw2 = __half22float2(*reinterpret_cast<const half2*>(&w_raw.z));
+    float2 fw3 = __half22float2(*reinterpret_cast<const half2*>(&w_raw.w));
+
+    half2 r0 = __float22half2_rn(make_float2(scale * fi0.x * fw0.x, scale * fi0.y * fw0.y));
+    half2 r1 = __float22half2_rn(make_float2(scale * fi1.x * fw1.x, scale * fi1.y * fw1.y));
+    half2 r2 = __float22half2_rn(make_float2(scale * fi2.x * fw2.x, scale * fi2.y * fw2.y));
+    half2 r3 = __float22half2_rn(make_float2(scale * fi3.x * fw3.x, scale * fi3.y * fw3.y));
+
+    uint4 result;
+    result.x = *reinterpret_cast<const unsigned int*>(&r0);
+    result.y = *reinterpret_cast<const unsigned int*>(&r1);
+    result.z = *reinterpret_cast<const unsigned int*>(&r2);
+    result.w = *reinterpret_cast<const unsigned int*>(&r3);
+    out_vec[i] = result;
+  }
+  // half2 remainder
+  const half2* wei_h2 = reinterpret_cast<const half2*>(wei);
+  half2* out_h2 = reinterpret_cast<half2*>(out);
+  for (int i = (vec8_off >> 1) + tid; i < num_h2; i += BLOCK_DIM) {
+    float2 fv = __half22float2(in_h2[i]);
+    float2 fw = __half22float2(__ldg(wei_h2 + i));
+    out_h2[i] = __float22half2_rn(make_float2(scale * fv.x * fw.x, scale * fv.y * fw.y));
+  }
+  for (int i = (num_h2 << 1) + tid; i < size; i += BLOCK_DIM) {
+    out[i] = __float2half(scale * __half2float(in[i]) * __half2float(__ldg(wei + i)));
+  }
+}
+
+// =======================================================================
+// row_rmsnorm_pure_fp16_dim: Pure FP16 (batched, prefill path)
+// 128-bit vectorized loads for maximum throughput
+// =======================================================================
 template <int32_t BLOCK_DIM>
-static __global__ void row_rmsnorm_pure_fp16_dim(const half* in, const half* wei, half* out, 
-                                                  int dim_size, int size, float eps);
+static __global__ void row_rmsnorm_pure_fp16_dim(const half* __restrict__ in,
+                                                  const half* __restrict__ wei,
+                                                  half* __restrict__ out,
+                                                  int dim_size, int size, float eps) {
+  const int bid = blockIdx.x;
+  const int tid = threadIdx.x;
+  if (bid >= dim_size) return;
+
+  const half* block_in = in + static_cast<int64_t>(bid) * size;
+  half* block_out = out + static_cast<int64_t>(bid) * size;
+
+  // Phase 1: Sum of squares with 128-bit loads
+  const int num_vec8 = size >> 3;
+  const int vec8_off = num_vec8 << 3;
+  const uint4* in_vec = reinterpret_cast<const uint4*>(block_in);
+
+  float sum = 0.0f;
+
+#pragma unroll 2
+  for (int i = tid; i < num_vec8; i += BLOCK_DIM) {
+    uint4 raw = in_vec[i];
+    float2 f0 = __half22float2(*reinterpret_cast<const half2*>(&raw.x));
+    float2 f1 = __half22float2(*reinterpret_cast<const half2*>(&raw.y));
+    float2 f2 = __half22float2(*reinterpret_cast<const half2*>(&raw.z));
+    float2 f3 = __half22float2(*reinterpret_cast<const half2*>(&raw.w));
+    sum += f0.x * f0.x + f0.y * f0.y + f1.x * f1.x + f1.y * f1.y +
+           f2.x * f2.x + f2.y * f2.y + f3.x * f3.x + f3.y * f3.y;
+  }
+  const int num_h2 = size >> 1;
+  const half2* in_h2 = reinterpret_cast<const half2*>(block_in);
+  for (int i = (vec8_off >> 1) + tid; i < num_h2; i += BLOCK_DIM) {
+    float2 fv = __half22float2(in_h2[i]);
+    sum += fv.x * fv.x + fv.y * fv.y;
+  }
+  for (int i = (num_h2 << 1) + tid; i < size; i += BLOCK_DIM) {
+    float v = __half2float(block_in[i]);
+    sum += v * v;
+  }
+
+  // Phase 2: Reduction
+  sum = block_reduce_sum<BLOCK_DIM>(sum);
+  const float scale = rsqrtf(sum / static_cast<float>(size) + eps);
+
+  // Phase 3: Normalize with 128-bit vectorized stores
+  const uint4* wei_vec = reinterpret_cast<const uint4*>(wei);
+  uint4* out_vec = reinterpret_cast<uint4*>(block_out);
+
+#pragma unroll 2
+  for (int i = tid; i < num_vec8; i += BLOCK_DIM) {
+    uint4 in_raw = in_vec[i];
+    uint4 w_raw = __ldg(wei_vec + i);
+
+    float2 fi0 = __half22float2(*reinterpret_cast<const half2*>(&in_raw.x));
+    float2 fi1 = __half22float2(*reinterpret_cast<const half2*>(&in_raw.y));
+    float2 fi2 = __half22float2(*reinterpret_cast<const half2*>(&in_raw.z));
+    float2 fi3 = __half22float2(*reinterpret_cast<const half2*>(&in_raw.w));
+    float2 fw0 = __half22float2(*reinterpret_cast<const half2*>(&w_raw.x));
+    float2 fw1 = __half22float2(*reinterpret_cast<const half2*>(&w_raw.y));
+    float2 fw2 = __half22float2(*reinterpret_cast<const half2*>(&w_raw.z));
+    float2 fw3 = __half22float2(*reinterpret_cast<const half2*>(&w_raw.w));
+
+    half2 r0 = __float22half2_rn(make_float2(scale * fi0.x * fw0.x, scale * fi0.y * fw0.y));
+    half2 r1 = __float22half2_rn(make_float2(scale * fi1.x * fw1.x, scale * fi1.y * fw1.y));
+    half2 r2 = __float22half2_rn(make_float2(scale * fi2.x * fw2.x, scale * fi2.y * fw2.y));
+    half2 r3 = __float22half2_rn(make_float2(scale * fi3.x * fw3.x, scale * fi3.y * fw3.y));
+
+    uint4 result;
+    result.x = *reinterpret_cast<const unsigned int*>(&r0);
+    result.y = *reinterpret_cast<const unsigned int*>(&r1);
+    result.z = *reinterpret_cast<const unsigned int*>(&r2);
+    result.w = *reinterpret_cast<const unsigned int*>(&r3);
+    out_vec[i] = result;
+  }
+  const half2* wei_h2 = reinterpret_cast<const half2*>(wei);
+  half2* out_h2 = reinterpret_cast<half2*>(block_out);
+  for (int i = (vec8_off >> 1) + tid; i < num_h2; i += BLOCK_DIM) {
+    float2 fv = __half22float2(in_h2[i]);
+    float2 fw = __half22float2(__ldg(wei_h2 + i));
+    out_h2[i] = __float22half2_rn(make_float2(scale * fv.x * fw.x, scale * fv.y * fw.y));
+  }
+  for (int i = (num_h2 << 1) + tid; i < size; i += BLOCK_DIM) {
+    block_out[i] =
+        __float2half(scale * __half2float(block_in[i]) * __half2float(__ldg(wei + i)));
+  }
+}
+
+// =======================================================================
+// Host launch functions
+// =======================================================================
 
 void rmsnorm_kernel_cu(const tensor::Tensor& input, const tensor::Tensor& weight,
                        const tensor::Tensor& output, void* stream) {
@@ -257,15 +437,15 @@ void rmsnorm_kernel_cu(const tensor::Tensor& input, const tensor::Tensor& weight
 #endif
   const int32_t size = static_cast<int32_t>(input.size());
   constexpr int threads_num = 128;
-  
-  // Check if this is pure FP16 path (FP16 input, FP16 weight, FP16 output)
+
+  // Pure FP16 path (FP16 input, FP16 weight, FP16 output)
   if (input.data_type() == base::DataType::kDataTypeFp16 &&
       output.data_type() == base::DataType::kDataTypeFp16 &&
       weight.data_type() == base::DataType::kDataTypeFp16) {
     const half* in_ptr = reinterpret_cast<const half*>(input.ptr<uint16_t>());
     const half* wei_ptr = reinterpret_cast<const half*>(weight.ptr<uint16_t>());
     half* out_ptr = reinterpret_cast<half*>(const_cast<uint16_t*>(output.ptr<uint16_t>()));
-    
+
     if (stream) {
       cudaStream_t stream_ = static_cast<cudaStream_t>(stream);
       row_rmsnorm_pure_fp16<128><<<1, threads_num, 0, stream_>>>(in_ptr, wei_ptr, out_ptr, size, eps);
@@ -274,12 +454,12 @@ void rmsnorm_kernel_cu(const tensor::Tensor& input, const tensor::Tensor& weight
     }
     return;
   }
-  
+
   // FP32 path
   float* in_ptr = const_cast<float*>(input.ptr<float>());
   float* out_ptr = const_cast<float*>(output.ptr<float>());
-  
-  // Check if weight is FP16
+
+  // FP32 input + FP16 weight
   if (weight.data_type() == base::DataType::kDataTypeFp16) {
     const half* wei_ptr = reinterpret_cast<const half*>(weight.ptr<uint16_t>());
     if (stream) {
@@ -289,6 +469,7 @@ void rmsnorm_kernel_cu(const tensor::Tensor& input, const tensor::Tensor& weight
       row_rmsnorm_f32_fp16w<128><<<1, threads_num>>>(in_ptr, wei_ptr, out_ptr, size, eps);
     }
   } else {
+    // FP32 input + FP32 weight
     float* wei_ptr = const_cast<float*>(weight.ptr<float>());
     if (stream) {
       cudaStream_t stream_ = static_cast<cudaStream_t>(stream);
@@ -315,21 +496,21 @@ void rmsnorm_kernel_cu_dim(const tensor::Tensor& input, const tensor::Tensor& we
   const int32_t dim_size = total_size / size;
   constexpr int threads_num = 128;
 
-  // Check if this is pure FP16 path
+  // Pure FP16 path
   if (input.data_type() == base::DataType::kDataTypeFp16 &&
       output.data_type() == base::DataType::kDataTypeFp16 &&
       weight.data_type() == base::DataType::kDataTypeFp16) {
     const half* in_ptr = reinterpret_cast<const half*>(input.ptr<uint16_t>());
     const half* wei_ptr = reinterpret_cast<const half*>(weight.ptr<uint16_t>());
     half* out_ptr = reinterpret_cast<half*>(const_cast<uint16_t*>(output.ptr<uint16_t>()));
-    
+
     if (stream) {
       cudaStream_t stream_ = static_cast<cudaStream_t>(stream);
-      row_rmsnorm_pure_fp16_dim<128><<<dim_size, threads_num, 0, stream_>>>(
-          in_ptr, wei_ptr, out_ptr, dim_size, size, eps);
+      row_rmsnorm_pure_fp16_dim<128>
+          <<<dim_size, threads_num, 0, stream_>>>(in_ptr, wei_ptr, out_ptr, dim_size, size, eps);
     } else {
-      row_rmsnorm_pure_fp16_dim<128><<<dim_size, threads_num>>>(
-          in_ptr, wei_ptr, out_ptr, dim_size, size, eps);
+      row_rmsnorm_pure_fp16_dim<128>
+          <<<dim_size, threads_num>>>(in_ptr, wei_ptr, out_ptr, dim_size, size, eps);
     }
     return;
   }
@@ -337,151 +518,27 @@ void rmsnorm_kernel_cu_dim(const tensor::Tensor& input, const tensor::Tensor& we
   // FP32 path
   float* in_ptr = const_cast<float*>(input.ptr<float>());
   float* out_ptr = const_cast<float*>(output.ptr<float>());
-  
-  // Check if weight is FP16
+
   if (weight.data_type() == base::DataType::kDataTypeFp16) {
     const half* wei_ptr = reinterpret_cast<const half*>(weight.ptr<uint16_t>());
     if (stream) {
       cudaStream_t stream_ = static_cast<cudaStream_t>(stream);
-      row_rmsnorm_f32_fp16w_dim<<<dim_size, threads_num, 0, stream_>>>(in_ptr, wei_ptr, out_ptr, dim_size, size, eps);
+      row_rmsnorm_f32_fp16w_dim<128>
+          <<<dim_size, threads_num, 0, stream_>>>(in_ptr, wei_ptr, out_ptr, dim_size, size, eps);
     } else {
-      row_rmsnorm_f32_fp16w_dim<<<dim_size, threads_num>>>(in_ptr, wei_ptr, out_ptr, dim_size, size, eps);
+      row_rmsnorm_f32_fp16w_dim<128>
+          <<<dim_size, threads_num>>>(in_ptr, wei_ptr, out_ptr, dim_size, size, eps);
     }
   } else {
     float* wei_ptr = const_cast<float*>(weight.ptr<float>());
     if (stream) {
       cudaStream_t stream_ = static_cast<cudaStream_t>(stream);
-      row_rmsnorm_f32_dim<<<dim_size, threads_num, 0, stream_>>>(in_ptr, wei_ptr, out_ptr, dim_size, size, eps);
+      row_rmsnorm_f32_dim<128>
+          <<<dim_size, threads_num, 0, stream_>>>(in_ptr, wei_ptr, out_ptr, dim_size, size, eps);
     } else {
-      row_rmsnorm_f32_dim<<<dim_size, threads_num>>>(in_ptr, wei_ptr, out_ptr, dim_size, size, eps);
+      row_rmsnorm_f32_dim<128>
+          <<<dim_size, threads_num>>>(in_ptr, wei_ptr, out_ptr, dim_size, size, eps);
     }
-  }
-}
-
-// ==================== Pure FP16 RMSNorm Implementation ====================
-
-/**
- * Pure FP16 RMSNorm kernel: FP16 input x FP16 weight -> FP16 output
- * Computation is done in FP32 internally for better precision
- */
-template <int32_t BLOCK_DIM>
-static __global__ void row_rmsnorm_pure_fp16(const half* in, const half* wei, half* out, 
-                                              int size, float eps) {
-  const int tid = threadIdx.x;
-
-  // Use half2 for vectorized loads
-  const int num_h2 = size / 2;
-  const half2* in_h2 = reinterpret_cast<const half2*>(in);
-  
-  float sum = 0.0f;
-  
-  // Calculate sum of squares
-  for (int i = tid; i < num_h2; i += blockDim.x) {
-    half2 val = in_h2[i];
-    float2 fval = __half22float2(val);
-    sum += fval.x * fval.x + fval.y * fval.y;
-  }
-  
-  // Handle remainder
-  const int base = num_h2 * 2;
-  for (int i = base + tid; i < size; i += blockDim.x) {
-    float fval = __half2float(in[i]);
-    sum += fval * fval;
-  }
-
-  // Block reduction
-  using BlockReduce = cub::BlockReduce<float, BLOCK_DIM>;
-  __shared__ typename BlockReduce::TempStorage temp;
-  __shared__ float shared_val;
-  sum = BlockReduce(temp).Sum(sum);
-  if (threadIdx.x == 0) {
-    shared_val = sum;
-  }
-  __syncthreads();
-  sum = shared_val;
-  const float scale = rsqrtf(sum / static_cast<float>(size) + eps);
-
-  // Apply normalization and weight
-  const half2* wei_h2 = reinterpret_cast<const half2*>(wei);
-  half2* out_h2 = reinterpret_cast<half2*>(out);
-  
-  for (int i = tid; i < num_h2; i += blockDim.x) {
-    half2 val = in_h2[i];
-    half2 w = wei_h2[i];
-    float2 fval = __half22float2(val);
-    float2 fw = __half22float2(w);
-    float2 result;
-    result.x = scale * fval.x * fw.x;
-    result.y = scale * fval.y * fw.y;
-    out_h2[i] = __float22half2_rn(result);
-  }
-  
-  for (int i = base + tid; i < size; i += blockDim.x) {
-    float fval = __half2float(in[i]);
-    float fw = __half2float(wei[i]);
-    out[i] = __float2half(scale * fval * fw);
-  }
-}
-
-/**
- * Pure FP16 RMSNorm kernel for multi-row input (batched)
- */
-template <int32_t BLOCK_DIM>
-static __global__ void row_rmsnorm_pure_fp16_dim(const half* in, const half* wei, half* out, 
-                                                  int dim_size, int size, float eps) {
-  const int bid = blockIdx.x;
-  const int tid = threadIdx.x;
-  if (bid >= dim_size) return;
-
-  const half* block_in = in + static_cast<int64_t>(bid) * size;
-  half* block_out = out + static_cast<int64_t>(bid) * size;
-  
-  const int num_h2 = size / 2;
-  const half2* in_h2 = reinterpret_cast<const half2*>(block_in);
-  
-  float sum = 0.0f;
-  
-  for (int i = tid; i < num_h2; i += blockDim.x) {
-    half2 val = in_h2[i];
-    float2 fval = __half22float2(val);
-    sum += fval.x * fval.x + fval.y * fval.y;
-  }
-  
-  const int base = num_h2 * 2;
-  for (int i = base + tid; i < size; i += blockDim.x) {
-    float fval = __half2float(block_in[i]);
-    sum += fval * fval;
-  }
-
-  using BlockReduce = cub::BlockReduce<float, BLOCK_DIM>;
-  __shared__ typename BlockReduce::TempStorage temp;
-  __shared__ float shared_val;
-  sum = BlockReduce(temp).Sum(sum);
-  if (threadIdx.x == 0) {
-    shared_val = sum;
-  }
-  __syncthreads();
-  sum = shared_val;
-  const float scale = rsqrtf(sum / static_cast<float>(size) + eps);
-
-  const half2* wei_h2 = reinterpret_cast<const half2*>(wei);
-  half2* out_h2 = reinterpret_cast<half2*>(block_out);
-  
-  for (int i = tid; i < num_h2; i += blockDim.x) {
-    half2 val = in_h2[i];
-    half2 w = wei_h2[i];
-    float2 fval = __half22float2(val);
-    float2 fw = __half22float2(w);
-    float2 result;
-    result.x = scale * fval.x * fw.x;
-    result.y = scale * fval.y * fw.y;
-    out_h2[i] = __float22half2_rn(result);
-  }
-  
-  for (int i = base + tid; i < size; i += blockDim.x) {
-    float fval = __half2float(block_in[i]);
-    float fw = __half2float(wei[i]);
-    block_out[i] = __float2half(scale * fval * fw);
   }
 }
 
@@ -503,7 +560,7 @@ void rmsnorm_kernel_cu_pure_fp16(const tensor::Tensor& input, const tensor::Tens
   const half* in_ptr = reinterpret_cast<const half*>(input.ptr<uint16_t>());
   const half* wei_ptr = reinterpret_cast<const half*>(weight.ptr<uint16_t>());
   half* out_ptr = reinterpret_cast<half*>(const_cast<uint16_t*>(output.ptr<uint16_t>()));
-  
+
   constexpr int threads_num = 128;
   if (stream) {
     cudaStream_t stream_ = static_cast<cudaStream_t>(stream);
@@ -534,15 +591,16 @@ void rmsnorm_kernel_cu_pure_fp16_dim(const tensor::Tensor& input, const tensor::
   const half* in_ptr = reinterpret_cast<const half*>(input.ptr<uint16_t>());
   const half* wei_ptr = reinterpret_cast<const half*>(weight.ptr<uint16_t>());
   half* out_ptr = reinterpret_cast<half*>(const_cast<uint16_t*>(output.ptr<uint16_t>()));
-  
+
   constexpr int threads_num = 128;
   if (stream) {
     cudaStream_t stream_ = static_cast<cudaStream_t>(stream);
-    row_rmsnorm_pure_fp16_dim<128><<<dim_size, threads_num, 0, stream_>>>(
-        in_ptr, wei_ptr, out_ptr, dim_size, size, eps);
+    row_rmsnorm_pure_fp16_dim<128>
+        <<<dim_size, threads_num, 0, stream_>>>(in_ptr, wei_ptr, out_ptr, dim_size, size, eps);
   } else {
-    row_rmsnorm_pure_fp16_dim<128><<<dim_size, threads_num>>>(
-        in_ptr, wei_ptr, out_ptr, dim_size, size, eps);
+    row_rmsnorm_pure_fp16_dim<128>
+        <<<dim_size, threads_num>>>(in_ptr, wei_ptr, out_ptr, dim_size, size, eps);
   }
 }
+
 }  // namespace kernel

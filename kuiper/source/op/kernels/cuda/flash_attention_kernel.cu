@@ -108,10 +108,20 @@ __global__ void flash_attention_prefill_kernel(
             const int kv_pos = tile_start + k;
             const float* k_ptr = K_cache + kv_pos * kv_dim + head_offset;
             
-            // Compute Q · K^T
+            // Compute Q · K^T using float4 vectorized loads (4x fewer transactions)
             float score = 0.0f;
-            for (int d = 0; d < head_size; d++) {
-                score += s_query[d] * k_ptr[d];
+            {
+                const float4* sq4 = reinterpret_cast<const float4*>(s_query);
+                const float4* kk4 = reinterpret_cast<const float4*>(k_ptr);
+                #pragma unroll
+                for (int d = 0; d < head_size / 4; d++) {
+                    float4 q = sq4[d];
+                    float4 k = __ldg(kk4 + d);
+                    score += q.x * k.x;
+                    score += q.y * k.y;
+                    score += q.z * k.z;
+                    score += q.w * k.w;
+                }
             }
             score *= scale;
             
@@ -164,7 +174,7 @@ __global__ void flash_attention_prefill_kernel(
                 for (int k = 0; k < tile_len; k++) {
                     const int kv_pos = tile_start + k;
                     const float* v_ptr = V_cache + kv_pos * kv_dim + head_offset;
-                    acc_o[i] += s_scores[k] * v_ptr[d];
+                    acc_o[i] += s_scores[k] * __ldg(v_ptr + d);
                 }
             }
         }
@@ -239,9 +249,18 @@ __global__ void flash_attention_decode_kernel_optimized(
         const float* k_ptr = K_cache + k * kv_dim + head_offset;
         
         float score = 0.0f;
-        #pragma unroll 8
-        for (int d = 0; d < head_size; d++) {
-            score += s_query[d] * k_ptr[d];
+        {
+            const float4* sq4 = reinterpret_cast<const float4*>(s_query);
+            const float4* kk4 = reinterpret_cast<const float4*>(k_ptr);
+            #pragma unroll
+            for (int d = 0; d < head_size / 4; d++) {
+                float4 q = sq4[d];
+                float4 k = __ldg(kk4 + d);
+                score += q.x * k.x;
+                score += q.y * k.y;
+                score += q.z * k.z;
+                score += q.w * k.w;
+            }
         }
         score *= scale;
         
@@ -308,7 +327,7 @@ __global__ void flash_attention_decode_kernel_optimized(
         float acc = 0.0f;
         for (int k = 0; k < kv_len; k++) {
             const float* v_ptr = V_cache + k * kv_dim + head_offset;
-            acc += s_scores[k] * v_ptr[d];
+            acc += s_scores[k] * __ldg(v_ptr + d);
         }
         o_ptr[d] = acc * inv_sum;
     }
@@ -376,20 +395,25 @@ __global__ void flash_attention_decode_kernel_fp16_optimized(
     
     // Each thread handles multiple K vectors
     for (int k = tid; k < kv_len; k += DECODE_BLOCK_SIZE) {
-        const half2* k_ptr_h2 = reinterpret_cast<const half2*>(K_cache + k * kv_dim + head_offset);
+        // float4 vectorized Q·K: 128-bit loads for 4x fewer global memory transactions
+        const float4* k_ptr_f4 = reinterpret_cast<const float4*>(K_cache + k * kv_dim + head_offset);
+        const float4* q_ptr_f4 = reinterpret_cast<const float4*>(s_query);
         
-        // Vectorized dot product using half2
         float2 acc = make_float2(0.0f, 0.0f);
         
-        #pragma unroll 4
-        for (int d = 0; d < head_size_h2; d++) {
-            half2 q = s_query_h2[d];
-            half2 kv = k_ptr_h2[d];
-            // half2 multiply and accumulate
-            float2 q_f = __half22float2(q);
-            float2 k_f = __half22float2(kv);
-            acc.x += q_f.x * k_f.x;
-            acc.y += q_f.y * k_f.y;
+        #pragma unroll
+        for (int d = 0; d < head_size / 8; d++) {
+            float4 q_packed = q_ptr_f4[d];
+            float4 k_packed = __ldg(k_ptr_f4 + d);
+            const half2* q_h2 = reinterpret_cast<const half2*>(&q_packed);
+            const half2* k_h2 = reinterpret_cast<const half2*>(&k_packed);
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                float2 q_f = __half22float2(q_h2[i]);
+                float2 k_f = __half22float2(k_h2[i]);
+                acc.x += q_f.x * k_f.x;
+                acc.y += q_f.y * k_f.y;
+            }
         }
         
         float score = (acc.x + acc.y) * scale;
@@ -485,194 +509,24 @@ __global__ void flash_attention_decode_kernel_fp16_optimized(
             const half* v2 = V_cache + (k + 2) * kv_dim + head_offset;
             const half* v3 = V_cache + (k + 3) * kv_dim + head_offset;
             
-            acc += s_scores[k + 0] * __half2float(v0[d]);
-            acc += s_scores[k + 1] * __half2float(v1[d]);
-            acc += s_scores[k + 2] * __half2float(v2[d]);
-            acc += s_scores[k + 3] * __half2float(v3[d]);
+            acc += s_scores[k + 0] * __half2float(__ldg(v0 + d));
+            acc += s_scores[k + 1] * __half2float(__ldg(v1 + d));
+            acc += s_scores[k + 2] * __half2float(__ldg(v2 + d));
+            acc += s_scores[k + 3] * __half2float(__ldg(v3 + d));
         }
         
         // Handle remaining elements
         for (; k < kv_len; k++) {
             const half* v_ptr = V_cache + k * kv_dim + head_offset;
-            acc += s_scores[k] * __half2float(v_ptr[d]);
+            acc += s_scores[k] * __half2float(__ldg(v_ptr + d));
         }
         
         o_ptr[d] = __float2half(acc * inv_sum);
     }
 }
 
-/**
- * GPU pos version of FP16 decode attention kernel for CUDA Graph compatibility
- * Reads position from GPU memory pointer instead of kernel argument
- * Grid: [head_num]
- * Block: 256 threads (8 warps)
- */
-__global__ void flash_attention_decode_kernel_fp16_gpu_pos(
-    const half* __restrict__ Q,        // [dim] - query for current token
-    const half* __restrict__ K_cache,  // [max_seq_len, kv_dim]
-    const half* __restrict__ V_cache,  // [max_seq_len, kv_dim]
-    half* __restrict__ O,              // [dim]
-    const int32_t* __restrict__ pos_ptr, // GPU memory - current position
-    const int max_seq_len,             // Maximum sequence length for shared memory allocation
-    const int head_num,
-    const int kv_head_num,
-    const int head_size,
-    const int kv_mul,
-    const int kv_dim,
-    const float scale
-) {
-    const int head = blockIdx.x;
-    const int tid = threadIdx.x;
-    const int lane_id = tid % DECODE_WARP_SIZE;
-    const int warp_id = tid / DECODE_WARP_SIZE;
-    
-    if (head >= head_num) return;
-    
-    // Read position from GPU memory - volatile to prevent caching stale values
-    const int pos = *reinterpret_cast<const volatile int32_t*>(pos_ptr);
-    const int kv_len = pos + 1;
-    
-    const int kv_head = head / kv_mul;
-    const int head_offset = kv_head * head_size;
-    const int head_size_h2 = head_size / 2;
-    
-    // Shared memory layout - use max_seq_len for allocation
-    extern __shared__ char smem_raw[];
-    half* s_query = reinterpret_cast<half*>(smem_raw);
-    float* s_scores = reinterpret_cast<float*>(smem_raw + head_size * sizeof(half));
-    float* s_max = s_scores + ((max_seq_len + DECODE_BLOCK_SIZE - 1) / DECODE_BLOCK_SIZE) * DECODE_BLOCK_SIZE;
-    float* s_sum = s_max + DECODE_NUM_WARPS;
-    
-    // Load query to shared memory using half2
-    const half* q_ptr = Q + head * head_size;
-    const half2* q_ptr_h2 = reinterpret_cast<const half2*>(q_ptr);
-    half2* s_query_h2 = reinterpret_cast<half2*>(s_query);
-    
-    for (int d = tid; d < head_size_h2; d += DECODE_BLOCK_SIZE) {
-        s_query_h2[d] = q_ptr_h2[d];
-    }
-    __syncthreads();
-    
-    // Phase 1: Compute Q·K attention scores with half2 dot product
-    float local_max = -FLT_MAX;
-    
-    for (int k = tid; k < kv_len; k += DECODE_BLOCK_SIZE) {
-        const half2* k_ptr_h2 = reinterpret_cast<const half2*>(K_cache + k * kv_dim + head_offset);
-        
-        float2 acc = make_float2(0.0f, 0.0f);
-        
-        #pragma unroll 4
-        for (int d = 0; d < head_size_h2; d++) {
-            half2 q = s_query_h2[d];
-            half2 kv = k_ptr_h2[d];
-            float2 q_f = __half22float2(q);
-            float2 k_f = __half22float2(kv);
-            acc.x += q_f.x * k_f.x;
-            acc.y += q_f.y * k_f.y;
-        }
-        
-        float score = (acc.x + acc.y) * scale;
-        s_scores[k] = score;
-        local_max = fmaxf(local_max, score);
-    }
-    __syncthreads();
-    
-    // Phase 2: Warp-level max reduction
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset /= 2) {
-        local_max = fmaxf(local_max, __shfl_xor_sync(0xffffffff, local_max, offset));
-    }
-    if (lane_id == 0) {
-        s_max[warp_id] = local_max;
-    }
-    __syncthreads();
-    
-    // Block-level max reduction
-    // FIX: Thread 0 does final reduction and stores to shared memory for ALL threads
-    float global_max;
-    if (tid < DECODE_NUM_WARPS) {
-        local_max = s_max[tid];
-    }
-    #pragma unroll
-    for (int offset = DECODE_NUM_WARPS / 2; offset > 0; offset /= 2) {
-        local_max = fmaxf(local_max, __shfl_xor_sync(0xffffffff, local_max, offset));
-    }
-    // Thread 0 writes final max to shared memory for all warps to read
-    if (tid == 0) {
-        s_max[0] = local_max;
-    }
-    __syncthreads();
-    global_max = s_max[0];  // All threads read the same global_max
-    
-    // Phase 3: Softmax normalization
-    float local_sum = 0.0f;
-    
-    for (int k = tid; k < kv_len; k += DECODE_BLOCK_SIZE) {
-        float val = s_scores[k] - global_max;
-        float exp_val = (val > SOFTMAX_FTZ) ? expf(val) : 0.0f;
-        s_scores[k] = exp_val;
-        local_sum += exp_val;
-    }
-    __syncthreads();
-    
-    // Warp-level sum reduction
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset /= 2) {
-        local_sum += __shfl_xor_sync(0xffffffff, local_sum, offset);
-    }
-    if (lane_id == 0) {
-        s_sum[warp_id] = local_sum;
-    }
-    __syncthreads();
-    
-    // Block-level sum reduction
-    // FIX: Thread 0 does final reduction and stores to shared memory for ALL threads
-    float global_sum;
-    if (tid < DECODE_NUM_WARPS) {
-        local_sum = s_sum[tid];
-    }
-    #pragma unroll
-    for (int offset = DECODE_NUM_WARPS / 2; offset > 0; offset /= 2) {
-        local_sum += __shfl_xor_sync(0xffffffff, local_sum, offset);
-    }
-    // Thread 0 writes final sum to shared memory for all warps to read
-    if (tid == 0) {
-        s_sum[0] = local_sum;
-    }
-    __syncthreads();
-    global_sum = s_sum[0];  // All threads read the same global_sum
-    float inv_sum = (global_sum > 0.0f) ? (1.0f / global_sum) : 0.0f;
-    
-    // Phase 4: Compute weighted V sum
-    half* o_ptr = O + head * head_size;
-    
-    for (int d = tid; d < head_size; d += DECODE_BLOCK_SIZE) {
-        float acc = 0.0f;
-        
-        int k = 0;
-        for (; k + 3 < kv_len; k += 4) {
-            const half* v0 = V_cache + (k + 0) * kv_dim + head_offset;
-            const half* v1 = V_cache + (k + 1) * kv_dim + head_offset;
-            const half* v2 = V_cache + (k + 2) * kv_dim + head_offset;
-            const half* v3 = V_cache + (k + 3) * kv_dim + head_offset;
-            
-            acc += s_scores[k + 0] * __half2float(v0[d]);
-            acc += s_scores[k + 1] * __half2float(v1[d]);
-            acc += s_scores[k + 2] * __half2float(v2[d]);
-            acc += s_scores[k + 3] * __half2float(v3[d]);
-        }
-        
-        for (; k < kv_len; k++) {
-            const half* v_ptr = V_cache + k * kv_dim + head_offset;
-            acc += s_scores[k] * __half2float(v_ptr[d]);
-        }
-        
-        o_ptr[d] = __float2half(acc * inv_sum);
-    }
-}
-
-// Optimized tile size for shared memory V loading
-constexpr int V_TILE_K = 32;  // Number of V vectors to load at once
+// NOTE: flash_attention_decode_kernel_fp16_gpu_pos removed (dead code)
+// Replaced by flash_attention_decode_kernel_fp16_online_softmax
 
 /**
  * FP16 prefill attention kernel with shared memory V tiling
@@ -746,15 +600,24 @@ __global__ void flash_attention_prefill_kernel_fp16(
         float tile_max_local = -FLT_MAX;
         for (int k_idx = tid; k_idx < tile_len; k_idx += BLOCK_SIZE) {
             const int kv_pos = tile_start + k_idx;
-            const half2* k_ptr_h2 = reinterpret_cast<const half2*>(K_cache + kv_pos * kv_dim + head_offset);
+            // float4 vectorized Q·K: 128-bit loads for 4x fewer global transactions
+            const float4* k_ptr_f4 = reinterpret_cast<const float4*>(K_cache + kv_pos * kv_dim + head_offset);
+            const float4* q_ptr_f4 = reinterpret_cast<const float4*>(s_query);
             
             float2 acc = make_float2(0.0f, 0.0f);
-            #pragma unroll 8
-            for (int d = 0; d < head_size_h2; d++) {
-                float2 q_val = __half22float2(s_query_h2[d]);
-                float2 k_val = __half22float2(k_ptr_h2[d]);
-                acc.x = fmaf(q_val.x, k_val.x, acc.x);
-                acc.y = fmaf(q_val.y, k_val.y, acc.y);
+            #pragma unroll
+            for (int d = 0; d < head_size / 8; d++) {
+                float4 q_packed = q_ptr_f4[d];
+                float4 k_packed = __ldg(k_ptr_f4 + d);
+                const half2* q_h2 = reinterpret_cast<const half2*>(&q_packed);
+                const half2* k_h2 = reinterpret_cast<const half2*>(&k_packed);
+                #pragma unroll
+                for (int i = 0; i < 4; i++) {
+                    float2 q_f = __half22float2(q_h2[i]);
+                    float2 k_f = __half22float2(k_h2[i]);
+                    acc.x = fmaf(q_f.x, k_f.x, acc.x);
+                    acc.y = fmaf(q_f.y, k_f.y, acc.y);
+                }
             }
             float score = (acc.x + acc.y) * scale;
             s_scores[k_idx] = score;
@@ -840,14 +703,14 @@ __global__ void flash_attention_prefill_kernel_fp16(
                 float s6 = s_scores[k+6];
                 float s7 = s_scores[k+7];
                 
-                float v0 = __half2float(v_ptr[0]);
-                float v1 = __half2float(v_ptr[kv_dim]);
-                float v2 = __half2float(v_ptr[2*kv_dim]);
-                float v3 = __half2float(v_ptr[3*kv_dim]);
-                float v4 = __half2float(v_ptr[4*kv_dim]);
-                float v5 = __half2float(v_ptr[5*kv_dim]);
-                float v6 = __half2float(v_ptr[6*kv_dim]);
-                float v7 = __half2float(v_ptr[7*kv_dim]);
+                float v0 = __half2float(__ldg(v_ptr));
+                float v1 = __half2float(__ldg(v_ptr + kv_dim));
+                float v2 = __half2float(__ldg(v_ptr + 2*kv_dim));
+                float v3 = __half2float(__ldg(v_ptr + 3*kv_dim));
+                float v4 = __half2float(__ldg(v_ptr + 4*kv_dim));
+                float v5 = __half2float(__ldg(v_ptr + 5*kv_dim));
+                float v6 = __half2float(__ldg(v_ptr + 6*kv_dim));
+                float v7 = __half2float(__ldg(v_ptr + 7*kv_dim));
                 
                 acc_o = fmaf(s0, v0, acc_o);
                 acc_o = fmaf(s1, v1, acc_o);
@@ -868,10 +731,10 @@ __global__ void flash_attention_prefill_kernel_fp16(
                 float s2 = s_scores[k+2];
                 float s3 = s_scores[k+3];
                 
-                float v0 = __half2float(v_ptr[0]);
-                float v1 = __half2float(v_ptr[kv_dim]);
-                float v2 = __half2float(v_ptr[2*kv_dim]);
-                float v3 = __half2float(v_ptr[3*kv_dim]);
+                float v0 = __half2float(__ldg(v_ptr));
+                float v1 = __half2float(__ldg(v_ptr + kv_dim));
+                float v2 = __half2float(__ldg(v_ptr + 2*kv_dim));
+                float v3 = __half2float(__ldg(v_ptr + 3*kv_dim));
                 
                 acc_o = fmaf(s0, v0, acc_o);
                 acc_o = fmaf(s1, v1, acc_o);
@@ -883,7 +746,7 @@ __global__ void flash_attention_prefill_kernel_fp16(
             
             // Handle remainder
             for (; k < tile_len; k++) {
-                acc_o = fmaf(s_scores[k], __half2float(v_ptr[0]), acc_o);
+                acc_o = fmaf(s_scores[k], __half2float(__ldg(v_ptr)), acc_o);
                 v_ptr += kv_dim;
             }
         }
@@ -1154,19 +1017,25 @@ __global__ void flash_attention_decode_kernel_fp16_online_softmax(
         
         for (int k_idx = tid; k_idx < tile_len; k_idx += ONLINE_BLOCK_SIZE) {
             const int kv_pos = tile_start + k_idx;
-            const half2* k_ptr_h2 = reinterpret_cast<const half2*>(K_cache + kv_pos * kv_dim + head_offset);
+            // float4 vectorized Q·K: 128-bit loads for 4x fewer transactions
+            const float4* k_ptr_f4 = reinterpret_cast<const float4*>(K_cache + kv_pos * kv_dim + head_offset);
+            const float4* q_ptr_f4 = reinterpret_cast<const float4*>(s_query);
             
-            // Vectorized dot product using half2
             float2 acc = make_float2(0.0f, 0.0f);
             
-            #pragma unroll 4
-            for (int d = 0; d < head_size_h2; d++) {
-                half2 q = s_query_h2[d];
-                half2 kv = k_ptr_h2[d];
-                float2 q_f = __half22float2(q);
-                float2 k_f = __half22float2(kv);
-                acc.x += q_f.x * k_f.x;
-                acc.y += q_f.y * k_f.y;
+            #pragma unroll
+            for (int d = 0; d < head_size / 8; d++) {
+                float4 q_packed = q_ptr_f4[d];
+                float4 k_packed = __ldg(k_ptr_f4 + d);
+                const half2* q_h2 = reinterpret_cast<const half2*>(&q_packed);
+                const half2* k_h2 = reinterpret_cast<const half2*>(&k_packed);
+                #pragma unroll
+                for (int i = 0; i < 4; i++) {
+                    float2 q_f = __half22float2(q_h2[i]);
+                    float2 k_f = __half22float2(k_h2[i]);
+                    acc.x += q_f.x * k_f.x;
+                    acc.y += q_f.y * k_f.y;
+                }
             }
             
             float score = (acc.x + acc.y) * scale;
@@ -1234,7 +1103,7 @@ __global__ void flash_attention_decode_kernel_fp16_online_softmax(
             for (int k = 0; k < tile_len; k++) {
                 const int kv_pos = tile_start + k;
                 const half* v_ptr = V_cache + kv_pos * kv_dim + head_offset;
-                acc_o += s_scores[k] * __half2float(v_ptr[my_dim]);
+                acc_o += s_scores[k] * __half2float(__ldg(v_ptr + my_dim));
             }
         }
         

@@ -1,0 +1,4 @@
+==PROF== Connected to process 66439 (/mnt/ssd/workspace/OrinMLLM/cuda_kernel_optimized/rmsnorm_kernel/ncu_profile_opt)
+NCU profiling kernels launched.
+==PROF== Disconnected from process 66439
+==PROF== Report: /mnt/ssd/workspace/OrinMLLM/cuda_kernel_optimized/rmsnorm_kernel/ncu_rmsnorm_after.ncu-rep
