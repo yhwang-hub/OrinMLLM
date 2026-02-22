@@ -306,6 +306,9 @@ public:
   // Configuration access
   const Qwen3VLConfig& get_vl_config() const { return vl_config_; }
   
+  // Attention type control
+  void set_attention_type(base::AttentionType type) override;
+
   // CUDA Graph management
   void enable_cuda_graph(bool enable);
   bool is_cuda_graph_enabled() const;

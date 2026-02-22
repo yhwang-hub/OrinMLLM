@@ -287,7 +287,12 @@ __global__ void flash_attention_decode_kernel_optimized(
     for (int offset = 4; offset > 0; offset /= 2) {
         global_max = fmaxf(global_max, __shfl_down_sync(0xffffffff, global_max, offset));
     }
-    global_max = __shfl_sync(0xffffffff, global_max, 0);
+    // Broadcast global_max to all threads via shared memory
+    if (tid == 0) {
+        s_max[0] = global_max;
+    }
+    __syncthreads();
+    global_max = s_max[0];
     
     // Compute softmax
     float local_sum = 0.0f;
@@ -316,7 +321,12 @@ __global__ void flash_attention_decode_kernel_optimized(
     for (int offset = 4; offset > 0; offset /= 2) {
         global_sum += __shfl_down_sync(0xffffffff, global_sum, offset);
     }
-    global_sum = __shfl_sync(0xffffffff, global_sum, 0);
+    // Broadcast global_sum to all threads via shared memory
+    if (tid == 0) {
+        s_sum[0] = global_sum;
+    }
+    __syncthreads();
+    global_sum = s_sum[0];
     
     float inv_sum = (global_sum > 0.0f) ? (1.0f / global_sum) : 0.0f;
     

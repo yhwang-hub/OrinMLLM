@@ -1058,10 +1058,10 @@ void Qwen2Model::attention_mha(int32_t layer_idx, const tensor::Tensor& pos_tens
   
   int pos = pos_tensor.index<int32_t>(0);
 
-  // Check if using pure FP16 path
+  // FP16 data always uses Flash Attention (MHA does not support FP16)
   if (query.data_type() == base::DataType::kDataTypeFp16 &&
       key_cache.data_type() == base::DataType::kDataTypeFp16) {
-    // Use Flash Attention layer for decode (FP16)
+    // Use Flash Attention layer for decode (FP16, FA1 or FA2 based on layer's attention_type_)
     auto flash_attn = qwen_layers_->flash_attention_decode_layer_;
     flash_attn->set_layer_index(layer_idx);
     flash_attn->set_pos(pos);
@@ -1073,7 +1073,7 @@ void Qwen2Model::attention_mha(int32_t layer_idx, const tensor::Tensor& pos_tens
     // input[4] not needed when use_gpu_pos=false
     flash_attn->set_cuda_config(cuda_config_);
     STATUS_CHECK(flash_attn->forward());
-  } else {
+  } else if (attention_type_ == base::AttentionType::kAttentionMHA) {
     // Standard FP32 MHA path
     tensor::Tensor score_storage = get_buffer(ModelBufferType::kScoreStorage);
     const auto& mha_layer = qwen_layers_->mha_layer_;
@@ -1081,6 +1081,18 @@ void Qwen2Model::attention_mha(int32_t layer_idx, const tensor::Tensor& pos_tens
     std::dynamic_pointer_cast<op::MultiHeadAttention>(mha_layer)->set_pos(pos);
     std::dynamic_pointer_cast<op::MultiHeadAttention>(mha_layer)->set_layer_idx(layer_idx);
     STATUS_CHECK(mha_layer->forward(query, score_storage, key_cache, val_cache, mha_output));
+  } else {
+    // FP32 Flash Attention path (FA1 or FA2)
+    auto flash_attn = qwen_layers_->flash_attention_decode_layer_;
+    flash_attn->set_layer_index(layer_idx);
+    flash_attn->set_pos(pos);
+    flash_attn->set_use_gpu_pos(false);
+    flash_attn->set_input(0, query);
+    flash_attn->set_input(1, mha_output);
+    flash_attn->set_input(2, key_cache);
+    flash_attn->set_input(3, val_cache);
+    flash_attn->set_cuda_config(cuda_config_);
+    STATUS_CHECK(flash_attn->forward());
   }
 
   // wo @ attention output
@@ -1100,10 +1112,10 @@ void Qwen2Model::attention_mha_with_graph(int32_t layer_idx, const tensor::Tenso
   tensor::Tensor mha_output = get_buffer(ModelBufferType::kOutputMHA);
   tensor::Tensor query = this->get_buffer(ModelBufferType::kQuery);
   
-  // Check if using pure FP16 path
+  // FP16 data always uses Flash Attention (MHA does not support FP16)
   if (query.data_type() == base::DataType::kDataTypeFp16 &&
       key_cache.data_type() == base::DataType::kDataTypeFp16) {
-    // Use Flash Attention layer with GPU pos for CUDA Graph compatibility
+    // Use Flash Attention layer with GPU pos for CUDA Graph compatibility (FP16)
     auto flash_attn = qwen_layers_->flash_attention_decode_layer_;
     flash_attn->set_layer_index(layer_idx);
     flash_attn->set_use_gpu_pos(true);
@@ -1114,11 +1126,27 @@ void Qwen2Model::attention_mha_with_graph(int32_t layer_idx, const tensor::Tenso
     flash_attn->set_input(4, pos_tensor_gpu);  // GPU position tensor
     flash_attn->set_cuda_config(cuda_config_);
     STATUS_CHECK(flash_attn->forward());
-  } else {
+  } else if (attention_type_ == base::AttentionType::kAttentionMHA) {
     // Standard FP32 path using GPU pos kernel for CUDA Graph compatibility
     tensor::Tensor score_storage = get_buffer(ModelBufferType::kScoreStorage);
     STATUS_CHECK(qwen_layers_->mha_gpu_pos_layer_->forward(
         pos_tensor_gpu.ptr<int32_t>(),  // Position pointer in GPU memory
+        config_->head_num_,
+        layer_idx,
+        config_->seq_len_,
+        config_->kv_dim_,
+        config_->kv_mul_,
+        config_->head_size_,
+        mha_output,
+        query,
+        score_storage,
+        key_cache,
+        val_cache));
+  } else {
+    // FP32 + FA1/FA2: no GPU-pos flash attention kernel for FP32, fall back to MHA with GPU pos
+    tensor::Tensor score_storage = get_buffer(ModelBufferType::kScoreStorage);
+    STATUS_CHECK(qwen_layers_->mha_gpu_pos_layer_->forward(
+        pos_tensor_gpu.ptr<int32_t>(),
         config_->head_num_,
         layer_idx,
         config_->seq_len_,
@@ -1626,69 +1654,31 @@ void Qwen2Model::batched_attention_mha(int32_t layer_idx, const tensor::Tensor& 
   
   std::shared_ptr<base::DeviceAllocator> alloc = base::CUDADeviceAllocatorFactory::get_instance();
 
-#if USE_FLASH_ATTENTION
-  // Use Flash Attention - more memory efficient via layer abstraction
-  // Check if using pure FP16 path
-  auto prefill_layer = qwen_layers_->flash_attention_prefill_layer_;
-  prefill_layer->set_cur_seq_len(seq_len);
-  prefill_layer->set_start_pos(start_pos);
-  prefill_layer->set_layer_index(layer_idx);
-  prefill_layer->set_use_fp16(query.data_type() == base::DataType::kDataTypeFp16 &&
-                              key_cache.data_type() == base::DataType::kDataTypeFp16);
-  prefill_layer->set_input(0, query);
-  prefill_layer->set_input(1, mha_out);
-  prefill_layer->set_input(2, key_cache);
-  prefill_layer->set_input(3, value_cache);
-  prefill_layer->set_cuda_config(cuda_config_);
-  STATUS_CHECK(prefill_layer->forward());
-    
-  // DEBUG: Disabled for production FP16 path
-    #if 0
-    // DEBUG: Check FP16 flash attention output for numerical issues (first layer only)
-    static int fp16_attn_debug_count = 0;
-    if (fp16_attn_debug_count < 3 && layer_idx == 0) {
-      cudaStreamSynchronize(cuda_config_->stream);
-      
-      const int check_size = std::min(128, seq_len * config_->dim_);
-      std::vector<uint16_t> cpu_out(check_size);
-      cudaMemcpy(cpu_out.data(), mha_out.ptr<uint16_t>(), 
-                 check_size * sizeof(uint16_t), cudaMemcpyDeviceToHost);
-      
-      int nan_count = 0, inf_count = 0, zero_count = 0;
-      float max_val = -1e30f, min_val = 1e30f, sum = 0.0f;
-      for (int i = 0; i < check_size; ++i) {
-        half h = *reinterpret_cast<half*>(&cpu_out[i]);
-        float v = __half2float(h);
-        if (std::isnan(v)) nan_count++;
-        else if (std::isinf(v)) inf_count++;
-        else {
-          if (fabsf(v) < 1e-6f) zero_count++;
-          if (v > max_val) max_val = v;
-          if (v < min_val) min_val = v;
-          sum += v;
-        }
-      }
-      LOG(INFO) << "[FP16 Flash Attn] Layer " << layer_idx << " output: "
-                << "min=" << min_val << ", max=" << max_val 
-                << ", mean=" << (sum / check_size)
-                << ", nan=" << nan_count << ", inf=" << inf_count 
-                << ", zeros=" << zero_count << "/" << check_size;
-      fp16_attn_debug_count++;
-    }
-    #endif
-#else
-  // Allocate temporary score storage for batched attention
-  // Score shape: [seq_len, head_num, max_seq_len]
-  tensor::Tensor score_storage(base::DataType::kDataTypeFp32, 
-                               seq_len, config_->head_num_, config_->seq_len_, true, alloc);
-  
-  // Call batched MHA layer
-  STATUS_CHECK(qwen_layers_->batched_mha_layer_->forward(
-      start_pos, seq_len, config_->head_num_, layer_idx,
-      config_->seq_len_, config_->dim_, config_->kv_dim_, 
-      config_->kv_mul_, config_->head_size_, mha_out,
-      query, score_storage, key_cache, value_cache));
-#endif
+  if (attention_type_ == base::AttentionType::kAttentionMHA &&
+      query.data_type() != base::DataType::kDataTypeFp16) {
+    // Standard batched MHA attention (FP32 only)
+    tensor::Tensor score_storage(base::DataType::kDataTypeFp32, 
+                                 seq_len, config_->head_num_, config_->seq_len_, true, alloc);
+    STATUS_CHECK(qwen_layers_->batched_mha_layer_->forward(
+        start_pos, seq_len, config_->head_num_, layer_idx,
+        config_->seq_len_, config_->dim_, config_->kv_dim_, 
+        config_->kv_mul_, config_->head_size_, const_cast<tensor::Tensor&>(mha_out),
+        query, score_storage, key_cache, value_cache));
+  } else {
+    // Use Flash Attention prefill via layer abstraction (FA1 or FA2)
+    auto prefill_layer = qwen_layers_->flash_attention_prefill_layer_;
+    prefill_layer->set_cur_seq_len(seq_len);
+    prefill_layer->set_start_pos(start_pos);
+    prefill_layer->set_layer_index(layer_idx);
+    prefill_layer->set_use_fp16(query.data_type() == base::DataType::kDataTypeFp16 &&
+                                key_cache.data_type() == base::DataType::kDataTypeFp16);
+    prefill_layer->set_input(0, query);
+    prefill_layer->set_input(1, mha_out);
+    prefill_layer->set_input(2, key_cache);
+    prefill_layer->set_input(3, value_cache);
+    prefill_layer->set_cuda_config(cuda_config_);
+    STATUS_CHECK(prefill_layer->forward());
+  }
   
   // wo @ mha_output for each position
   const auto& wo_layer = qwen_layers_->wo_layers_.at(layer_idx);
@@ -2060,6 +2050,18 @@ void Qwen2Model::clear_kv_cache() {
   } else {
     memset(key_cache.ptr<void>(), 0, key_cache.size() * elem_size);
     memset(value_cache.ptr<void>(), 0, value_cache.size() * elem_size);
+  }
+}
+
+void Qwen2Model::set_attention_type(base::AttentionType type) {
+  Model::set_attention_type(type);
+  if (qwen_layers_) {
+    if (qwen_layers_->flash_attention_decode_layer_) {
+      qwen_layers_->flash_attention_decode_layer_->set_attention_type(type);
+    }
+    if (qwen_layers_->flash_attention_prefill_layer_) {
+      qwen_layers_->flash_attention_prefill_layer_->set_attention_type(type);
+    }
   }
 }
 

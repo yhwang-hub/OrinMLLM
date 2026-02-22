@@ -105,6 +105,9 @@ class Qwen2Model : public Model {
   void enable_fused_ffn(bool enable) { use_fused_ffn_ = enable; }
   bool is_fused_ffn_enabled() const { return use_fused_ffn_; }
 
+  // Override to propagate attention type to flash attention layers
+  void set_attention_type(base::AttentionType type) override;
+
  private:
   void init_mem() override;
 

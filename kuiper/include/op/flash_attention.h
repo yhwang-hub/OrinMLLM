@@ -1,6 +1,7 @@
 #ifndef KUIPER_INCLUDE_OP_FLASH_ATTENTION_H_
 #define KUIPER_INCLUDE_OP_FLASH_ATTENTION_H_
 #include "layer.h"
+#include <base/base.h>
 namespace op {
 
 /**
@@ -45,6 +46,8 @@ class FlashAttentionDecodeLayer : public Layer {
     kv_dim_ = kv_dim;
   }
   void set_use_fp16(bool use_fp16) { use_fp16_ = use_fp16; }
+  void set_attention_type(base::AttentionType type) { attention_type_ = type; }
+  base::AttentionType get_attention_type() const { return attention_type_; }
 
  private:
   int32_t head_num_ = 0;
@@ -57,6 +60,7 @@ class FlashAttentionDecodeLayer : public Layer {
   int32_t pos_ = 0;
   bool use_fp16_ = false;
   bool use_gpu_pos_ = false;
+  base::AttentionType attention_type_ = base::AttentionType::kAttentionFlash1;
 };
 
 /**
@@ -95,6 +99,8 @@ class FlashAttentionPrefillLayer : public Layer {
     max_seq_len_ = max_seq_len;
   }
   void set_use_fp16(bool use_fp16) { use_fp16_ = use_fp16; }
+  void set_attention_type(base::AttentionType type) { attention_type_ = type; }
+  base::AttentionType get_attention_type() const { return attention_type_; }
 
  private:
   int32_t head_num_ = 0;
@@ -105,6 +111,7 @@ class FlashAttentionPrefillLayer : public Layer {
   int32_t start_pos_ = 0;
   int32_t layer_idx_ = 0;
   bool use_fp16_ = false;
+  base::AttentionType attention_type_ = base::AttentionType::kAttentionFlash1;
 };
 
 }  // namespace op

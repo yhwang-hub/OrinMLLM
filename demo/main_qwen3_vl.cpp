@@ -86,6 +86,7 @@ struct VLInferenceConfig {
   bool stream_output = false;
   bool verbose = false;
   bool use_cuda_graph = false;
+  base::AttentionType attention_type = base::AttentionType::kAttentionFlash1;
 };
 
 void print_usage(const char* program_name) {
@@ -98,6 +99,7 @@ void print_usage(const char* program_name) {
             << "                       Lower = faster ViT. Suggested: 1003520, 500000, 400000\n"
             << "  --stream             Enable streaming output\n"
             << "  --cuda-graph         Enable CUDA Graph for faster decode\n"
+            << "  --attention TYPE     Attention type: mha, flash1, flash2 (default: flash1)\n"
             << "  --verbose            Enable verbose logging\n"
             << "  -h, --help           Show this help message\n"
             << "\nExample:\n"
@@ -115,6 +117,7 @@ VLInferenceConfig parse_args(int argc, char* argv[]) {
     {"max-pixels", required_argument, 0, 'x'},
     {"stream", no_argument, 0, 's'},
     {"cuda-graph", no_argument, 0, 'g'},
+    {"attention", required_argument, 0, 'a'},
     {"verbose", no_argument, 0, 'v'},
     {"help", no_argument, 0, 'h'},
     {0, 0, 0, 0}
@@ -123,7 +126,7 @@ VLInferenceConfig parse_args(int argc, char* argv[]) {
   int opt;
   int option_index = 0;
   
-  while ((opt = getopt_long(argc, argv, "i:p:m:x:sgvh", long_options, &option_index)) != -1) {
+  while ((opt = getopt_long(argc, argv, "i:p:m:x:a:sgvh", long_options, &option_index)) != -1) {
     switch (opt) {
       case 'i':
         config.image_path = optarg;
@@ -142,8 +145,20 @@ VLInferenceConfig parse_args(int argc, char* argv[]) {
         break;
       case 'g':
         config.use_cuda_graph = true;
+        break;      case 'a': {
+        std::string attn_str = optarg;
+        if (attn_str == "mha") {
+          config.attention_type = base::AttentionType::kAttentionMHA;
+        } else if (attn_str == "flash1") {
+          config.attention_type = base::AttentionType::kAttentionFlash1;
+        } else if (attn_str == "flash2") {
+          config.attention_type = base::AttentionType::kAttentionFlash2;
+        } else {
+          LOG(ERROR) << "Unknown attention type: " << attn_str << ". Use mha, flash1, or flash2.";
+          exit(1);
+        }
         break;
-      case 'v':
+      }      case 'v':
         config.verbose = true;
         break;
       case 'h':
@@ -214,6 +229,7 @@ int run_inference(const VLInferenceConfig& config) {
   LOG(INFO) << "Max tokens: " << config.max_tokens;
   LOG(INFO) << "Stream output: " << (config.stream_output ? "enabled" : "disabled");
   LOG(INFO) << "CUDA Graph: " << (config.use_cuda_graph ? "enabled" : "disabled");
+  LOG(INFO) << "Attention: " << base::AttentionTypeName(config.attention_type);
   
   // Create model
   model::Qwen3VLModel model(base::TokenizerType::kEncodeBpe,
@@ -236,6 +252,9 @@ int run_inference(const VLInferenceConfig& config) {
     model.enable_cuda_graph(true);
     LOG(INFO) << "CUDA Graph optimization enabled";
   }
+  
+  // Set attention type
+  model.set_attention_type(config.attention_type);
   
   double init_time = init_timer.elapsed_ms();
   LOG(INFO) << "Model initialized in " << init_time << " ms";

@@ -136,6 +136,7 @@ struct InferenceConfig {
   int64_t prefix_cache_size = 65536; // prefix cache 最大 token 数
   bool benchmark_mode = false;       // 是否运行性能基准测试
   int benchmark_decode_tokens = 1024; // benchmark模式下的decode token数
+  base::AttentionType attention_type = base::AttentionType::kAttentionFlash1; // 注意力计算类型
   
   // 解析命令行参数
   static InferenceConfig parse_args(int argc, char* argv[], int start_idx = 3) {
@@ -169,6 +170,19 @@ struct InferenceConfig {
           config.max_tokens = 256;
         }
         ++i;
+      } else if (arg == "--attention" && i + 1 < argc) {
+        std::string attn_type = argv[i + 1];
+        if (attn_type == "mha") {
+          config.attention_type = base::AttentionType::kAttentionMHA;
+        } else if (attn_type == "flash1") {
+          config.attention_type = base::AttentionType::kAttentionFlash1;
+        } else if (attn_type == "flash2") {
+          config.attention_type = base::AttentionType::kAttentionFlash2;
+        } else {
+          LOG(WARNING) << "Unknown attention type '" << attn_type 
+                       << "', valid options: mha, flash1, flash2. Using default flash1";
+        }
+        ++i;
       } else if (arg == "--max-history" && i + 1 < argc) {
         config.max_history_turns = std::atoi(argv[i + 1]);
         if (config.max_history_turns < 0) {
@@ -198,6 +212,7 @@ struct InferenceConfig {
     LOG(INFO) << "=== Inference Configuration ===";
     LOG(INFO) << "CUDA Graph: " << (use_cuda_graph ? "enabled" : "disabled");
     LOG(INFO) << "Fused FFN: " << (use_fused_ffn ? "enabled" : "disabled");
+    LOG(INFO) << "Attention: " << base::AttentionTypeName(attention_type);
     LOG(INFO) << "Stream output: " << (stream_output ? "enabled" : "disabled");
     LOG(INFO) << "Interactive mode: " << (interactive_mode ? "enabled" : "disabled");
     LOG(INFO) << "Prefix Cache: " << (use_prefix_cache ? "enabled" : "disabled");
@@ -225,6 +240,7 @@ inline void print_usage(const char* program_name, const std::string& model_desc)
   LOG(INFO) << "  --cuda-graph       Enable CUDA Graph for decode phase";
   LOG(INFO) << "  --no-cuda-graph    Disable CUDA Graph for decode phase";
   LOG(INFO) << "  --no-fused-ffn     Disable fused FFN optimization";
+  LOG(INFO) << "  --attention TYPE   Set attention type: mha, flash1, flash2 (default: flash1)";
   LOG(INFO) << "  --stream           Enable streaming output (print tokens as generated)";
   LOG(INFO) << "  --interactive, -i  Enable interactive mode (continuous multi-turn dialog)";
   LOG(INFO) << "  --prefix-cache     Enable RadixTree-based prefix cache for KV cache reuse";
@@ -1695,6 +1711,7 @@ int run_model_inference(
     
     // 配置模型选项
     model.enable_fused_ffn(config.use_fused_ffn);
+    model.set_attention_type(config.attention_type);
     
     if (config.use_cuda_graph) {
         model.enable_cuda_graph(true);

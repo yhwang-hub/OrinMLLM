@@ -187,12 +187,18 @@ class FlashAttentionDecodeGpuPosLayer : public Layer {
   base::Status check() const override;
   base::Status forward() override;
   
+  void set_attention_type(base::AttentionType type) { attention_type_ = type; }
+  base::AttentionType get_attention_type() const { return attention_type_; }
+
   // Direct forward for Flash Attention decode with GPU position
   base::Status forward(const int32_t* pos_gpu, int32_t head_num, int32_t kv_head_num,
                        int32_t head_size, int32_t kv_mul, int32_t layer_idx,
                        int32_t seq_len, int32_t kv_dim,
                        const tensor::Tensor& query, const tensor::Tensor& mha_output,
                        const tensor::Tensor& key_cache, const tensor::Tensor& val_cache);
+
+ private:
+  base::AttentionType attention_type_ = base::AttentionType::kAttentionFlash1;
 };
 
 }  // namespace op

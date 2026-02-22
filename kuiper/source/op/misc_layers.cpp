@@ -341,11 +341,19 @@ base::Status FlashAttentionDecodeGpuPosLayer::forward(const int32_t* pos_gpu,
                                                        int32_t seq_len, int32_t kv_dim,
                                                        const tensor::Tensor& query, const tensor::Tensor& mha_output,
                                                        const tensor::Tensor& key_cache, const tensor::Tensor& val_cache) {
-  kernel::flash_attention_decode_fp16_gpu_pos_cu(pos_gpu, head_num, kv_head_num,
-                                                 head_size, kv_mul, layer_idx,
-                                                 seq_len, kv_dim,
-                                                 query, mha_output, key_cache, val_cache,
-                                                 cuda_config_.get());
+  if (attention_type_ == base::AttentionType::kAttentionFlash2) {
+    kernel::flash_attention2_decode_fp16_gpu_pos_cu(pos_gpu, head_num, kv_head_num,
+                                                    head_size, kv_mul, layer_idx,
+                                                    seq_len, kv_dim,
+                                                    query, mha_output, key_cache, val_cache,
+                                                    cuda_config_.get());
+  } else {
+    kernel::flash_attention_decode_fp16_gpu_pos_cu(pos_gpu, head_num, kv_head_num,
+                                                   head_size, kv_mul, layer_idx,
+                                                   seq_len, kv_dim,
+                                                   query, mha_output, key_cache, val_cache,
+                                                   cuda_config_.get());
+  }
   return base::error::Success();
 }
 

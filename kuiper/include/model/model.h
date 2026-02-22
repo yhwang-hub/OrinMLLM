@@ -58,6 +58,10 @@ class Model {
                                     const op::EmbeddingOutput& embedding_output,
                                     bool is_prompt) const;
 
+  // Attention type control (MHA / FlashAttention1 / FlashAttention2)
+  virtual void set_attention_type(base::AttentionType type) { attention_type_ = type; }
+  base::AttentionType get_attention_type() const { return attention_type_; }
+
  protected:
   virtual base::Status insert_buffer(ModelBufferType buffer_idx, const tensor::Tensor& tensor);
 
@@ -98,6 +102,7 @@ class Model {
   base::DeviceType device_type_ = base::DeviceType::kDeviceUnknown;
   base::ModelType model_type_ = base::ModelType::kModelTypeUnknown;
   base::TokenizerType tokenizer_type_ = base::TokenizerType::kEncodeUnknown;
+  base::AttentionType attention_type_ = base::AttentionType::kAttentionFlash1;
 };
 }  // namespace model
 #endif  // KUIPER_INCLUDE_MODEL_MODEL_H_

@@ -125,6 +125,114 @@ void flash_attention_decode_fp16_gpu_pos_cu(
     CudaConfig* config
 );
 
+// ============================================================================
+// FlashAttention v2 Functions - Reduced non-matmul FLOPs, better parallelism
+// ============================================================================
+
+/**
+ * FlashAttention v2 for batched prefill phase (FP16)
+ * Key improvements over v1:
+ * - Delayed rescaling: only rescale output at the very end
+ * - Better warp-level parallelism: warps split across K tiles
+ * - Reduced shared memory synchronization barriers
+ */
+void flash_attention2_prefill_fp16_cu(
+    int32_t start_pos,
+    int32_t seq_len,
+    int32_t head_num,
+    int32_t kv_head_num,
+    int32_t head_size,
+    int32_t kv_mul,
+    int32_t layer_index,
+    int32_t max_seq_len,
+    int32_t kv_dim,
+    const tensor::Tensor& query,
+    const tensor::Tensor& output,
+    const tensor::Tensor& key_cache,
+    const tensor::Tensor& value_cache,
+    CudaConfig* config
+);
+
+/**
+ * FlashAttention v2 for batched prefill phase (FP32)
+ */
+void flash_attention2_prefill_cu(
+    int32_t start_pos,
+    int32_t seq_len,
+    int32_t head_num,
+    int32_t kv_head_num,
+    int32_t head_size,
+    int32_t kv_mul,
+    int32_t layer_index,
+    int32_t max_seq_len,
+    int32_t kv_dim,
+    const tensor::Tensor& query,
+    const tensor::Tensor& output,
+    const tensor::Tensor& key_cache,
+    const tensor::Tensor& value_cache,
+    CudaConfig* config
+);
+
+/**
+ * FlashAttention v2 for single token decode phase (FP16)
+ * - Improved warp scheduling with split-K strategy
+ * - Reduced warp synchronization overhead
+ */
+void flash_attention2_decode_fp16_cu(
+    int32_t pos,
+    int32_t head_num,
+    int32_t kv_head_num,
+    int32_t head_size,
+    int32_t kv_mul,
+    int32_t layer_index,
+    int32_t max_seq_len,
+    int32_t kv_dim,
+    const tensor::Tensor& query,
+    const tensor::Tensor& output,
+    const tensor::Tensor& key_cache,
+    const tensor::Tensor& value_cache,
+    CudaConfig* config
+);
+
+/**
+ * FlashAttention v2 for single token decode phase (FP32)
+ */
+void flash_attention2_decode_cu(
+    int32_t pos,
+    int32_t head_num,
+    int32_t kv_head_num,
+    int32_t head_size,
+    int32_t kv_mul,
+    int32_t layer_index,
+    int32_t max_seq_len,
+    int32_t kv_dim,
+    const tensor::Tensor& query,
+    const tensor::Tensor& output,
+    const tensor::Tensor& key_cache,
+    const tensor::Tensor& value_cache,
+    CudaConfig* config
+);
+
+/**
+ * FlashAttention v2 for single token decode phase (FP16) with GPU pos pointer
+ * Compatible with CUDA Graph - reads position from GPU memory
+ */
+void flash_attention2_decode_fp16_gpu_pos_cu(
+    const int32_t* pos_ptr,
+    int32_t head_num,
+    int32_t kv_head_num,
+    int32_t head_size,
+    int32_t kv_mul,
+    int32_t layer_index,
+    int32_t max_seq_len,
+    int32_t kv_dim,
+    const tensor::Tensor& query,
+    const tensor::Tensor& output,
+    const tensor::Tensor& key_cache,
+    const tensor::Tensor& value_cache,
+    CudaConfig* config
+);
+
 }  // namespace kernel
 
 #endif  // FLASH_ATTENTION_KERNEL_H

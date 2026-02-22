@@ -1193,21 +1193,29 @@ void Qwen3VLModel::attention_mha(int32_t layer_idx, const tensor::Tensor& pos_te
   
   int pos = pos_tensor.index<int32_t>(0);
 
-  // Use Flash Attention FP16 for decode
+  // FP16 data always uses Flash Attention (MHA does not support FP16)
   if (query.data_type() == base::DataType::kDataTypeFp16 &&
       key_cache.data_type() == base::DataType::kDataTypeFp16) {
+    // Use Flash Attention FP16 for decode (FA1 or FA2 based on layer's attention_type_)
     qwen_layers_->flash_attention_decode_layer_->forward(
         pos, config_->head_num_, config_->kv_head_num_,
         config_->head_size_, config_->kv_mul_, layer_idx,
         config_->seq_len_, config_->kv_dim_,
         query, mha_output, key_cache, val_cache);
-  } else {
+  } else if (attention_type_ == base::AttentionType::kAttentionMHA) {
     tensor::Tensor score_storage = get_buffer(ModelBufferType::kScoreStorage);
     const auto& mha_layer = qwen_layers_->mha_layer_;
     CHECK_NE(mha_layer, nullptr) << "The MHA layer is null";
     std::dynamic_pointer_cast<op::MultiHeadAttention>(mha_layer)->set_pos(pos);
     std::dynamic_pointer_cast<op::MultiHeadAttention>(mha_layer)->set_layer_idx(layer_idx);
     STATUS_CHECK(mha_layer->forward(query, score_storage, key_cache, val_cache, mha_output));
+  } else {
+    // FP32 Flash Attention path (FA1 or FA2)
+    qwen_layers_->flash_attention_decode_layer_->forward(
+        pos, config_->head_num_, config_->kv_head_num_,
+        config_->head_size_, config_->kv_mul_, layer_idx,
+        config_->seq_len_, config_->kv_dim_,
+        query, mha_output, key_cache, val_cache);
   }
 
   // WO @ attention output
@@ -1295,7 +1303,7 @@ void Qwen3VLModel::attention_mha_with_graph(int32_t layer_idx, const tensor::Ten
   tensor::Tensor mha_output = get_buffer(ModelBufferType::kOutputMHA);
   tensor::Tensor query = this->get_buffer(ModelBufferType::kQuery);
   
-  // Check if using pure FP16 path
+  // FP16 data always uses Flash Attention (MHA does not support FP16)
   if (query.data_type() == base::DataType::kDataTypeFp16 &&
       key_cache.data_type() == base::DataType::kDataTypeFp16) {
     // Use GPU pos version for CUDA Graph compatibility with FP16
@@ -1305,7 +1313,7 @@ void Qwen3VLModel::attention_mha_with_graph(int32_t layer_idx, const tensor::Ten
         config_->head_size_, config_->kv_mul_, layer_idx,
         config_->seq_len_, config_->kv_dim_,
         query, mha_output, key_cache, val_cache);
-  } else {
+  } else if (attention_type_ == base::AttentionType::kAttentionMHA) {
     // Standard FP32 MHA path with GPU pos
     tensor::Tensor score_storage = get_buffer(ModelBufferType::kScoreStorage);
     qwen_layers_->mha_gpu_pos_layer_->forward(
@@ -1321,6 +1329,14 @@ void Qwen3VLModel::attention_mha_with_graph(int32_t layer_idx, const tensor::Ten
         score_storage,
         key_cache,
         val_cache);
+  } else {
+    // FP32 Flash Attention path with GPU pos (FA1 or FA2)
+    qwen_layers_->flash_attention_decode_gpu_pos_layer_->forward(
+        pos_tensor_gpu.ptr<int32_t>(),
+        config_->head_num_, config_->kv_head_num_,
+        config_->head_size_, config_->kv_mul_, layer_idx,
+        config_->seq_len_, config_->kv_dim_,
+        query, mha_output, key_cache, val_cache);
   }
 
   // WO @ attention output
@@ -3050,6 +3066,21 @@ void Qwen3VLModel::clear_kv_cache() {
     cudaMemsetAsync(const_cast<void*>(value_cache.get_buffer()->ptr()), 0, 
                     value_cache.size() * elem_size, cuda_config_->stream);
     cudaStreamSynchronize(cuda_config_->stream);
+  }
+}
+
+void Qwen3VLModel::set_attention_type(base::AttentionType type) {
+  Model::set_attention_type(type);
+  if (qwen_layers_) {
+    if (qwen_layers_->flash_attention_decode_layer_) {
+      qwen_layers_->flash_attention_decode_layer_->set_attention_type(type);
+    }
+    if (qwen_layers_->flash_attention_prefill_layer_) {
+      qwen_layers_->flash_attention_prefill_layer_->set_attention_type(type);
+    }
+    if (qwen_layers_->flash_attention_decode_gpu_pos_layer_) {
+      qwen_layers_->flash_attention_decode_gpu_pos_layer_->set_attention_type(type);
+    }
   }
 }
 

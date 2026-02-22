@@ -109,6 +109,22 @@ enum class TokenizerType {
   kEncodeBpe = 1,
 };
 
+// Attention computation strategy selection
+enum class AttentionType : uint8_t {
+  kAttentionMHA = 0,      // Standard Multi-Head Attention (materialized score matrix)
+  kAttentionFlash1 = 1,   // FlashAttention v1 (online softmax, tiled K/V)
+  kAttentionFlash2 = 2,   // FlashAttention v2 (reduced non-matmul FLOPs, better parallelism)
+};
+
+inline const char* AttentionTypeName(AttentionType type) {
+  switch (type) {
+    case AttentionType::kAttentionMHA: return "MHA";
+    case AttentionType::kAttentionFlash1: return "FlashAttention1";
+    case AttentionType::kAttentionFlash2: return "FlashAttention2";
+    default: return "Unknown";
+  }
+}
+
 class Status {
  public:
   Status(int code = StatusCode::kSuccess, std::string err_message = "");
