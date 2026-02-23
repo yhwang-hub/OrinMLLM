@@ -16,6 +16,7 @@
 #include "../op/kernels/cuda/add_kernel.cuh"
 #include "../op/kernels/cuda/swiglu_kernel.cuh"
 #include "../op/kernels/cuda/flash_attention_kernel.cuh"
+#include "../op/kernels/cuda/paged_attention_kernel.cuh"
 #include "../op/kernels/cuda/kv_cache_kernel.cuh"
 #include "../op/kernels/cuda/fused_ffn_kernel.cuh"  // Fused FFN optimization
 #include "../op/kernels/cuda/fp16_convert_kernel.cuh"  // FP16/FP32 conversion
@@ -785,13 +786,28 @@ void Qwen2Model::init_mem() {
   CHECK(insert_buffer(ModelBufferType::kW3Output, w3_output));
 
   // kv cache - use FP16 for memory efficiency and bandwidth
-  tensor::Tensor key_cache(activation_dtype, config_->layer_num_, config_->seq_len_,
-                           config_->kv_dim_, true, alloc);
-  tensor::Tensor value_cache(activation_dtype, config_->layer_num_, config_->seq_len_,
-                             config_->kv_dim_, true, alloc);
+  if (use_paged_attention_) {
+    // Paged KV cache: allocate block pool + block table via PagedKVCacheManager
+    cudaStream_t stream = (cuda_config_ ? cuda_config_->stream : nullptr);
+    paged_kv_cache_manager_ = std::make_unique<base::PagedKVCacheManager>(
+        config_->layer_num_, base::PagedKVCacheManager::kDefaultPageSize,
+        config_->kv_dim_, config_->seq_len_, activation_dtype, stream);
+    LOG(INFO) << "PagedAttention: Created paged KV cache manager";
 
-  CHECK(insert_buffer(ModelBufferType::kKeyCache, key_cache));
-  CHECK(insert_buffer(ModelBufferType::kValueCache, value_cache));
+    // Create minimal placeholder buffers so get_buffer() doesn't crash
+    tensor::Tensor key_cache(activation_dtype, 1, true, alloc);
+    tensor::Tensor value_cache(activation_dtype, 1, true, alloc);
+    CHECK(insert_buffer(ModelBufferType::kKeyCache, key_cache));
+    CHECK(insert_buffer(ModelBufferType::kValueCache, value_cache));
+  } else {
+    // Contiguous KV cache
+    tensor::Tensor key_cache(activation_dtype, config_->layer_num_, config_->seq_len_,
+                             config_->kv_dim_, true, alloc);
+    tensor::Tensor value_cache(activation_dtype, config_->layer_num_, config_->seq_len_,
+                               config_->kv_dim_, true, alloc);
+    CHECK(insert_buffer(ModelBufferType::kKeyCache, key_cache));
+    CHECK(insert_buffer(ModelBufferType::kValueCache, value_cache));
+  }
 
   // Wq query output
   tensor::Tensor query(activation_dtype, config_->dim_, true, alloc);
@@ -949,6 +965,11 @@ void Qwen2Model::attention_qkv(int32_t layer_idx, const tensor::Tensor& pos_tens
   // kv cache
   tensor::Tensor query = this->get_buffer(ModelBufferType::kQuery);
   int32_t pos = pos_tensor.index<int32_t>(0);
+  // Paged attention: allocate blocks and sync block table
+  if (use_paged_attention_ && paged_kv_cache_manager_) {
+    paged_kv_cache_manager_->ensure_allocated_to(pos);
+    paged_kv_cache_manager_->sync_block_table();
+  }
   // wq wk wv @ input
   const auto& [key, val] = slice_kv_cache(layer_idx, pos);
   // query
@@ -1019,22 +1040,51 @@ void Qwen2Model::attention_qkv_with_graph(int32_t layer_idx, const tensor::Tenso
   tensor::Tensor key_cache = get_buffer(ModelBufferType::kKeyCache);
   tensor::Tensor val_cache = get_buffer(ModelBufferType::kValueCache);
   
-  // Use layer for unified KV cache copy
-  auto key_cache_layer = qwen_layers_->kv_cache_key_layer_;
-  key_cache_layer->set_layer_index(layer_idx);
-  key_cache_layer->set_use_gpu_pos(true);
-  key_cache_layer->set_input(0, temp_key);
-  key_cache_layer->set_input(1, key_cache);
-  key_cache_layer->set_input(2, pos_tensor);
-  STATUS_CHECK(key_cache_layer->forward());
-  
-  auto value_cache_layer = qwen_layers_->kv_cache_value_layer_;
-  value_cache_layer->set_layer_index(layer_idx);
-  value_cache_layer->set_use_gpu_pos(true);
-  value_cache_layer->set_input(0, temp_value);
-  value_cache_layer->set_input(1, val_cache);
-  value_cache_layer->set_input(2, pos_tensor);
-  STATUS_CHECK(value_cache_layer->forward());
+  if (use_paged_attention_ && paged_kv_cache_manager_) {
+    // Paged KV cache write using paged copy kernels
+    auto* mgr = paged_kv_cache_manager_.get();
+    bool use_fp16 = (temp_key.data_type() == base::DataType::kDataTypeFp16);
+    if (use_fp16) {
+      kernel::paged_copy_to_kv_cache_kernel_fp16(
+          reinterpret_cast<half*>(mgr->key_pool_gpu()), temp_key.ptr<half>(),
+          pos_tensor.ptr<int32_t>(), mgr->block_table_gpu(),
+          config_->kv_dim_, layer_idx, mgr->max_blocks_per_seq(), mgr->page_size(),
+          cuda_config_->stream);
+      kernel::paged_copy_to_kv_cache_kernel_fp16(
+          reinterpret_cast<half*>(mgr->value_pool_gpu()), temp_value.ptr<half>(),
+          pos_tensor.ptr<int32_t>(), mgr->block_table_gpu(),
+          config_->kv_dim_, layer_idx, mgr->max_blocks_per_seq(), mgr->page_size(),
+          cuda_config_->stream);
+    } else {
+      kernel::paged_copy_to_kv_cache_kernel(
+          reinterpret_cast<float*>(mgr->key_pool_gpu()), temp_key.ptr<float>(),
+          pos_tensor.ptr<int32_t>(), mgr->block_table_gpu(),
+          config_->kv_dim_, layer_idx, mgr->max_blocks_per_seq(), mgr->page_size(),
+          cuda_config_->stream);
+      kernel::paged_copy_to_kv_cache_kernel(
+          reinterpret_cast<float*>(mgr->value_pool_gpu()), temp_value.ptr<float>(),
+          pos_tensor.ptr<int32_t>(), mgr->block_table_gpu(),
+          config_->kv_dim_, layer_idx, mgr->max_blocks_per_seq(), mgr->page_size(),
+          cuda_config_->stream);
+    }
+  } else {
+    // Use layer for unified KV cache copy
+    auto key_cache_layer = qwen_layers_->kv_cache_key_layer_;
+    key_cache_layer->set_layer_index(layer_idx);
+    key_cache_layer->set_use_gpu_pos(true);
+    key_cache_layer->set_input(0, temp_key);
+    key_cache_layer->set_input(1, key_cache);
+    key_cache_layer->set_input(2, pos_tensor);
+    STATUS_CHECK(key_cache_layer->forward());
+    
+    auto value_cache_layer = qwen_layers_->kv_cache_value_layer_;
+    value_cache_layer->set_layer_index(layer_idx);
+    value_cache_layer->set_use_gpu_pos(true);
+    value_cache_layer->set_input(0, temp_value);
+    value_cache_layer->set_input(1, val_cache);
+    value_cache_layer->set_input(2, pos_tensor);
+    STATUS_CHECK(value_cache_layer->forward());
+  }
 }
 
 base::Status Qwen2Model::predict(const tensor::Tensor& input, const tensor::Tensor& pos_tensor,
@@ -1058,11 +1108,23 @@ void Qwen2Model::attention_mha(int32_t layer_idx, const tensor::Tensor& pos_tens
   
   int pos = pos_tensor.index<int32_t>(0);
 
+  // Configure paged attention mode for flash attention layers
+  auto configure_paged = [this](auto& layer) {
+    if (use_paged_attention_ && paged_kv_cache_manager_) {
+      auto* mgr = paged_kv_cache_manager_.get();
+      layer->set_paged_mode(true, mgr->page_size(), mgr->max_blocks_per_seq(),
+                            mgr->key_pool_gpu(), mgr->value_pool_gpu(), mgr->block_table_gpu());
+    } else {
+      layer->set_paged_mode(false, 16, 0, nullptr, nullptr, nullptr);
+    }
+  };
+
   // FP16 data always uses Flash Attention (MHA does not support FP16)
   if (query.data_type() == base::DataType::kDataTypeFp16 &&
       key_cache.data_type() == base::DataType::kDataTypeFp16) {
     // Use Flash Attention layer for decode (FP16, FA1 or FA2 based on layer's attention_type_)
     auto flash_attn = qwen_layers_->flash_attention_decode_layer_;
+    configure_paged(flash_attn);
     flash_attn->set_layer_index(layer_idx);
     flash_attn->set_pos(pos);
     flash_attn->set_use_gpu_pos(false);
@@ -1084,6 +1146,7 @@ void Qwen2Model::attention_mha(int32_t layer_idx, const tensor::Tensor& pos_tens
   } else {
     // FP32 Flash Attention path (FA1 or FA2)
     auto flash_attn = qwen_layers_->flash_attention_decode_layer_;
+    configure_paged(flash_attn);
     flash_attn->set_layer_index(layer_idx);
     flash_attn->set_pos(pos);
     flash_attn->set_use_gpu_pos(false);
@@ -1112,11 +1175,23 @@ void Qwen2Model::attention_mha_with_graph(int32_t layer_idx, const tensor::Tenso
   tensor::Tensor mha_output = get_buffer(ModelBufferType::kOutputMHA);
   tensor::Tensor query = this->get_buffer(ModelBufferType::kQuery);
   
+  // Configure paged attention mode for flash attention layers
+  auto configure_paged = [this](auto& layer) {
+    if (use_paged_attention_ && paged_kv_cache_manager_) {
+      auto* mgr = paged_kv_cache_manager_.get();
+      layer->set_paged_mode(true, mgr->page_size(), mgr->max_blocks_per_seq(),
+                            mgr->key_pool_gpu(), mgr->value_pool_gpu(), mgr->block_table_gpu());
+    } else {
+      layer->set_paged_mode(false, 16, 0, nullptr, nullptr, nullptr);
+    }
+  };
+
   // FP16 data always uses Flash Attention (MHA does not support FP16)
   if (query.data_type() == base::DataType::kDataTypeFp16 &&
       key_cache.data_type() == base::DataType::kDataTypeFp16) {
     // Use Flash Attention layer with GPU pos for CUDA Graph compatibility (FP16)
     auto flash_attn = qwen_layers_->flash_attention_decode_layer_;
+    configure_paged(flash_attn);
     flash_attn->set_layer_index(layer_idx);
     flash_attn->set_use_gpu_pos(true);
     flash_attn->set_input(0, query);
@@ -1558,6 +1633,23 @@ void Qwen2Model::batched_attention_qkv(int32_t layer_idx, const tensor::Tensor& 
   
   int32_t layer_offset = layer_idx * config_->seq_len_ * config_->kv_dim_;
   
+  if (use_paged_attention_ && paged_kv_cache_manager_) {
+    // Paged KV cache: allocate blocks for the full sequence
+    auto* mgr = paged_kv_cache_manager_.get();
+    mgr->ensure_allocated_to(start_pos + seq_len - 1);
+    mgr->sync_block_table();
+    
+    size_t elem_size = (value_cache.data_type() == base::DataType::kDataTypeFp16)
+                       ? sizeof(uint16_t) : sizeof(float);
+    for (int i = 0; i < seq_len; ++i) {
+      size_t byte_offset = mgr->get_kv_byte_offset(layer_idx, start_pos + i);
+      void* v_dst = reinterpret_cast<char*>(mgr->value_pool_gpu()) + byte_offset;
+      const void* v_src = reinterpret_cast<const char*>(value_out.get_buffer()->ptr()) + 
+                          (size_t)i * config_->kv_dim_ * elem_size;
+      cudaMemcpyAsync(v_dst, v_src, config_->kv_dim_ * elem_size,
+                      cudaMemcpyDeviceToDevice, cuda_config_->stream);
+    }
+  } else {
   // Check if using FP16 path
   if (value_cache.data_type() == base::DataType::kDataTypeFp16) {
     for (int i = 0; i < seq_len; ++i) {
@@ -1576,6 +1668,7 @@ void Qwen2Model::batched_attention_qkv(int32_t layer_idx, const tensor::Tensor& 
                       cudaMemcpyDeviceToDevice, cuda_config_->stream);
     }
   }
+  } // end contiguous path
   
   // Apply RoPE to query and key (in-place) via layer abstraction
   auto batched_rope = qwen_layers_->batched_rope_layer_;
@@ -1625,6 +1718,20 @@ void Qwen2Model::batched_attention_qkv(int32_t layer_idx, const tensor::Tensor& 
   #endif
   
   // Copy RoPE'd keys to KV cache
+  if (use_paged_attention_ && paged_kv_cache_manager_) {
+    // Paged key copy
+    auto* mgr = paged_kv_cache_manager_.get();
+    size_t elem_size = (key_cache.data_type() == base::DataType::kDataTypeFp16)
+                       ? sizeof(uint16_t) : sizeof(float);
+    for (int i = 0; i < seq_len; ++i) {
+      size_t byte_offset = mgr->get_kv_byte_offset(layer_idx, start_pos + i);
+      void* k_dst = reinterpret_cast<char*>(mgr->key_pool_gpu()) + byte_offset;
+      const void* k_src = reinterpret_cast<const char*>(key_out.get_buffer()->ptr()) + 
+                          (size_t)i * config_->kv_dim_ * elem_size;
+      cudaMemcpyAsync(k_dst, k_src, config_->kv_dim_ * elem_size,
+                      cudaMemcpyDeviceToDevice, cuda_config_->stream);
+    }
+  } else {
   if (key_cache.data_type() == base::DataType::kDataTypeFp16) {
     for (int i = 0; i < seq_len; ++i) {
       int32_t cache_offset = layer_offset + (start_pos + i) * config_->kv_dim_;
@@ -1642,6 +1749,7 @@ void Qwen2Model::batched_attention_qkv(int32_t layer_idx, const tensor::Tensor& 
                       cudaMemcpyDeviceToDevice, cuda_config_->stream);
     }
   }
+  } // end contiguous key copy path
 }
 
 void Qwen2Model::batched_attention_mha(int32_t layer_idx, const tensor::Tensor& query,
@@ -1667,6 +1775,14 @@ void Qwen2Model::batched_attention_mha(int32_t layer_idx, const tensor::Tensor& 
   } else {
     // Use Flash Attention prefill via layer abstraction (FA1 or FA2)
     auto prefill_layer = qwen_layers_->flash_attention_prefill_layer_;
+    // Configure paged mode if enabled
+    if (use_paged_attention_ && paged_kv_cache_manager_) {
+      auto* mgr = paged_kv_cache_manager_.get();
+      prefill_layer->set_paged_mode(true, mgr->page_size(), mgr->max_blocks_per_seq(),
+                                    mgr->key_pool_gpu(), mgr->value_pool_gpu(), mgr->block_table_gpu());
+    } else {
+      prefill_layer->set_paged_mode(false, 16, 0, nullptr, nullptr, nullptr);
+    }
     prefill_layer->set_cur_seq_len(seq_len);
     prefill_layer->set_start_pos(start_pos);
     prefill_layer->set_layer_index(layer_idx);
@@ -1894,7 +2010,11 @@ base::Status Qwen2Model::decode(const tensor::Tensor& input, int32_t pos, int& n
   }
   
   // Check if we should use CUDA Graph optimization
+  // FP32 + Paged Attention is not compatible with CUDA Graph (no FP32 paged GPU-pos kernel)
   bool use_graph = cuda_config_ && cuda_config_->should_use_graph();
+  if (use_graph && !is_fp16_model_ && use_paged_attention_) {
+    use_graph = false;
+  }
   
   if (use_graph) {
     // Use fixed-address buffers for CUDA Graph compatibility
@@ -1925,6 +2045,13 @@ base::Status Qwen2Model::decode(const tensor::Tensor& input, int32_t pos, int& n
     cudaMemcpyAsync(const_cast<int32_t*>(pos_tensor_gpu.ptr<int32_t>()), 
                     pos_pinned.ptr<int32_t>(), sizeof(int32_t), 
                     cudaMemcpyHostToDevice, cuda_config_->stream);
+    
+    // Paged attention: allocate blocks and sync block table BEFORE graph capture/launch
+    // These operations involve CPU-side allocation and cudaMemcpy, must not be inside graph capture
+    if (use_paged_attention_ && paged_kv_cache_manager_) {
+      paged_kv_cache_manager_->ensure_allocated_to(pos);
+      paged_kv_cache_manager_->sync_block_table();
+    }
     
     if (need_capture && !graph->is_disabled()) {
       // Sync before capture to ensure copies are complete
@@ -2030,6 +2157,12 @@ base::Status Qwen2Model::decode(const tensor::Tensor& input, int32_t pos, int& n
 }
 
 void Qwen2Model::clear_kv_cache() {
+  // Paged attention: clear the paged KV cache manager
+  if (use_paged_attention_ && paged_kv_cache_manager_) {
+    paged_kv_cache_manager_->clear();
+    invalidate_cuda_graph();
+    return;
+  }
   tensor::Tensor key_cache = get_buffer(ModelBufferType::kKeyCache);
   tensor::Tensor value_cache = get_buffer(ModelBufferType::kValueCache);
   

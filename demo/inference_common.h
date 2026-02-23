@@ -134,6 +134,7 @@ struct InferenceConfig {
   int max_context_len = 8192;        // 最大上下文长度
   bool use_prefix_cache = false;     // 是否使用 RadixTree prefix cache
   int64_t prefix_cache_size = 65536; // prefix cache 最大 token 数
+  bool use_paged_attention = false;  // 是否使用 PagedAttention
   bool benchmark_mode = false;       // 是否运行性能基准测试
   int benchmark_decode_tokens = 1024; // benchmark模式下的decode token数
   base::AttentionType attention_type = base::AttentionType::kAttentionFlash1; // 注意力计算类型
@@ -197,6 +198,8 @@ struct InferenceConfig {
         ++i;
       } else if (arg == "--benchmark") {
         config.benchmark_mode = true;
+      } else if (arg == "--paged-attention") {
+        config.use_paged_attention = true;
       } else if (arg == "--benchmark-decode-tokens" && i + 1 < argc) {
         config.benchmark_decode_tokens = std::atoi(argv[i + 1]);
         if (config.benchmark_decode_tokens <= 0) config.benchmark_decode_tokens = 1024;
@@ -219,6 +222,7 @@ struct InferenceConfig {
     if (use_prefix_cache) {
       LOG(INFO) << "Prefix Cache Size: " << prefix_cache_size << " tokens";
     }
+    LOG(INFO) << "Paged Attention: " << (use_paged_attention ? "enabled" : "disabled");
     LOG(INFO) << "Max tokens: " << max_tokens;
     LOG(INFO) << "Max context: " << max_context_len;
     if (interactive_mode) {
@@ -1701,6 +1705,10 @@ int run_model_inference(
     // 初始化模型
     ModelType model(base::TokenizerType::kEncodeBpe, tokenizer_path,
                     checkpoint_path, false);
+    // Enable paged attention BEFORE init (affects KV cache allocation)
+    if (config.use_paged_attention) {
+        model.enable_paged_attention(true);
+    }
     auto init_status = model.init(base::DeviceType::kDeviceCUDA);
     if (!init_status) {
         LOG(FATAL) << "The model init failed, the error code is: " << init_status.get_err_code();

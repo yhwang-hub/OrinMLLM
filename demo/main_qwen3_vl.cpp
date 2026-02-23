@@ -86,6 +86,7 @@ struct VLInferenceConfig {
   bool stream_output = false;
   bool verbose = false;
   bool use_cuda_graph = false;
+  bool use_paged_attention = false;
   base::AttentionType attention_type = base::AttentionType::kAttentionFlash1;
 };
 
@@ -117,6 +118,7 @@ VLInferenceConfig parse_args(int argc, char* argv[]) {
     {"max-pixels", required_argument, 0, 'x'},
     {"stream", no_argument, 0, 's'},
     {"cuda-graph", no_argument, 0, 'g'},
+    {"paged-attention", no_argument, 0, 'P'},
     {"attention", required_argument, 0, 'a'},
     {"verbose", no_argument, 0, 'v'},
     {"help", no_argument, 0, 'h'},
@@ -126,7 +128,7 @@ VLInferenceConfig parse_args(int argc, char* argv[]) {
   int opt;
   int option_index = 0;
   
-  while ((opt = getopt_long(argc, argv, "i:p:m:x:a:sgvh", long_options, &option_index)) != -1) {
+  while ((opt = getopt_long(argc, argv, "i:p:m:x:a:sgPvh", long_options, &option_index)) != -1) {
     switch (opt) {
       case 'i':
         config.image_path = optarg;
@@ -145,6 +147,9 @@ VLInferenceConfig parse_args(int argc, char* argv[]) {
         break;
       case 'g':
         config.use_cuda_graph = true;
+        break;
+      case 'P':
+        config.use_paged_attention = true;
         break;      case 'a': {
         std::string attn_str = optarg;
         if (attn_str == "mha") {
@@ -229,6 +234,7 @@ int run_inference(const VLInferenceConfig& config) {
   LOG(INFO) << "Max tokens: " << config.max_tokens;
   LOG(INFO) << "Stream output: " << (config.stream_output ? "enabled" : "disabled");
   LOG(INFO) << "CUDA Graph: " << (config.use_cuda_graph ? "enabled" : "disabled");
+  LOG(INFO) << "Paged Attention: " << (config.use_paged_attention ? "enabled" : "disabled");
   LOG(INFO) << "Attention: " << base::AttentionTypeName(config.attention_type);
   
   // Create model
@@ -240,6 +246,11 @@ int run_inference(const VLInferenceConfig& config) {
   LOG(INFO) << "Initializing model...";
   inference::Timer init_timer;
   init_timer.start();
+  
+  // Enable paged attention BEFORE init (affects KV cache allocation)
+  if (config.use_paged_attention) {
+    model.enable_paged_attention(true);
+  }
   
   auto status = model.init(base::DeviceType::kDeviceCUDA);
   if (!status) {

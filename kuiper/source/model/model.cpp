@@ -347,6 +347,37 @@ std::string Model::decode(std::vector<int32_t> token_idxs) const {
 
 std::pair<tensor::Tensor, tensor::Tensor> Model::slice_kv_cache(int32_t layer_idx,
                                                                 int32_t token_pos) const {
+  // ===================== Paged KV Cache Path =====================
+  if (use_paged_attention_ && paged_kv_cache_manager_) {
+    auto* mgr = paged_kv_cache_manager_.get();
+    size_t byte_offset = mgr->get_kv_byte_offset(layer_idx, token_pos);
+
+    if (mgr->dtype() == base::DataType::kDataTypeFp16) {
+      uint16_t* key_ptr = reinterpret_cast<uint16_t*>(
+          static_cast<char*>(mgr->key_pool_gpu()) + byte_offset);
+      uint16_t* val_ptr = reinterpret_cast<uint16_t*>(
+          static_cast<char*>(mgr->value_pool_gpu()) + byte_offset);
+
+      tensor::Tensor key(base::DataType::kDataTypeFp16, config_->kv_dim_, false, nullptr, key_ptr);
+      tensor::Tensor val(base::DataType::kDataTypeFp16, config_->kv_dim_, false, nullptr, val_ptr);
+      key.set_device_type(device_type_);
+      val.set_device_type(device_type_);
+      return {key, val};
+    } else {
+      float* key_ptr = reinterpret_cast<float*>(
+          static_cast<char*>(mgr->key_pool_gpu()) + byte_offset);
+      float* val_ptr = reinterpret_cast<float*>(
+          static_cast<char*>(mgr->value_pool_gpu()) + byte_offset);
+
+      tensor::Tensor key(base::DataType::kDataTypeFp32, config_->kv_dim_, false, nullptr, key_ptr);
+      tensor::Tensor val(base::DataType::kDataTypeFp32, config_->kv_dim_, false, nullptr, val_ptr);
+      key.set_device_type(device_type_);
+      val.set_device_type(device_type_);
+      return {key, val};
+    }
+  }
+
+  // ===================== Contiguous KV Cache Path =====================
   int32_t layer_offset = layer_idx * config_->seq_len_ * config_->kv_dim_;
   int32_t cache_offset = layer_offset + token_pos * config_->kv_dim_;
 

@@ -190,6 +190,19 @@ class FlashAttentionDecodeGpuPosLayer : public Layer {
   void set_attention_type(base::AttentionType type) { attention_type_ = type; }
   base::AttentionType get_attention_type() const { return attention_type_; }
 
+  // Paged attention support
+  void set_paged_mode(bool paged, int32_t page_size, int32_t max_blocks_per_seq,
+                      const void* key_pool, const void* value_pool,
+                      const int32_t* block_table) {
+    paged_mode_ = paged;
+    page_size_ = page_size;
+    max_blocks_per_seq_ = max_blocks_per_seq;
+    key_pool_ = key_pool;
+    value_pool_ = value_pool;
+    block_table_ = block_table;
+  }
+  bool is_paged_mode() const { return paged_mode_; }
+
   // Direct forward for Flash Attention decode with GPU position
   base::Status forward(const int32_t* pos_gpu, int32_t head_num, int32_t kv_head_num,
                        int32_t head_size, int32_t kv_mul, int32_t layer_idx,
@@ -199,6 +212,13 @@ class FlashAttentionDecodeGpuPosLayer : public Layer {
 
  private:
   base::AttentionType attention_type_ = base::AttentionType::kAttentionFlash1;
+  // Paged attention state
+  bool paged_mode_ = false;
+  int32_t page_size_ = 16;
+  int32_t max_blocks_per_seq_ = 0;
+  const void* key_pool_ = nullptr;
+  const void* value_pool_ = nullptr;
+  const int32_t* block_table_ = nullptr;
 };
 
 }  // namespace op

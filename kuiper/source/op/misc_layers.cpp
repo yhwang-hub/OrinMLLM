@@ -5,6 +5,7 @@
 #include "kernels/cuda/mha_kernel.cuh"
 #include "kernels/cuda/matmul_kernel.cuh"
 #include "kernels/cuda/flash_attention_kernel.cuh"
+#include "kernels/cuda/paged_attention_kernel.cuh"
 #include "kernels/cuda/rmsnorm_kernel.cuh"
 #include "kernels/cuda/kv_cache_kernel.cuh"
 #include "kernels/cuda/fused_kernels.cuh"
@@ -341,6 +342,15 @@ base::Status FlashAttentionDecodeGpuPosLayer::forward(const int32_t* pos_gpu,
                                                        int32_t seq_len, int32_t kv_dim,
                                                        const tensor::Tensor& query, const tensor::Tensor& mha_output,
                                                        const tensor::Tensor& key_cache, const tensor::Tensor& val_cache) {
+  // Paged attention path
+  if (paged_mode_) {
+    kernel::paged_flash_attention_decode_fp16_gpu_pos_cu(
+        pos_gpu, head_num, kv_head_num, head_size, kv_mul, layer_idx,
+        kv_dim, page_size_, max_blocks_per_seq_,
+        query, mha_output, key_pool_, value_pool_, block_table_,
+        cuda_config_.get());
+    return base::error::Success();
+  }
   if (attention_type_ == base::AttentionType::kAttentionFlash2) {
     kernel::flash_attention2_decode_fp16_gpu_pos_cu(pos_gpu, head_num, kv_head_num,
                                                     head_size, kv_mul, layer_idx,
