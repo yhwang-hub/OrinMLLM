@@ -2,7 +2,6 @@
 #define KUIPER_INCLUDE_MODEL_MODEL_H_
 #include <op/embedding.h>
 #include <map>
-#include <memory>
 #include <string>
 #include "config.h"
 #include "op/encode.h"
@@ -11,7 +10,6 @@
 #include "sampler/argmax_sampler.h"
 #include "sentencepiece_processor.h"
 #include "tensor/tensor.h"
-#include "base/paged_kv_cache.h"
 
 namespace model {
 class Model {
@@ -64,11 +62,6 @@ class Model {
   virtual void set_attention_type(base::AttentionType type) { attention_type_ = type; }
   base::AttentionType get_attention_type() const { return attention_type_; }
 
-  // Paged Attention control
-  void enable_paged_attention(bool enable) { use_paged_attention_ = enable; }
-  bool is_paged_attention() const { return use_paged_attention_; }
-  base::PagedKVCacheManager* get_paged_kv_cache() const { return paged_kv_cache_manager_.get(); }
-
  protected:
   virtual base::Status insert_buffer(ModelBufferType buffer_idx, const tensor::Tensor& tensor);
 
@@ -98,8 +91,6 @@ class Model {
   bool is_quant_model_ = false;
   bool is_fp16_model_ = false;  // FP16 model flag (version 3)
   bool is_awq_model_ = false;   // AWQ INT4 model flag (version 5)
-  bool use_paged_attention_ = false;  // Paged KV cache flag
-  std::unique_ptr<base::PagedKVCacheManager> paged_kv_cache_manager_;
   std::unique_ptr<TransformerConfig> config_;
 
   std::string token_path_;

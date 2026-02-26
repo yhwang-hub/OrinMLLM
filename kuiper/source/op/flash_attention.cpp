@@ -1,7 +1,6 @@
 #include "op/flash_attention.h"
 #include <cuda_runtime_api.h>
 #include "kernels/cuda/flash_attention_kernel.cuh"
-#include "kernels/cuda/paged_attention_kernel.cuh"
 #include "kernels/cuda/mha_kernel.cuh"
 #include "kernels/kernels_interface.h"
 
@@ -48,35 +47,6 @@ base::Status FlashAttentionDecodeLayer::forward() {
   const tensor::Tensor& key_cache = get_input(2);
   const tensor::Tensor& value_cache = get_input(3);
 
-  // ===================== Paged Attention Path =====================
-  if (paged_mode_) {
-    if (use_fp16_) {
-      if (use_gpu_pos_) {
-        const tensor::Tensor& pos_tensor = get_input(4);
-        kernel::paged_flash_attention_decode_fp16_gpu_pos_cu(
-            pos_tensor.ptr<int32_t>(),
-            head_num_, kv_head_num_, head_size_, kv_mul_,
-            layer_index_, kv_dim_, page_size_, max_blocks_per_seq_,
-            query, mha_output, key_pool_, value_pool_, block_table_,
-            cuda_config_.get());
-      } else {
-        kernel::paged_flash_attention_decode_fp16_cu(
-            pos_, head_num_, kv_head_num_, head_size_, kv_mul_,
-            layer_index_, kv_dim_, page_size_, max_blocks_per_seq_,
-            query, mha_output, key_pool_, value_pool_, block_table_,
-            cuda_config_.get());
-      }
-    } else {
-      kernel::paged_flash_attention_decode_cu(
-          pos_, head_num_, kv_head_num_, head_size_, kv_mul_,
-          layer_index_, kv_dim_, page_size_, max_blocks_per_seq_,
-          query, mha_output, key_pool_, value_pool_, block_table_,
-          cuda_config_.get());
-    }
-    return base::error::Success();
-  }
-
-  // ===================== Contiguous Attention Path =====================
   if (use_fp16_) {
     if (use_gpu_pos_) {
       const tensor::Tensor& pos_tensor = get_input(4);
@@ -142,23 +112,6 @@ base::Status FlashAttentionDecodeLayer::forward(int32_t pos, int32_t head_num, i
                                                  int32_t seq_len, int32_t kv_dim,
                                                  const tensor::Tensor& query, const tensor::Tensor& mha_output,
                                                  const tensor::Tensor& key_cache, const tensor::Tensor& val_cache) {
-  // Paged attention path (direct overload)
-  if (paged_mode_) {
-    if (query.data_type() == base::DataType::kDataTypeFp16) {
-      kernel::paged_flash_attention_decode_fp16_cu(
-          pos, head_num, kv_head_num, head_size, kv_mul, layer_idx,
-          kv_dim, page_size_, max_blocks_per_seq_,
-          query, mha_output, key_pool_, value_pool_, block_table_,
-          cuda_config_.get());
-    } else {
-      kernel::paged_flash_attention_decode_cu(
-          pos, head_num, kv_head_num, head_size, kv_mul, layer_idx,
-          kv_dim, page_size_, max_blocks_per_seq_,
-          query, mha_output, key_pool_, value_pool_, block_table_,
-          cuda_config_.get());
-    }
-    return base::error::Success();
-  }
   if (attention_type_ == base::AttentionType::kAttentionFlash2) {
     kernel::flash_attention2_decode_fp16_cu(
         pos, head_num, kv_head_num, head_size, kv_mul,
@@ -217,25 +170,6 @@ base::Status FlashAttentionPrefillLayer::forward() {
   int32_t kv_mul = head_num_ / kv_head_num_;
   int32_t kv_dim = kv_head_num_ * head_size_;
 
-  // ===================== Paged Attention Path =====================
-  if (paged_mode_) {
-    if (use_fp16_) {
-      kernel::paged_flash_attention_prefill_fp16_cu(
-          start_pos_, cur_seq_len_, head_num_, kv_head_num_, head_size_,
-          kv_mul, layer_idx_, kv_dim, page_size_, max_blocks_per_seq_,
-          query, output, key_pool_, value_pool_, block_table_,
-          cuda_config_.get());
-    } else {
-      kernel::paged_flash_attention_prefill_cu(
-          start_pos_, cur_seq_len_, head_num_, kv_head_num_, head_size_,
-          kv_mul, layer_idx_, kv_dim, page_size_, max_blocks_per_seq_,
-          query, output, key_pool_, value_pool_, block_table_,
-          cuda_config_.get());
-    }
-    return base::error::Success();
-  }
-
-  // ===================== Contiguous Attention Path =====================
   if (use_fp16_) {
     if (attention_type_ == base::AttentionType::kAttentionFlash2) {
       kernel::flash_attention2_prefill_fp16_cu(
@@ -275,23 +209,6 @@ base::Status FlashAttentionPrefillLayer::forward(int32_t start_pos, int32_t seq_
                                                   int32_t max_seq_len, int32_t kv_dim,
                                                   const tensor::Tensor& query, const tensor::Tensor& output,
                                                   const tensor::Tensor& key_cache, const tensor::Tensor& val_cache) {
-  // Paged attention path (direct overload)
-  if (paged_mode_) {
-    if (query.data_type() == base::DataType::kDataTypeFp16) {
-      kernel::paged_flash_attention_prefill_fp16_cu(
-          start_pos, seq_len, head_num, kv_head_num, head_size,
-          kv_mul, layer_idx, kv_dim, page_size_, max_blocks_per_seq_,
-          query, output, key_pool_, value_pool_, block_table_,
-          cuda_config_.get());
-    } else {
-      kernel::paged_flash_attention_prefill_cu(
-          start_pos, seq_len, head_num, kv_head_num, head_size,
-          kv_mul, layer_idx, kv_dim, page_size_, max_blocks_per_seq_,
-          query, output, key_pool_, value_pool_, block_table_,
-          cuda_config_.get());
-    }
-    return base::error::Success();
-  }
   if (attention_type_ == base::AttentionType::kAttentionFlash2) {
     kernel::flash_attention2_prefill_fp16_cu(
         start_pos, seq_len, head_num, kv_head_num, head_size,

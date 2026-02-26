@@ -49,19 +49,6 @@ class FlashAttentionDecodeLayer : public Layer {
   void set_attention_type(base::AttentionType type) { attention_type_ = type; }
   base::AttentionType get_attention_type() const { return attention_type_; }
 
-  // Paged attention support
-  void set_paged_mode(bool paged, int32_t page_size, int32_t max_blocks_per_seq,
-                      const void* key_pool, const void* value_pool,
-                      const int32_t* block_table) {
-    paged_mode_ = paged;
-    page_size_ = page_size;
-    max_blocks_per_seq_ = max_blocks_per_seq;
-    key_pool_ = key_pool;
-    value_pool_ = value_pool;
-    block_table_ = block_table;
-  }
-  bool is_paged_mode() const { return paged_mode_; }
-
  private:
   int32_t head_num_ = 0;
   int32_t kv_head_num_ = 0;
@@ -74,14 +61,6 @@ class FlashAttentionDecodeLayer : public Layer {
   bool use_fp16_ = false;
   bool use_gpu_pos_ = false;
   base::AttentionType attention_type_ = base::AttentionType::kAttentionFlash1;
-
-  // Paged attention state
-  bool paged_mode_ = false;
-  int32_t page_size_ = 16;
-  int32_t max_blocks_per_seq_ = 0;
-  const void* key_pool_ = nullptr;
-  const void* value_pool_ = nullptr;
-  const int32_t* block_table_ = nullptr;
 };
 
 /**
@@ -123,19 +102,6 @@ class FlashAttentionPrefillLayer : public Layer {
   void set_attention_type(base::AttentionType type) { attention_type_ = type; }
   base::AttentionType get_attention_type() const { return attention_type_; }
 
-  // Paged attention support
-  void set_paged_mode(bool paged, int32_t page_size, int32_t max_blocks_per_seq,
-                      const void* key_pool, const void* value_pool,
-                      const int32_t* block_table) {
-    paged_mode_ = paged;
-    page_size_ = page_size;
-    max_blocks_per_seq_ = max_blocks_per_seq;
-    key_pool_ = key_pool;
-    value_pool_ = value_pool;
-    block_table_ = block_table;
-  }
-  bool is_paged_mode() const { return paged_mode_; }
-
  private:
   int32_t head_num_ = 0;
   int32_t kv_head_num_ = 0;
@@ -146,14 +112,6 @@ class FlashAttentionPrefillLayer : public Layer {
   int32_t layer_idx_ = 0;
   bool use_fp16_ = false;
   base::AttentionType attention_type_ = base::AttentionType::kAttentionFlash1;
-
-  // Paged attention state
-  bool paged_mode_ = false;
-  int32_t page_size_ = 16;
-  int32_t max_blocks_per_seq_ = 0;
-  const void* key_pool_ = nullptr;
-  const void* value_pool_ = nullptr;
-  const int32_t* block_table_ = nullptr;
 };
 
 }  // namespace op
