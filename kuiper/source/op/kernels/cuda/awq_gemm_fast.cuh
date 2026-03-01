@@ -52,16 +52,4 @@ void awq_gemm_fast_cu(
     cudaStream_t stream
 );
 
-/**
- * Initialize global resources for AWQ kernels.
- * Call once at startup.
- */
-void awq_fast_init();
-
-/**
- * Cleanup global resources.
- * Call at shutdown.
- */
-void awq_fast_cleanup();
-
 }  // namespace kernel

@@ -1136,7 +1136,570 @@ fused_gate_up_swiglu_kernel_fp16_v2<32, 8><<<1376, 256, 0, stream>>>(...);
 | Shared Memory | 0 bytes | Warp shuffle 不需要 shared memory |
 | 寄存器/线程 | ~32 个 | 8 个 FP32 累加器 + 临时变量 |
 
-### 6.4 与标准 FP16 GEMV Kernel 的逐项优化对比
+### 6.4 从硬件层次理解 Kernel 的计算过程
+
+本节从 **Global Memory、Shared Memory、Block、Thread（Warp/Lane）** 四个硬件抽象层次，自顶向下剖析 `fused_gate_up_swiglu_kernel_fp16_v2` 如何完成 FFN 算子的计算。
+
+#### 6.4.1 Global Memory 层面
+
+Global Memory（全局显存 / DRAM）是 GPU 上容量最大、延迟最高的存储层级（Orin 上带宽约 102.4 GB/s，延迟 ~400-600 cycles）。本 kernel 的全局内存访问模式如下：
+
+**输入数据（只读）**：
+
+| 数据 | 形状 | 大小（Qwen3-8B, FP16） | 访问模式 |
+|------|------|------------------------|----------|
+| `input[M]` | $[4096]$ | 8 KB | 所有 warp 共享读取同一份 input |
+| `w1[K, M]` | $[11008, 4096]$ | ~86 MB | 每个 warp 读取不同的行 |
+| `w3[K, M]` | $[11008, 4096]$ | ~86 MB | 每个 warp 读取不同的行 |
+
+**输出数据（只写）**：
+
+| 数据 | 形状 | 大小 | 访问模式 |
+|------|------|------|----------|
+| `output[K]` | $[11008]$ | ~22 KB | 每个 warp 中仅 lane 0 写一个元素 |
+
+**全局内存访问总量**（整个 kernel 执行期间）：
+
+$$\text{读取} = \underbrace{K \times M \times 2B}_{W1\ 权重} + \underbrace{K \times M \times 2B}_{W3\ 权重} + \underbrace{K \times M \times 2B}_{input\ 被\ K\ 个\ warp\ 各读一次} = 3 \times 11008 \times 4096 \times 2 \approx 258\ \text{MB}$$
+
+> **注**：虽然 input 只有 8KB，但每个 warp 独立加载一遍。由于 input 较小（8KB < L2 Cache 4MB），第一个 warp 读取后会被缓存到 L2/L1，后续 warp 的读取均命中缓存，实际 DRAM 读取约 86 MB + 86 MB + 8 KB ≈ 172 MB。
+
+$$\text{写入} = K \times 2B = 11008 \times 2 = 22\ \text{KB}$$
+
+**关键设计：`__ldg` 只读缓存路径**
+
+所有全局内存读取均通过 `__ldg()` 内建函数执行。`__ldg` 走 GPU 的 **只读纹理缓存路径（L1 Read-Only Cache / Texture Cache）**，而非默认的 L1 Data Cache。这意味着：
+
+1. 只读数据不会被写操作（`output[row] = ...`）的 cache 一致性协议干扰
+2. 只读缓存有独立的 tag 和替换逻辑，对广播式访问模式（如 input 被所有 warp 共享）更友好
+3. 编译器不需要在 `__ldg` 加载前后插入 fence 指令，减少指令开销
+
+**关键设计：float4 向量化合并访问（Coalesced Access）**
+
+每个线程使用 `float4`（128-bit = 16 Bytes）一次加载 8 个 half 元素。当一个 warp 的 32 个线程同时执行 `__ldg(input_f4 + i)` 时（`i = lane_id, lane_id + 32, ...`），它们访问的地址是连续的：
+
+```
+Warp 中 32 个线程的 float4 加载地址：
+  lane 0:  input_f4[0]   → 地址 0x0000 ~ 0x000F  (16B)
+  lane 1:  input_f4[1]   → 地址 0x0010 ~ 0x001F  (16B)
+  lane 2:  input_f4[2]   → 地址 0x0020 ~ 0x002F  (16B)
+  ...
+  lane 31: input_f4[31]  → 地址 0x01F0 ~ 0x01FF  (16B)
+  
+  总计：32 × 16B = 512B 连续访问 → 4 个 128B cache line 事务
+  → 100% 带宽利用率（无浪费字节）
+```
+
+如果使用标量 `half` 加载（2B/次），同样 32 线程只覆盖 64B，仍需 1 个 128B cache line 事务，但有一半带宽被浪费。`float4` 将带宽利用率提升至最优。
+
+#### 6.4.2 Shared Memory 层面
+
+**本 kernel 没有使用任何 Shared Memory**。这是一个重要的设计决策。
+
+Shared Memory 是片上 SRAM（Orin SM 8.7 上每个 SM 最多 164 KB，与 L1 Cache 共享），位于 Block 内所有线程可见的地址空间中，延迟约 20-30 cycles。
+
+**为什么不使用 Shared Memory？**
+
+在 FP32 版本的 `fused_gate_up_swiglu_kernel` 中，使用了 CUB 的 `BlockReduce`，需要约 2KB shared memory 作为 `TempStorage`。而 FP16 版本选择了完全不同的策略——**以 Warp（32 线程）为计算粒度**，用 Warp Shuffle 代替 Shared Memory Reduction：
+
+| 策略 | 归约范围 | 需要 Shared Memory？ | 需要 `__syncthreads`？ | 延迟 |
+|------|---------|---------------------|---------------------|------|
+| CUB BlockReduce (FP32 版) | Block 内 256 线程 | 是（~1KB × 2） | 是 | ~20-30 cycles/step |
+| Warp Shuffle (FP16 版) | Warp 内 32 线程 | **否（0 字节）** | **否（warp 锁步）** | **~1 cycle/step** |
+
+**不使用 Shared Memory 带来的好处**：
+
+1. **Occupancy 最大化**：Shared Memory = 0 意味着 SM 上 block 数量的唯一限制因素变为寄存器数量和线程数，而非 Shared Memory 容量。Orin 每个 SM 有 164 KB Shared Memory，如果每个 block 用 2KB，最多同时驻留 82 个 block；不用 Shared Memory 则没有这个限制
+2. **消除 `__syncthreads` 开销**：`BlockReduce` 需要多次 `__syncthreads()` 调用，每次需要等待 block 内所有 256 个线程到达 barrier，这在 warp 执行进度不一致时会造成等待。Warp Shuffle 利用 warp 内线程天然同步（SIMT 锁步执行），完全无需显式同步
+3. **避免 Bank Conflict**：Shared Memory 被组织为 32 个 bank，如果多个线程同时访问同一 bank 的不同地址，会产生 bank conflict（串行化访问）。Warp Shuffle 在寄存器文件之间直接传输数据，不存在 bank conflict 问题
+
+**代价**：每个 warp 只能归约 32 个线程的部分和，因此每个 warp 只能处理一行输出。如果需要更多线程协作处理一行（比如 M 特别大），则需要跨 warp 通信，那时就无法避免使用 Shared Memory。在本 kernel 中 $M = 4096$，32 个线程每个处理 $4096 / 8 / 32 = 16$ 次 `float4` 加载，工作量适中。
+
+#### 6.4.3 Block 层面
+
+**启动配置**：
+
+```cuda
+constexpr int WARPS_PER_BLOCK = 8;
+constexpr int THREADS_PER_BLOCK = WARPS_PER_BLOCK * 32;  // = 256
+const int num_blocks = (K + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
+// 对于 K = 11008: num_blocks = ceil(11008 / 8) = 1376
+```
+
+**每个 Block 的职责**：
+
+- 每个 Block 包含 **8 个 Warp**（256 个线程）
+- 每个 Block **负责计算 8 行输出**（$y_{8b}, y_{8b+1}, \ldots, y_{8b+7}$，其中 $b$ = `blockIdx.x`）
+- Block 内的 8 个 Warp 完全独立工作，**没有** warp 间的数据交换或同步
+
+```
+Block b（256 个线程）：
+┌─────────────────────────────────────────────────────────────────┐
+│  Warp 0 (tid 0-31)   → 计算 output[8b + 0] = SiLU(W1[8b+0]·x) × W3[8b+0]·x   │
+│  Warp 1 (tid 32-63)  → 计算 output[8b + 1] = SiLU(W1[8b+1]·x) × W3[8b+1]·x   │
+│  Warp 2 (tid 64-95)  → 计算 output[8b + 2] = SiLU(W1[8b+2]·x) × W3[8b+2]·x   │
+│  Warp 3 (tid 96-127) → 计算 output[8b + 3] = SiLU(W1[8b+3]·x) × W3[8b+3]·x   │
+│  Warp 4 (tid 128-159)→ 计算 output[8b + 4] = SiLU(W1[8b+4]·x) × W3[8b+4]·x   │
+│  Warp 5 (tid 160-191)→ 计算 output[8b + 5] = SiLU(W1[8b+5]·x) × W3[8b+5]·x   │
+│  Warp 6 (tid 192-223)→ 计算 output[8b + 6] = SiLU(W1[8b+6]·x) × W3[8b+6]·x   │
+│  Warp 7 (tid 224-255)→ 计算 output[8b + 7] = SiLU(W1[8b+7]·x) × W3[8b+7]·x   │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**为什么选 8 个 Warp/Block？**
+
+这是在 occupancy 和资源利用之间的平衡：
+
+- **8 Warp = 256 线程/Block**：这是 CUDA 编程中常用的 block size，通常能达到较高的 SM occupancy
+- **太少的 Warp/Block**（如 1 或 2）：block 数量暴增（11008 或 5504），GPU block scheduler 调度开销增大，且每个 SM 需要更多 block 驻留才能隐藏延迟
+- **太多的 Warp/Block**（如 16 或 32）：每个 block 占用大量寄存器文件，SM 上能驻留的 block 数减少，灵活性降低
+
+**Block 间的 input 共享问题**：
+
+所有 1376 个 block 中的所有 warp 都需要读取同一个 `input[M]` 向量。由于 CUDA 不支持跨 block 的显式数据共享（除了 Global Memory），input 被每个 warp 独立从 Global Memory 读取。但由于 input 只有 8KB，远小于 L2 Cache（4MB），实际上第一个 block 读取后 input 就被缓存在 L2 中，后续所有 block 的读取都命中 L2 Cache（延迟 ~200 cycles，远低于 DRAM 的 ~500 cycles）。
+
+#### 6.4.4 Thread（Warp / Lane）层面
+
+每个 Warp 由 32 个线程（Lane 0 - Lane 31）组成，它们以 **SIMT（单指令多线程）** 方式锁步执行相同的指令序列。以下是每个 lane 的完整计算流程：
+
+**Phase 1：初始化**
+
+每个 lane 确定自身身份和工作范围：
+
+```cuda
+const int warp_id = threadIdx.x / 32;     // 所在 warp 编号（0-7）
+const int lane_id = threadIdx.x % 32;     // 在 warp 内的编号（0-31）
+const int row = blockIdx.x * 8 + warp_id; // 负责的输出行号
+```
+
+每个 lane 初始化 8 个 FP32 累加器（4 个 gate + 4 个 up），全部为 0.0f，存储在 **寄存器** 中。
+
+**Phase 2：向量化加载与 FMA 累加（主循环）**
+
+以 $M = 4096$ 为例，`num_float4 = 4096 / 8 = 512`。每个 lane 以步长 32 遍历 512 个 float4 元素：
+
+```
+Lane 0:  处理 float4 索引 = 0, 32, 64, ..., 480  → 共 16 次迭代
+Lane 1:  处理 float4 索引 = 1, 33, 65, ..., 481  → 共 16 次迭代
+...
+Lane 31: 处理 float4 索引 = 31, 63, 95, ..., 511 → 共 16 次迭代
+```
+
+每次迭代中，每个 lane 的操作：
+
+```
+1. 从 Global Memory 加载 3 个 float4（共 48 字节 = 24 个 half）：
+   x_f4 = __ldg(input_f4 + i)    // 8 个 half from input
+   g_f4 = __ldg(w1_f4 + i)       // 8 个 half from W1[row]
+   u_f4 = __ldg(w3_f4 + i)       // 8 个 half from W3[row]
+
+2. 将 3 个 float4 各拆为 4 个 half2，再转为 4 个 float2：
+   xf0, xf1, xf2, xf3 = __half22float2(x_h2[0..3])
+   gf0, gf1, gf2, gf3 = __half22float2(g_h2[0..3])
+   uf0, uf1, uf2, uf3 = __half22float2(u_h2[0..3])
+
+3. 执行 16 次 FMA 操作（8 次 gate + 8 次 up），分布在 4 路累加器上：
+   sum_gate0 += gf0.x * xf0.x + gf0.y * xf0.y  （2 次 fmaf）
+   sum_gate1 += gf1.x * xf1.x + gf1.y * xf1.y  （2 次 fmaf）
+   sum_gate2 += gf2.x * xf2.x + gf2.y * xf2.y  （2 次 fmaf）
+   sum_gate3 += gf3.x * xf3.x + gf3.y * xf3.y  （2 次 fmaf）
+   sum_up0   += uf0.x * xf0.x + uf0.y * xf0.y   （2 次 fmaf）
+   sum_up1   += uf1.x * xf1.x + uf1.y * xf1.y   （2 次 fmaf）
+   sum_up2   += uf2.x * xf2.x + uf2.y * xf2.y   （2 次 fmaf）
+   sum_up3   += uf3.x * xf3.x + uf3.y * xf3.y   （2 次 fmaf）
+```
+
+每个 lane 在整个主循环中执行：
+- 加载次数：$16 \times 3 = 48$ 次 `float4` 加载
+- FMA 次数：$16 \times 16 = 256$ 次 `fmaf` 调用
+- 处理的元素数：$16 \times 8 = 128$ 个 half 元素（每个权重矩阵）
+
+**Phase 3：累加器合并**
+
+每个 lane 将 4 路累加器合并为 1 个值：
+
+```cuda
+float sum_gate = sum_gate0 + sum_gate1 + sum_gate2 + sum_gate3;  // 3 次加法
+float sum_up   = sum_up0   + sum_up1   + sum_up2   + sum_up3;    // 3 次加法
+```
+
+此时 warp 内每个 lane 持有 input 向量 **不同段** 的部分点积和。
+
+**Phase 4：Warp Shuffle 树形归约**
+
+通过 5 步 butterfly reduction 将 32 个 lane 的部分和汇聚到 Lane 0：
+
+```
+步骤 1 (offset=16): 每个 lane i 加上 lane i+16 的值
+  Lane 0  = Lane0  + Lane16     Lane 16 = (不再使用)
+  Lane 1  = Lane1  + Lane17     Lane 17 = (不再使用)
+  ...                            
+  Lane 15 = Lane15 + Lane31     Lane 31 = (不再使用)
+
+步骤 2 (offset=8):  Lane 0-7 各加上 Lane 8-15 的值
+步骤 3 (offset=4):  Lane 0-3 各加上 Lane 4-7 的值
+步骤 4 (offset=2):  Lane 0-1 各加上 Lane 2-3 的值
+步骤 5 (offset=1):  Lane 0 加上 Lane 1 的值
+
+→ Lane 0 持有：sum_gate = Σ_{j=0}^{M-1} W1[row,j] × input[j]
+               sum_up   = Σ_{j=0}^{M-1} W3[row,j] × input[j]
+```
+
+每步执行 2 条 `__shfl_down_sync` + 2 条 `fadd`，5 步共 20 条指令。整个归约仅需 ~5-10 个时钟周期（warp shuffle 延迟约 1 cycle）。
+
+**Phase 5：SiLU 激活与输出（仅 Lane 0）**
+
+```cuda
+if (lane_id == 0) {
+    float gate_activated = sum_gate / (1.0f + expf(-sum_gate));
+    output[row] = __float2half(gate_activated * sum_up);
+}
+```
+
+只有 Lane 0 执行最终计算并写出结果。其他 31 个 lane 此时空闲（但由于 SIMT 锁步，它们实际上也执行了指令，只是写操作被 predicate mask 屏蔽）。
+
+**每个 Lane 的完整工作量汇总**：
+
+| 阶段 | 操作 | 次数 | 存储层级 |
+|------|------|------|----------|
+| 加载 input float4 | `__ldg` 128-bit 读取 | 16 次 | Global → L1 Read-Only Cache |
+| 加载 W1 float4 | `__ldg` 128-bit 读取 | 16 次 | Global → L1 Read-Only Cache |
+| 加载 W3 float4 | `__ldg` 128-bit 读取 | 16 次 | Global → L1 Read-Only Cache |
+| half2→float2 转换 | `__half22float2` | 48 次 | 寄存器 |
+| FMA 累加 | `fmaf` | 256 次 | 寄存器 |
+| 累加器合并 | `fadd` | 6 次 | 寄存器 |
+| Warp Shuffle | `__shfl_down_sync` | 10 次 | 寄存器 |
+| SiLU + 输出 | `fdiv/fexp/fmul/st` | 4 次（仅 Lane 0） | 寄存器 → Global Memory |
+
+#### 6.4.5 四层硬件抽象总览图
+
+```
+┌────────────────────────── GPU Grid ──────────────────────────────┐
+│                       1376 个 Block                              │
+│  Block 0     Block 1     Block 2     ...     Block 1375          │
+│  ┌────────┐  ┌────────┐  ┌────────┐          ┌────────┐          │
+│  │ 8 Warps│  │ 8 Warps│  │ 8 Warps│          │ 8 Warps│          │
+│  │ row 0-7│  │ row 8-15│ │row16-23│          │row11000│          │
+│  │        │  │        │  │        │          │-11007  │          │
+│  └────────┘  └────────┘  └────────┘          └────────┘          │
+└──────────────────────────────────────────────────────────────────┘
+
+┌────────────────────── Block b (256 threads) ─────────────────────┐
+│  Warp 0          Warp 1          ...          Warp 7             │
+│  (32 threads)    (32 threads)                 (32 threads)       │
+│  row = 8b+0      row = 8b+1                   row = 8b+7        │
+│                                                                  │
+│  Shared Memory: 0 bytes（完全不使用）                              │
+│  Block 内无任何跨 Warp 通信或同步                                   │
+└──────────────────────────────────────────────────────────────────┘
+
+┌────────────────────── Warp w (32 lanes) ─────────────────────────┐
+│  每个 Lane 的数据流：                                              │
+│                                                                  │
+│  Global Mem ──ldg──→ 寄存器(float4) ──reinterpret──→ half2[4]    │
+│                                       ──half22float2──→ float2[4]│
+│                                       ──fmaf──→ 8个FP32累加器     │
+│                                                                  │
+│  主循环结束后：                                                    │
+│  寄存器(8路)──fadd──→ 寄存器(2路)──shfl_down──→ Lane0(2个标量和)    │
+│                                  ──SiLU──→ ──float2half──→ Global│
+│                                                                  │
+│  内存层级使用: Global Memory → L1 Read-Only Cache → 寄存器          │
+│  未使用: Shared Memory, L1 Data Cache (写路径)                     │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+### 6.5 FMA（Fused Multiply-Add）详解
+
+#### 6.5.1 什么是 FMA？
+
+**FMA（Fused Multiply-Add，融合乘加）** 是一种将乘法和加法合并为单条硬件指令执行的运算。其数学定义为：
+
+$$\text{FMA}(a, b, c) = a \times b + c$$
+
+在 CUDA 中，FP32 精度的 FMA 通过内建函数 `fmaf(a, b, c)` 调用，编译为单条 PTX 指令 `fma.rn.f32`。
+
+#### 6.5.2 FMA vs 分离的 MUL + ADD
+
+传统的乘加操作需要两条独立指令：
+
+```
+// 分离指令序列
+temp = a * b;     // MUL 指令：计算乘积，结果舍入到 FP32
+result = temp + c; // ADD 指令：计算和，结果再次舍入到 FP32
+```
+
+FMA 将两步合并：
+
+```
+// FMA 单条指令
+result = fmaf(a, b, c);  // 计算 a*b+c，中间乘积保持全精度，最终结果只舍入一次
+```
+
+**FMA 的三大优势**：
+
+**1. 性能优势（2 合 1）**
+
+FMA 只占用 **1 条指令的发射槽和流水线周期**，却完成了乘法 + 加法两个操作。对于 GPU 的 FP32 ALU 流水线来说：
+
+| 方式 | 指令数 | 流水线延迟 | 吞吐率 |
+|------|--------|-----------|--------|
+| MUL + ADD | 2 条 | ~8 cycles（串行） | 1 个乘加 / 2 个发射周期 |
+| FMA | 1 条 | ~4 cycles | 1 个乘加 / 1 个发射周期 |
+
+理论上 FMA 让乘加运算的 **吞吐量翻倍**。
+
+**2. 精度优势（单次舍入）**
+
+这是 FMA 最重要的数学特性。IEEE 754-2008 标准规定 FMA 操作对中间乘积 $a \times b$ **不进行舍入**，而是保留其完整精度（对于 FP32，中间乘积保持约 48 位有效尾数），直到加上 $c$ 之后才执行一次舍入：
+
+$$\text{FMA}(a, b, c) = \text{round}(a \times b + c)$$
+
+而分离的 MUL + ADD 需要两次舍入：
+
+$$\text{MUL\_ADD}(a, b, c) = \text{round}(\text{round}(a \times b) + c)$$
+
+两次舍入会累积舍入误差。特别是在执行长向量点积（如 $d = 4096$ 个元素的求和）时，FMA 的单次舍入可以显著减少误差累积：
+
+$$\text{dot}(w, x) = \sum_{j=0}^{d-1} w_j \cdot x_j$$
+
+使用 FMA 链式计算：
+
+$$\text{sum} = \text{fma}(w_{d-1}, x_{d-1}, \text{fma}(w_{d-2}, x_{d-2}, \ldots \text{fma}(w_1, x_1, \text{fma}(w_0, x_0, 0))\ldots))$$
+
+每一步的 $w_j \times x_j$ 都以全精度参与累加，最终只在最外层舍入一次，误差远小于分离指令的逐步舍入。
+
+**3. 能效优势（减少寄存器写回）**
+
+FMA 不需要将中间乘积 `temp` 写回寄存器文件然后再读出给 ADD 指令。中间结果在 ALU 内部的全精度线路上直接流入加法器，减少了一次寄存器文件的写-读往返，节省寄存器端口带宽和能耗。
+
+#### 6.5.3 FMA 在本 Kernel 中的使用
+
+在 `fused_gate_up_swiglu_kernel_fp16_v2` 的主循环中，`fmaf` 被 **嵌套调用** 以实现连续的乘加链：
+
+```cuda
+sum_gate0 = fmaf(gf0.x, xf0.x, fmaf(gf0.y, xf0.y, sum_gate0));
+//          │                   │
+//          │                   └─ 内层 FMA: temp = gf0.y * xf0.y + sum_gate0
+//          └─ 外层 FMA: result = gf0.x * xf0.x + temp
+```
+
+展开后等价于：
+
+$$\text{sum\_gate0} = gf0.x \times xf0.x + (gf0.y \times xf0.y + \text{sum\_gate0})$$
+
+这构成一条 **FMA 依赖链**：外层 FMA 依赖内层 FMA 的结果。这条链的延迟为 $2 \times 4 = 8$ 个时钟周期。但由于使用了 **4 路独立累加器**（见 6.6 节 ILP 详解），GPU 调度器可以在等待某一路 FMA 结果的同时，发射其他路的 FMA 指令，从而保持流水线满载。
+
+**每次循环迭代的 FMA 统计**：
+
+| 类别 | FMA 次数 | 说明 |
+|------|---------|------|
+| Gate 点积 (sum_gate0) | 2 | `fmaf(gf0.x, xf0.x, fmaf(gf0.y, xf0.y, sum_gate0))` |
+| Gate 点积 (sum_gate1) | 2 | `fmaf(gf1.x, xf1.x, fmaf(gf1.y, xf1.y, sum_gate1))` |
+| Gate 点积 (sum_gate2) | 2 | 同上模式 |
+| Gate 点积 (sum_gate3) | 2 | 同上模式 |
+| Up 点积 (sum_up0) | 2 | `fmaf(uf0.x, xf0.x, fmaf(uf0.y, xf0.y, sum_up0))` |
+| Up 点积 (sum_up1) | 2 | 同上模式 |
+| Up 点积 (sum_up2) | 2 | 同上模式 |
+| Up 点积 (sum_up3) | 2 | 同上模式 |
+| **合计** | **16** | 每次迭代处理 8 对 half 元素 |
+
+每个 lane 在整个主循环中总共执行 $16 \times 16 = 256$ 次 FMA 操作。
+
+#### 6.5.4 GPU 硬件中的 FMA 单元
+
+NVIDIA GPU 的每个 SM（Streaming Multiprocessor）包含多个 **FP32 CUDA Core**，每个 CUDA Core 就是一个 **FMA 流水线**。在 Orin（SM 8.7 / Ampere 架构）上：
+
+- 每个 SM 有 128 个 FP32 CUDA Core
+- 每个 CUDA Core 每周期可执行 1 次 FMA 操作
+- FMA 流水线深度约 4 个周期（发射到结果就绪）
+- 每个 SM 的 FP32 FMA 峰值吞吐：128 FMA/cycle = 256 FLOP/cycle（每次 FMA 算 2 个 FLOP）
+
+FMA 是 GPU 计算吞吐的基石——GPU 的理论算力（TFLOPS）就是以 FMA 吞吐量来衡量的。
+
+### 6.6 ILP（指令级并行）与 4 路 ILP 详解
+
+#### 6.6.1 什么是 ILP？
+
+**ILP（Instruction-Level Parallelism，指令级并行）** 是指在单个线程的指令流中，让多条互不依赖的指令同时在处理器流水线中执行的技术。ILP 的核心思想是：当一条指令正在等待结果就绪时（处于流水线的后续阶段），可以发射另一条不依赖于该结果的指令进入流水线。
+
+**流水线（Pipeline）** 是理解 ILP 的前提。GPU 的 FMA 单元是一个多级流水线：
+
+```
+     ┌────────┐  ┌────────┐  ┌────────┐  ┌────────┐
+─in→ │ Stage 1│→ │ Stage 2│→ │ Stage 3│→ │ Stage 4│ →out
+     │(取操作 │  │(乘法   │  │(加法   │  │(写回   │
+     │ 数)    │  │ 计算)  │  │ 计算)  │  │ 结果)  │
+     └────────┘  └────────┘  └────────┘  └────────┘
+```
+
+一条 FMA 指令从发射到结果就绪需要经过 4 个流水线阶段（约 4 个时钟周期的延迟）。但流水线的每个阶段在每个周期都可以处理一条不同的指令——前提是这些指令之间没有数据依赖。
+
+#### 6.6.2 无 ILP 时的流水线气泡
+
+考虑最简单的点积累加——使用单个累加器 `sum`：
+
+```cuda
+float sum = 0.0f;
+for (int i = 0; i < N; i++) {
+    sum = fmaf(w[i], x[i], sum);  // 每次都依赖上一次的 sum
+}
+```
+
+每条 `fmaf(w[i], x[i], sum)` 都读取上一条的 `sum` 结果作为输入。这产生了 **RAW（Read-After-Write）数据冒险**：第 $i+1$ 条 FMA 的第三个操作数 `sum` 需要等第 $i$ 条 FMA 写回结果后才能读取。
+
+流水线执行时序（延迟 = 4 cycles）：
+
+```
+周期:  1    2    3    4    5    6    7    8    9   10   11   12
+      ┌────────────────┐
+FMA₀: │ S1 │ S2 │ S3 │ S4 │                          → sum 在周期 4 就绪
+      └────────────────┘
+                   ↓↓↓ 等待 sum 就绪（3 个气泡）↓↓↓
+                             ┌────────────────┐
+FMA₁:                        │ S1 │ S2 │ S3 │ S4 │   → sum 在周期 8 就绪
+                             └────────────────┘
+                                          ↓↓↓ 再等 3 个气泡 ↓↓↓
+                                                    ┌────────────────┐
+FMA₂:                                               │ S1 │ S2 │ S3 │ S4 │
+                                                    └────────────────┘
+
+→ 实际吞吐：1 FMA / 4 cycles = 25% 流水线利用率
+→ 流水线 75% 的时间在空转（气泡）
+```
+
+#### 6.6.3 4 路 ILP 如何消除气泡
+
+**4 路 ILP** 是指使用 **4 个独立的累加器**，消除 FMA 指令之间的数据依赖链，使得流水线在等待某一路结果时可以发射其他路的指令。
+
+本 kernel 中 4 路 gate 累加器和 4 路 up 累加器的展开：
+
+```cuda
+// 4 路独立累加器——彼此之间无数据依赖
+float sum_gate0 = 0.0f, sum_gate1 = 0.0f, sum_gate2 = 0.0f, sum_gate3 = 0.0f;
+float sum_up0 = 0.0f, sum_up1 = 0.0f, sum_up2 = 0.0f, sum_up3 = 0.0f;
+
+// 在主循环中，每组 half2 使用不同的累加器：
+sum_gate0 = fmaf(gf0.x, xf0.x, fmaf(gf0.y, xf0.y, sum_gate0)); // 依赖 sum_gate0
+sum_gate1 = fmaf(gf1.x, xf1.x, fmaf(gf1.y, xf1.y, sum_gate1)); // 依赖 sum_gate1（独立！）
+sum_gate2 = fmaf(gf2.x, xf2.x, fmaf(gf2.y, xf2.y, sum_gate2)); // 依赖 sum_gate2（独立！）
+sum_gate3 = fmaf(gf3.x, xf3.x, fmaf(gf3.y, xf3.y, sum_gate3)); // 依赖 sum_gate3（独立！）
+```
+
+4 路 ILP 下的流水线执行时序：
+
+```
+周期:  1    2    3    4    5    6    7    8    9
+      ┌────────────────┐
+FMA₀: │ S1 │ S2 │ S3 │ S4 │                    → sum_gate0 在周期 4 就绪
+      └────────────────┘
+           ┌────────────────┐
+FMA₁:      │ S1 │ S2 │ S3 │ S4 │               → sum_gate1 在周期 5 就绪
+           └────────────────┘
+                ┌────────────────┐
+FMA₂:           │ S1 │ S2 │ S3 │ S4 │          → sum_gate2 在周期 6 就绪
+                └────────────────┘
+                     ┌────────────────┐
+FMA₃:                │ S1 │ S2 │ S3 │ S4 │     → sum_gate3 在周期 7 就绪
+                     └────────────────┘
+                          ┌────────────────┐
+FMA₄:                     │ S1 │ S2 │ S3 │ S4 │  → sum_gate0 的下一次（周期 5 发射，
+                          └────────────────┘       周期 4 的结果已就绪 ✓）
+
+→ 实际吞吐：1 FMA / 1 cycle = 100% 流水线利用率
+→ 零气泡！
+```
+
+**关键观察**：FMA₄ 操作的是 `sum_gate0`，它需要等待 FMA₀ 的结果（周期 4 就绪）。FMA₄ 在周期 5 发射，此时 FMA₀ 的结果已经就绪，所以不产生等待。4 路 ILP 正好匹配 FMA 流水线的 4 级延迟。
+
+#### 6.6.4 为什么是 "4 路" 而不是 2 路或 8 路？
+
+流水线利用率与 ILP 路数的关系：
+
+| ILP 路数 | 流水线利用率 | 寄存器需求 | 说明 |
+|----------|------------|-----------|------|
+| 1 路 | 25% (1/4) | 1 个累加器 | 每发射 1 条 FMA 需等 3 cycles |
+| 2 路 | 50% (2/4) | 2 个累加器 | 每发射 2 条 FMA 等 2 cycles |
+| **4 路** | **100% (4/4)** | **4 个累加器** | **刚好填满 4 级流水线** |
+| 8 路 | 100% (受限) | 8 个累加器 | 流水线已满，多余的路只占用寄存器 |
+
+**4 路是最优选择的原因**：
+
+1. **刚好匹配流水线深度**：FMA 流水线延迟约 4 cycles，4 路独立累加器正好在每个 cycle 都有一条可发射的 FMA 指令，流水线 100% 利用
+2. **寄存器压力可控**：每多一路需要 2 个额外的 FP32 寄存器（gate + up 各 1 个）。4 路需要 8 个 FP32 累加器（`sum_gate0-3` + `sum_up0-3`），占 8 × 4B = 32B 寄存器，是可接受的开销
+3. **超过 4 路无额外收益**：流水线已经 100% 利用，第 5 路及以上的累加器只会浪费寄存器而不提升吞吐
+4. **代码结构契合**：每次 `float4` 加载 8 个 half 元素 = 4 个 `half2`，自然分为 4 组，每组使用一路累加器
+
+#### 6.6.5 ILP 与 TLP 的协同
+
+在 GPU 编程中，ILP（指令级并行）与 **TLP（Thread-Level Parallelism，线程级并行）** 是两种互补的延迟隐藏机制：
+
+| 机制 | 并行粒度 | 延迟隐藏方式 | 代价 |
+|------|---------|-------------|------|
+| TLP | 线程间 | warp scheduler 在多个 warp 间切换 | 需要更多活跃 warp（更高 occupancy） |
+| ILP | 线程内 | 单线程内多条独立指令同时在流水线中 | 需要更多寄存器（更多独立累加器） |
+
+**TLP 的工作方式**：当 Warp A 的指令因为等待内存加载（~500 cycles）或 FMA 结果（~4 cycles）而停滞时，warp scheduler 切换到 Warp B 继续执行。这需要 SM 上同时驻留足够多的 warp。
+
+**ILP 的优势**：即使 occupancy 不高（活跃 warp 较少），ILP 也能让单个 warp 的流水线保持高利用率。在本 kernel 中，两者协同工作：
+
+```
+SM 上的执行时序：
+
+时钟周期   1    2    3    4    5    6    7    8    9   10
+          ╔════╗
+Warp A:   ║FMA₀║FMA₁ FMA₂ FMA₃ FMA₄ FMA₅ FMA₆ FMA₇     ← ILP: 4 路独立指令填满流水线
+          ╚════╝
+           ╔════╗
+Warp B:    ║FMA₀║FMA₁ FMA₂ FMA₃ FMA₄ FMA₅ FMA₆ FMA₇    ← TLP: 另一个 warp 交替执行
+           ╚════╝
+```
+
+在本 kernel 中，每个 Block 有 8 个 Warp，每个 SM 可以同时驻留多个 Block。TLP（跨 warp 切换）用于隐藏 **内存延迟**（~500 cycles），而 ILP（4 路累加器）用于隐藏 **FMA 计算延迟**（~4 cycles）。两者协同最大化了 SM 的利用率。
+
+#### 6.6.6 4 路 ILP 在本 Kernel 中的完整展开
+
+以一次主循环迭代为例，将所有 FMA 指令及其依赖关系展开：
+
+```
+数据加载：
+  float4 x_f4 = __ldg(input_f4 + i)     // 加载 8 个 half: x[0..7]
+  float4 g_f4 = __ldg(w1_f4 + i)        // 加载 8 个 half: W1[row, 0..7]
+  float4 u_f4 = __ldg(w3_f4 + i)        // 加载 8 个 half: W3[row, 0..7]
+
+half2→float2 转换（12 次）：
+  xf0 = __half22float2(x_h2[0])  →  (x0, x1)
+  gf0 = __half22float2(g_h2[0])  →  (g0, g1)
+  uf0 = __half22float2(u_h2[0])  →  (u0, u1)
+  xf1 = __half22float2(x_h2[1])  →  (x2, x3)
+  gf1 = __half22float2(g_h2[1])  →  (g2, g3)
+  uf1 = __half22float2(u_h2[1])  →  (u2, u3)
+  xf2 = __half22float2(x_h2[2])  →  (x4, x5)
+  gf2 = __half22float2(g_h2[2])  →  (g4, g5)
+  uf2 = __half22float2(u_h2[2])  →  (u4, u5)
+  xf3 = __half22float2(x_h2[3])  →  (x6, x7)
+  gf3 = __half22float2(g_h2[3])  →  (g6, g7)
+  uf3 = __half22float2(u_h2[3])  →  (u6, u7)
+
+FMA 指令依赖图（16 条 FMA，4 路独立链）：
+
+  路 0:  fmaf(g1, x1, sum_gate0) → fmaf(g0, x0, ·)  → sum_gate0'  [依赖链长度: 2]
+  路 1:  fmaf(g3, x3, sum_gate1) → fmaf(g2, x2, ·)  → sum_gate1'  [依赖链长度: 2]
+  路 2:  fmaf(g5, x5, sum_gate2) → fmaf(g4, x4, ·)  → sum_gate2'  [依赖链长度: 2]
+  路 3:  fmaf(g7, x7, sum_gate3) → fmaf(g6, x6, ·)  → sum_gate3'  [依赖链长度: 2]
+  路 4:  fmaf(u1, x1, sum_up0)   → fmaf(u0, x0, ·)  → sum_up0'    [依赖链长度: 2]
+  路 5:  fmaf(u3, x3, sum_up1)   → fmaf(u2, x2, ·)  → sum_up1'    [依赖链长度: 2]
+  路 6:  fmaf(u5, x5, sum_up2)   → fmaf(u4, x4, ·)  → sum_up2'    [依赖链长度: 2]
+  路 7:  fmaf(u7, x7, sum_up3)   → fmaf(u6, x6, ·)  → sum_up3'    [依赖链长度: 2]
+
+  路 0-3 和路 4-7 之间完全独立（gate vs up）
+  路 0,1,2,3 之间完全独立（不同累加器）
+  → GPU 调度器可在 8 条独立链之间自由调度发射
+```
+
+实际上不仅有 4 路 gate ILP，还有 4 路 up ILP，总共 **8 条独立的 FMA 依赖链**。这远超 FMA 流水线深度（4 cycles），确保流水线在任何情况下都不会因数据依赖而停顿。
+
+### 6.7 与标准 FP16 GEMV Kernel 的逐项优化对比
 
 下面将 fused kernel 与标准的 `fp16_gemv_kernel_optimized`（用于非融合路径的 W1、W3 单独 GEMV）进行详细对比：
 
@@ -1287,7 +1850,7 @@ Kernel #1: fused_gate_up_swiglu_kernel_fp16_v2(x, W1, W3, output)
 对于 $M = 4096$：每行节省 $4096 \times 2 + 8 = 8200B \approx 8KB$
 全部 $K = 11008$ 行：$11008 \times 8200 \approx 86MB$
 
-### 6.5 优化手段汇总
+### 6.8 优化手段汇总
 
 | 优化手段 | 标准 FP16 GEMV | Fused FP16 Kernel | 加速原理 |
 |----------|---------------|-------------------|----------|
@@ -1303,7 +1866,7 @@ Kernel #1: fused_gate_up_swiglu_kernel_fp16_v2(x, W1, W3, output)
 | **精度策略** | FP32 累加 | FP32 累加 | 相同，保证数值精度 |
 | **SiLU 融合** | 独立 kernel 计算 | 归约后立即在寄存器中计算 | 零额外内存访问 |
 
-### 6.6 Fused Kernel 完整数据流
+### 6.9 Fused Kernel 完整数据流
 
 ```
                                ┌─── float4 加载 ──→ half2 拆解 ──→ float2 转换

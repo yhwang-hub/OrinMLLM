@@ -398,7 +398,7 @@ int run_inference(const VLInferenceConfig& config) {
     
     // Check for EOS
     if (next_token == vl_config.special_tokens.eos_token_id) {
-      LOG(INFO) << "EOS token reached after " << generated.size() << " tokens";
+      VLOG(1) << "EOS token reached after " << generated.size() << " tokens";
       break;
     }
     

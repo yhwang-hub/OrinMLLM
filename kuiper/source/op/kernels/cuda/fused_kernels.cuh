@@ -7,64 +7,6 @@
 namespace kernel {
 
 /**
- * Fused RMSNorm + GEMV operation
- * Combines normalization and matrix-vector multiplication in a single kernel
- * 
- * output = rmsnorm(input) @ gemv_weight
- * 
- * @param input Input tensor [dim]
- * @param rms_weight RMSNorm weight [dim]
- * @param gemv_weight GEMV weight matrix [out_dim, dim]
- * @param output Output tensor [out_dim]
- * @param eps RMSNorm epsilon
- * @param config CUDA configuration
- */
-void fused_rmsnorm_gemv_cu(
-    const tensor::Tensor& input,
-    const tensor::Tensor& rms_weight,
-    const tensor::Tensor& gemv_weight,
-    tensor::Tensor& output,
-    float eps,
-    CudaConfig* config
-);
-
-/**
- * Fused SiLU activation + elementwise multiply
- * output = silu(gate) * up
- * 
- * @param gate Gate tensor [dim]
- * @param up Up tensor [dim]
- * @param output Output tensor [dim]
- * @param config CUDA configuration
- */
-void fused_silu_multiply_cu(
-    const tensor::Tensor& gate,
-    const tensor::Tensor& up,
-    tensor::Tensor& output,
-    CudaConfig* config
-);
-
-/**
- * Fused residual add + RMSNorm
- * output = rmsnorm(input + residual)
- * 
- * @param input Input tensor [dim]
- * @param residual Residual tensor [dim]
- * @param weight RMSNorm weight [dim]
- * @param output Output tensor [dim]
- * @param eps RMSNorm epsilon
- * @param config CUDA configuration
- */
-void fused_add_rmsnorm_cu(
-    const tensor::Tensor& input,
-    const tensor::Tensor& residual,
-    const tensor::Tensor& weight,
-    tensor::Tensor& output,
-    float eps,
-    CudaConfig* config
-);
-
-/**
  * Fused multimodal embedding assembly kernel
  * Combines text embeddings before/after image token with vision embeddings
  * in a single kernel, eliminating 3 separate cudaMemcpyAsync calls

@@ -21,7 +21,6 @@
 #include <cub/cub.cuh>
 #include <mma.h>
 #include "flash_attention_kernel.cuh"
-#include "mma.cuh"
 
 namespace kernel {
 

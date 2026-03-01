@@ -177,39 +177,4 @@ void emb_kernel_cu(const tensor::Tensor& input, const tensor::Tensor& weight,
   }
 }
 
-// Pure FP16 embedding: FP16 weight -> FP16 output (no conversion)
-void emb_kernel_cu_pure_fp16(const tensor::Tensor& input, const tensor::Tensor& weight,
-                              const tensor::Tensor& output, int32_t vocab_size, void* stream) {
-  tensor::Tensor input_cu;
-  if (input.device_type() != base::DeviceType::kDeviceCUDA) {
-    input_cu = input.clone();
-    input_cu.to_cuda();
-  }
-  
-  const int32_t input_num = static_cast<int32_t>(input.size());
-  const int32_t weight_dim = weight.get_dim(1);
-  
-  CHECK(weight.device_type() == output.device_type());
-  CHECK(output.device_type() == base::DeviceType::kDeviceCUDA);
-  CHECK(weight.data_type() == base::DataType::kDataTypeFp16);
-  CHECK(output.data_type() == base::DataType::kDataTypeFp16);
-
-  // 使用实际的 token 数量作为 grid size
-  const int32_t grid_size = input_num;
-  constexpr int32_t thread_num = 256;  // 256 threads for better latency hiding with float4 loads
-  
-  int32_t* in_ptr = input_cu.ptr<int32_t>();
-  const half* wei_ptr = reinterpret_cast<const half*>(weight.ptr<uint16_t>());
-  half* out_ptr = reinterpret_cast<half*>(const_cast<uint16_t*>(output.ptr<uint16_t>()));
-  
-  cudaStream_t stream_ = stream ? static_cast<cudaStream_t>(stream) : nullptr;
-  
-  if (stream_) {
-    emb_kernel_cu_pure_fp16_impl<<<grid_size, thread_num, 0, stream_>>>(
-        vocab_size, input_num, weight_dim, in_ptr, wei_ptr, out_ptr);
-  } else {
-    emb_kernel_cu_pure_fp16_impl<<<grid_size, thread_num>>>(
-        vocab_size, input_num, weight_dim, in_ptr, wei_ptr, out_ptr);
-  }
-}
 }  // namespace kernel

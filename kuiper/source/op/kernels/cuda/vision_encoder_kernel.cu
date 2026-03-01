@@ -348,87 +348,6 @@ void bias_add_residual_cu(
 }
 
 // ============================================================================
-// Patch Embedding (Conv3D) Implementation
-// ============================================================================
-
-__global__ void patch_embed_conv3d_fp16_kernel(
-    const half* __restrict__ input,
-    const half* __restrict__ weight,
-    const half* __restrict__ bias,
-    half* __restrict__ output,
-    int num_patches,
-    int hidden_size,
-    int patch_dim,
-    int in_channels,
-    int temporal_patch_size,
-    int patch_size) {
-  
-  // Each thread computes one output element
-  int patch_idx = blockIdx.x;
-  int out_idx = threadIdx.x + blockIdx.y * blockDim.x;
-  
-  if (patch_idx >= num_patches || out_idx >= hidden_size) return;
-  
-  const half* patch_input = input + patch_idx * patch_dim;
-  const half* filter = weight + out_idx * patch_dim;  // [hidden_size, patch_dim]
-  
-  // Compute dot product with half2 vectorization + FMA
-  float sum = 0.0f;
-  const int patch_dim_h2 = patch_dim >> 1;
-  const half2* patch_h2 = reinterpret_cast<const half2*>(patch_input);
-  const half2* filter_h2 = reinterpret_cast<const half2*>(filter);
-  
-  #pragma unroll 4
-  for (int i = 0; i < patch_dim_h2; ++i) {
-    float2 p = __half22float2(patch_h2[i]);
-    float2 f = __half22float2(filter_h2[i]);
-    sum = __fmaf_rn(p.x, f.x, sum);
-    sum = __fmaf_rn(p.y, f.y, sum);
-  }
-  // Handle odd patch_dim
-  if (patch_dim & 1) {
-    sum = __fmaf_rn(__half2float(patch_input[patch_dim - 1]),
-                    __half2float(filter[patch_dim - 1]), sum);
-  }
-  
-  // Add bias
-  sum += __half2float(bias[out_idx]);
-  
-  // Write output
-  output[patch_idx * hidden_size + out_idx] = __float2half(sum);
-}
-
-void patch_embed_conv3d_cu(
-    const tensor::Tensor& input,
-    const tensor::Tensor& weight,
-    const tensor::Tensor& bias,
-    tensor::Tensor& output,
-    int in_channels,
-    int temporal_patch_size,
-    int patch_size,
-    cudaStream_t stream) {
-  
-  int num_patches = input.get_dim(0);
-  int patch_dim = input.get_dim(1);
-  int hidden_size = weight.get_dim(0);
-  
-  dim3 block_size(256);
-  dim3 grid_size(num_patches, (hidden_size + 255) / 256);
-  
-  patch_embed_conv3d_fp16_kernel<<<grid_size, block_size, 0, stream>>>(
-      input.ptr<half>(),
-      weight.ptr<half>(),
-      bias.ptr<half>(),
-      output.ptr<half>(),
-      num_patches,
-      hidden_size,
-      patch_dim,
-      in_channels,
-      temporal_patch_size,
-      patch_size);
-}
-
-// ============================================================================
 // Position Embedding with Bilinear Interpolation
 // ============================================================================
 
@@ -720,64 +639,6 @@ void vision_merger_mlp_cu(
   
   bias_add_residual_cu(output, fc2_bias, tensor::Tensor(), output, config->stream);
 }
-
-// ============================================================================
-// Image Token Replacement
-// ============================================================================
-
-__global__ void replace_image_tokens_kernel(
-    const half* __restrict__ text_embeds,
-    const half* __restrict__ visual_embeds,
-    half* __restrict__ output,
-    const int32_t* __restrict__ token_ids,
-    int seq_len,
-    int image_token_id,
-    int num_vision_tokens,
-    int hidden_size) {
-  
-  // Optimized: float4 vectorized copy
-  int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  int total_size = seq_len * hidden_size;
-  const int VEC = 8;
-  int base = idx * VEC;
-  
-  if (base + VEC <= total_size) {
-    float4 data = *reinterpret_cast<const float4*>(&text_embeds[base]);
-    *reinterpret_cast<float4*>(&output[base]) = data;
-  } else {
-    for (int i = base; i < total_size; i++) {
-      output[i] = text_embeds[i];
-    }
-  }
-}
-
-void replace_image_tokens_cu(
-    const tensor::Tensor& text_embeds,
-    const tensor::Tensor& visual_embeds,
-    tensor::Tensor& output,
-    const int32_t* token_ids,
-    int seq_len,
-    int image_token_id,
-    int num_vision_tokens,
-    int hidden_size,
-    cudaStream_t stream) {
-  
-  int block_size = 256;
-  int num_vecs = (seq_len * hidden_size + 7) / 8;
-  int grid_size = (num_vecs + block_size - 1) / block_size;
-  
-  replace_image_tokens_kernel<<<grid_size, block_size, 0, stream>>>(
-      text_embeds.ptr<half>(),
-      visual_embeds.ptr<half>(),
-      output.ptr<half>(),
-      token_ids,
-      seq_len,
-      image_token_id,
-      num_vision_tokens,
-      hidden_size);
-}
-
-
 
 // ============================================================================
 // Fused Split + RoPE + Transpose Kernel
@@ -1157,54 +1018,6 @@ void vision_attention_pretransposed_cu(
   
   transpose_head_token_kernel<<<trans_grid, trans_block, 0, stream>>>(
       out_transposed.ptr<half>(), output.ptr<half>(), num_tokens, num_heads, head_dim);
-}
-
-// ============================================================================
-// Fused QKV Projection
-// ============================================================================
-
-void fused_qkv_projection_cu(
-    const tensor::Tensor& input,
-    const tensor::Tensor& qkv_weight,
-    const tensor::Tensor& qkv_bias,
-    tensor::Tensor& q_out,
-    tensor::Tensor& k_out,
-    tensor::Tensor& v_out,
-    const kernel::CudaConfig* config) {
-  
-  int num_tokens = input.get_dim(0);
-  int hidden_size = input.get_dim(1);
-  
-  // Allocate temporary buffer for full QKV output
-  auto alloc = input.get_buffer()->allocator();
-  tensor::Tensor qkv_out(base::DataType::kDataTypeFp16, num_tokens, 3 * hidden_size, true, alloc);
-  
-  const half alpha = __float2half(1.0f);
-  const half beta = __float2half(0.0f);
-  
-  // GEMM: qkv_out = input @ qkv_weight.T
-  cublasHgemm(config->cublas_handle,
-              CUBLAS_OP_T, CUBLAS_OP_N,
-              3 * hidden_size, num_tokens, hidden_size,
-              &alpha,
-              qkv_weight.ptr<half>(), hidden_size,
-              input.ptr<half>(), hidden_size,
-              &beta,
-              qkv_out.ptr<half>(), 3 * hidden_size);
-  
-  // Add bias
-  bias_add_residual_cu(qkv_out, qkv_bias, tensor::Tensor(), qkv_out, config->stream);
-  
-  // Split into Q, K, V
-  cudaMemcpyAsync(q_out.ptr<void>(), qkv_out.ptr<half>(),
-                  num_tokens * hidden_size * sizeof(half),
-                  cudaMemcpyDeviceToDevice, config->stream);
-  cudaMemcpyAsync(k_out.ptr<void>(), qkv_out.ptr<half>() + num_tokens * hidden_size,
-                  num_tokens * hidden_size * sizeof(half),
-                  cudaMemcpyDeviceToDevice, config->stream);
-  cudaMemcpyAsync(v_out.ptr<void>(), qkv_out.ptr<half>() + 2 * num_tokens * hidden_size,
-                  num_tokens * hidden_size * sizeof(half),
-                  cudaMemcpyDeviceToDevice, config->stream);
 }
 
 }  // namespace kernel

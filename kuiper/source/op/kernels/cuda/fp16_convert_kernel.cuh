@@ -28,16 +28,6 @@ void fp16_to_fp32_kernel_cu(const half* input, float* output, size_t size, cudaS
  */
 void fp16_cpu_to_fp32_gpu(const uint16_t* input_cpu, float* output_gpu, size_t size, cudaStream_t stream = nullptr);
 
-/**
- * Copy FP16 tensor from CPU to GPU (keep FP16 format)
- * This is faster than fp16_cpu_to_fp32_gpu as it avoids conversion
- * @param input_cpu  FP16 input data on CPU (mmap'd memory)
- * @param output_gpu Pre-allocated FP16 output buffer on GPU
- * @param size       Number of elements
- * @param stream     CUDA stream
- */
-void fp16_cpu_to_fp16_gpu(const uint16_t* input_cpu, uint16_t* output_gpu, size_t size, cudaStream_t stream = nullptr);
-
 }  // namespace kernel
 
 #endif  // FP16_CONVERT_KERNEL_CUH

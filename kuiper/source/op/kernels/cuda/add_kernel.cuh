@@ -8,10 +8,6 @@ namespace kernel {
 void add_kernel_cu(const tensor::Tensor& input1, const tensor::Tensor& input2,
                    const tensor::Tensor& output, void* stream = nullptr);
 
-// Pure FP16 add kernel
-void add_kernel_cu_pure_fp16(const tensor::Tensor& input1, const tensor::Tensor& input2,
-                              const tensor::Tensor& output, void* stream = nullptr);
-
 // FP16 broadcast add bias: adds bias vector to each row of matrix
 // matrix: [rows, cols], bias: [cols], output: [rows, cols]
 void broadcast_add_bias_fp16_cu(

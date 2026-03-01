@@ -1123,44 +1123,26 @@ std::string generate_response(
                   << " tokens (" << (stats.kv_reuse_len * 100 / total_len) << "%)";
     }
     
-    // 4. 获取embeddings
-    const auto& embedding_out = model.embedding(tokens);
-    
-    // 5. Prefill新增的tokens
+    // 4-5. 获取embeddings并Prefill
+    // 优化：只为需要prefill的新token计算embedding，避免对已在KV cache中的token做多余计算
     Timer prefill_timer;
     prefill_timer.start();
     
     if (stats.prefill_tokens > 0) {
         if (start_pos > 0) {
-            std::shared_ptr<base::DeviceAllocator> alloc = base::CUDADeviceAllocatorFactory::get_instance();
+            // 增量prefill: 只对新token(tokens[start_pos:])计算embedding
+            std::vector<int> new_tokens(tokens.begin() + start_pos, tokens.end());
+            const auto& embedding_out = model.embedding(new_tokens);
             
-            base::DataType dtype = embedding_out.input_embeddings.data_type();
-            size_t dim = model.get_config()->dim_;
-            size_t elem_size = (dtype == base::DataType::kDataTypeFp16) ? sizeof(uint16_t) : sizeof(float);
-            
-            tensor::Tensor new_embeddings(dtype, stats.prefill_tokens, dim, true, alloc);
-            
-            const void* src_ptr = nullptr;
-            if (dtype == base::DataType::kDataTypeFp16) {
-                src_ptr = embedding_out.input_embeddings.template ptr<uint16_t>(start_pos * dim);
-            } else {
-                src_ptr = embedding_out.input_embeddings.template ptr<float>(start_pos * dim);
-            }
-            
-            cudaMemcpyAsync(
-                const_cast<void*>(new_embeddings.get_buffer()->ptr()),
-                src_ptr,
-                stats.prefill_tokens * dim * elem_size,
-                cudaMemcpyDeviceToDevice,
-                model.get_cuda_config() ? model.get_cuda_config()->stream : nullptr
-            );
-            
-            base::Status status = model.prefill(new_embeddings, stats.prefill_tokens, start_pos);
+            base::Status status = model.prefill(embedding_out.input_embeddings, stats.prefill_tokens, start_pos);
             if (!status) {
                 LOG(ERROR) << "Incremental prefill failed: " << status.get_err_code();
                 return "";
             }
         } else {
+            // 全量prefill: 计算所有token的embedding
+            const auto& embedding_out = model.embedding(tokens);
+            
             base::Status status = model.prefill(embedding_out.input_embeddings, total_len, 0);
             if (!status) {
                 LOG(ERROR) << "Prefill failed: " << status.get_err_code();
@@ -1348,6 +1330,33 @@ void run_interactive(
             std::string history_prompt = conv.get_history_prompt();
             auto history_tokens = model.encode(history_prompt);
             std::vector<int32_t> history_tokens_i32(history_tokens.begin(), history_tokens.end());
+            
+            // 修复 KV cache 与 cached_tokens 不一致的问题：
+            // 模型 decode 时，最后输出的 token（如 <|im_end|>）不会被写入 KV cache
+            // （因为 EOS 检测后直接 break，该 token 从未作为输入经过 decode）。
+            // 此外 chat template 可能在末尾追加 \n 等分隔符 token。
+            // 这些 token 出现在重新 tokenize 的历史中，但对应的 KV cache 位置未填充。
+            // 如果不补齐，下一轮对话的 prefix cache 会声称复用这些位置，
+            // 导致 attention 计算使用未初始化的 KV 数据（正确性 bug）。
+            int32_t actual_kv_len = stats.prompt_len + stats.decode_steps;
+            int32_t retokenized_len = static_cast<int32_t>(history_tokens_i32.size());
+            
+            if (retokenized_len > actual_kv_len) {
+                int32_t gap = retokenized_len - actual_kv_len;
+                std::vector<int> gap_tokens(history_tokens_i32.begin() + actual_kv_len,
+                                            history_tokens_i32.end());
+                const auto& gap_embedding = model.embedding(gap_tokens);
+                base::Status gap_status = model.prefill(
+                    gap_embedding.input_embeddings, gap, actual_kv_len);
+                if (!gap_status) {
+                    LOG(WARNING) << "KV gap fill failed: " << gap_status.get_err_code();
+                } else {
+                    if (model.get_cuda_config()) {
+                        cudaStreamSynchronize(model.get_cuda_config()->stream);
+                    }
+                }
+            }
+            
             conv.update_cached_tokens(history_tokens_i32);
             
             if (config.use_prefix_cache && cache_manager) {

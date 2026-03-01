@@ -596,17 +596,6 @@ void awq_gemm_small_batch_kernel(
 // Global Resources and Dispatcher
 // =============================================================================
 
-static bool g_fast_initialized = false;
-
-void awq_fast_init() {
-    if (g_fast_initialized) return;
-    g_fast_initialized = true;
-}
-
-void awq_fast_cleanup() {
-    g_fast_initialized = false;
-}
-
 void awq_gemm_fast_cu(
     const half* input,
     const int32_t* qweight,

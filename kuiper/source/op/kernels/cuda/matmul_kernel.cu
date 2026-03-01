@@ -1,7 +1,6 @@
 #include <tensor/tensor.h>
 #include <cub/block/block_reduce.cuh>
 #include <cuda_fp16.h>
-#include <mma.h>
 #include "../kernels_interface.h"
 #include "matmul_kernel.cuh"
 #include "optimized_fp16_kernels.cuh"
@@ -853,67 +852,6 @@ void matmul_kernel_cu_fp16_input_fp16_weight(const tensor::Tensor& input, const 
         reinterpret_cast<const half*>(weight.ptr<uint16_t>()),
         const_cast<float*>(output.ptr<float>()),
         M, K);
-}
-
-// Batched version: input [batch_size, dim], weight [vocab_size, dim], output [batch_size, vocab_size]
-// Uses cuBLAS GEMM for efficient batch processing
-void batched_matmul_kernel_cu_fp16_input_fp16_weight(const tensor::Tensor& input, const tensor::Tensor& weight,
-                                                      const tensor::Tensor& output, int32_t batch_size,
-                                                      const float scale, const CudaConfig* config) {
-    CHECK(input.is_empty() == false);
-    CHECK(input.device_type() == base::DeviceType::kDeviceCUDA);
-    CHECK(input.data_type() == base::DataType::kDataTypeFp16);
-    CHECK(weight.is_empty() == false && weight.dims_size() == 2);
-    CHECK(weight.device_type() == base::DeviceType::kDeviceCUDA);
-    CHECK(weight.data_type() == base::DataType::kDataTypeFp16);
-    CHECK(output.data_type() == base::DataType::kDataTypeFp32);
-    
-    const int32_t vocab_size = weight.get_dim(0);  // output dim (K)
-    const int32_t dim = weight.get_dim(1);         // input dim (M)
-    
-    cudaStream_t stream = config ? config->stream : nullptr;
-    cublasHandle_t handle = config ? config->cublas_handle : nullptr;
-    
-    if (handle) {
-        // Use cuBLAS GEMM: C = alpha * A * B^T + beta * C
-        // A: input [batch_size, dim], B: weight [vocab_size, dim] (row major)
-        // C: output [batch_size, vocab_size]
-        // In cuBLAS column-major: we compute C^T = B * A^T
-        // So: m=vocab_size, n=batch_size, k=dim
-        const float alpha = scale;
-        const float beta = 0.0f;
-        
-        // cuBLAS GemmEx for mixed precision
-        cublasGemmEx(handle,
-                     CUBLAS_OP_T,  // B^T
-                     CUBLAS_OP_N,  // A
-                     vocab_size,   // m
-                     batch_size,   // n
-                     dim,          // k
-                     &alpha,
-                     weight.ptr<void>(), CUDA_R_16F, dim,      // B: [vocab_size, dim] -> transposed
-                     input.ptr<void>(), CUDA_R_16F, dim,       // A: [batch_size, dim]
-                     &beta,
-                     const_cast<void*>(output.ptr<void>()), CUDA_R_32F, vocab_size,  // C: [batch_size, vocab_size]
-                     CUBLAS_COMPUTE_32F,
-                     CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-    } else {
-        // Fallback: process each row individually
-        for (int32_t b = 0; b < batch_size; ++b) {
-            const half* input_row = reinterpret_cast<const half*>(input.ptr<uint16_t>()) + b * dim;
-            float* output_row = const_cast<float*>(output.ptr<float>()) + b * vocab_size;
-            
-            constexpr int WARPS_PER_BLOCK = 8;
-            constexpr int THREADS_PER_BLOCK = WARPS_PER_BLOCK * 32;
-            const int num_blocks = (vocab_size + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
-            
-            gemv_fp16_input_fp16_weight_fp32_output<WARPS_PER_BLOCK, 4><<<num_blocks, THREADS_PER_BLOCK, 0, stream>>>(
-                input_row,
-                reinterpret_cast<const half*>(weight.ptr<uint16_t>()),
-                output_row,
-                dim, vocab_size);
-        }
-    }
 }
 
 }  // namespace kernel

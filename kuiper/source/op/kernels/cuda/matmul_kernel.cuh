@@ -48,12 +48,6 @@ void matmul_kernel_cu_fp16_input_fp16_weight(const tensor::Tensor& input, const 
                                               const tensor::Tensor& output, float scale = 1.f,
                                               const CudaConfig* config = nullptr);
 
-// Batched FP16 input × FP16 weight → FP32 output (for batched cls_logits)
-// input: [batch_size, dim], weight: [vocab_size, dim], output: [batch_size, vocab_size]
-void batched_matmul_kernel_cu_fp16_input_fp16_weight(const tensor::Tensor& input, const tensor::Tensor& weight,
-                                                      const tensor::Tensor& output, int32_t batch_size,
-                                                      float scale = 1.f, const CudaConfig* config = nullptr);
-
 }  // namespace kernel
 
 #endif  // MATMUL_KERNEL_CU_CUH

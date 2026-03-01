@@ -2,7 +2,6 @@
 #include <base/alloc.h>
 #include "kernels/cpu/matmul_kernel.h"
 #include "kernels/kernels_interface.h"
-#include "kernels/cuda/fp16_convert_kernel.cuh"
 #include "kernels/cuda/matmul_kernel.cuh"
 namespace op {
 MatmulLayer::MatmulLayer(base::DeviceType device_type, int32_t dim0, int32_t dim1,

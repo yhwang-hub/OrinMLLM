@@ -111,36 +111,6 @@ void add_kernel_cu(const tensor::Tensor& input1, const tensor::Tensor& input2,
   }
 }
 
-void add_kernel_cu_pure_fp16(const tensor::Tensor& input1, const tensor::Tensor& input2,
-                              const tensor::Tensor& output, void* stream) {
-  CHECK_EQ(input1.is_empty(), false);
-  CHECK_EQ(input2.is_empty(), false);
-  CHECK_EQ(output.is_empty(), false);
-  CHECK(input1.data_type() == base::DataType::kDataTypeFp16);
-  CHECK(input2.data_type() == base::DataType::kDataTypeFp16);
-  CHECK(output.data_type() == base::DataType::kDataTypeFp16);
-
-  int32_t size = static_cast<int32_t>(input1.size());
-  CHECK_EQ(size, input2.size());
-  CHECK_EQ(size, output.size());
-
-  // 8 halfs per thread (128-bit vectorized)
-  int32_t thread_num = 256;
-  int32_t elements_per_thread = 8;
-  int32_t block_num = (size + thread_num * elements_per_thread - 1) / (thread_num * elements_per_thread);
-
-  const half* in1_ptr = reinterpret_cast<const half*>(input1.ptr<uint16_t>());
-  const half* in2_ptr = reinterpret_cast<const half*>(input2.ptr<uint16_t>());
-  half* out_ptr = reinterpret_cast<half*>(const_cast<uint16_t*>(output.ptr<uint16_t>()));
-
-  if (stream) {
-    cudaStream_t stream_ = static_cast<cudaStream_t>(stream);
-    add_kernel_cu_fp16_impl<<<block_num, thread_num, 0, stream_>>>(size, in1_ptr, in2_ptr, out_ptr);
-  } else {
-    add_kernel_cu_fp16_impl<<<block_num, thread_num>>>(size, in1_ptr, in2_ptr, out_ptr);
-  }
-}
-
 // FP16 broadcast add bias: 2D grid eliminates integer modulo
 // matrix: [rows, cols], bias: [cols], output: [rows, cols]
 // blockIdx.y = row index, blockIdx.x * blockDim.x + threadIdx.x = col block

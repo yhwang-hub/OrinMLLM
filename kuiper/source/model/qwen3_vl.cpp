@@ -132,7 +132,6 @@ inline float half_to_float(uint16_t h) {
 #include "../op/kernels/cuda/flash_attention_kernel.cuh"
 #include "../op/kernels/cuda/kv_cache_kernel.cuh"
 #include "../op/kernels/cuda/fused_ffn_kernel.cuh"
-#include "../op/kernels/cuda/fp16_convert_kernel.cuh"
 #include "../op/kernels/cuda/argmax_kernel.cuh"
 #include "../op/kernels/cuda/vision_encoder_kernel.cuh"
 #include "../op/kernels/cuda/rope_kernel.cuh"

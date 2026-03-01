@@ -42,16 +42,6 @@ class AWQMatmulLayer : public Layer {
   
   void to_cuda() override;
   
-  // Pre-dequantize weights for faster prefill (uses more memory)
-  // Call this after to_cuda() to pre-dequantize weights
-  void pre_dequantize(cudaStream_t stream = nullptr);
-  
-  // Check if weights are pre-dequantized
-  bool is_pre_dequantized() const { return has_dequant_weight_; }
-  
-  // Get pre-dequantized weights (for cuBLAS HGEMM)
-  const tensor::Tensor& get_dequant_weight() const { return dequant_weight_; }
-  
   // Getters
   int32_t in_features() const { return in_features_; }
   int32_t out_features() const { return out_features_; }
@@ -70,10 +60,6 @@ class AWQMatmulLayer : public Layer {
   tensor::Tensor qweight_;  // [in_features, out_features/8] INT32
   tensor::Tensor qzeros_;   // [in_features/group_size, out_features/8] INT32
   tensor::Tensor scales_;   // [in_features/group_size, out_features] FP16
-  
-  // Pre-dequantized weights (optional, for faster prefill)
-  tensor::Tensor dequant_weight_;  // [in_features, out_features] FP16
-  bool has_dequant_weight_ = false;
 };
 
 }  // namespace op
