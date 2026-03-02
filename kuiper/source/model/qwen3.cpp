@@ -689,44 +689,32 @@ void Qwen3Model::create_param_layers_awq() {
       
       awq_layer->set_awq_weights(qweight_ptr, qzeros_ptr, scales_ptr, cpu_device_type);
       layer_list.push_back(awq_layer);
-      
-      if (i == 0) {
-        LOG(INFO) << "  " << name << " layer loaded: [" << in_features << " x " << out_features << "]";
-      }
     }
   };
 
   // 5. wq layers (q_proj) - AWQ
-  LOG(INFO) << "Loading AWQ wq layers...";
   load_awq_layer(dim, dim, qwen_layers_->wq_layers_, "wq");
 
   // 6. wk layers (k_proj) - AWQ
-  LOG(INFO) << "Loading AWQ wk layers...";
   load_awq_layer(dim, kv_dim, qwen_layers_->wk_layers_, "wk");
 
   // 7. wv layers (v_proj) - AWQ
-  LOG(INFO) << "Loading AWQ wv layers...";
   load_awq_layer(dim, kv_dim, qwen_layers_->wv_layers_, "wv");
 
   // 8. wo layers (o_proj) - AWQ
-  LOG(INFO) << "Loading AWQ wo layers...";
   load_awq_layer(dim, dim, qwen_layers_->wo_layers_, "wo");
 
   // 9. w1 layers (gate_proj) - AWQ
-  LOG(INFO) << "Loading AWQ w1 (gate_proj) layers...";
   load_awq_layer(dim, immediate_dim, qwen_layers_->w1_layers_, "w1");
 
   // 10. w2 layers (down_proj) - AWQ
-  LOG(INFO) << "Loading AWQ w2 (down_proj) layers...";
   load_awq_layer(immediate_dim, dim, qwen_layers_->w2_layers_, "w2");
 
   // 11. w3 layers (up_proj) - AWQ
-  LOG(INFO) << "Loading AWQ w3 (up_proj) layers...";
   load_awq_layer(dim, immediate_dim, qwen_layers_->w3_layers_, "w3");
 
   // 12. output (lm_head) - FP16 (not quantized)
   if (!config_->is_shared_weight_) {
-    LOG(INFO) << "Loading lm_head layer (FP16)...";
     auto lm_head = std::make_shared<op::MatmulLayer>(device_type_, config_->vocab_size_, dim, false);
     lm_head->set_weight_fp16(0, {config_->vocab_size_, dim},
                              base_ptr + pos, cpu_device_type);
@@ -742,7 +730,6 @@ void Qwen3Model::create_param_layers_awq() {
   }
 
   // 13. q_norm for all layers - FP16
-  LOG(INFO) << "Loading q_norm layers (FP16)...";
   for (int32_t i = 0; i < config_->layer_num_; ++i) {
     auto rms_norm_layer = std::make_shared<op::RmsNormLayer>(device_type_, config_->head_size_);
     rms_norm_layer->set_weight_fp16(0, {config_->head_size_},
@@ -752,7 +739,6 @@ void Qwen3Model::create_param_layers_awq() {
   }
 
   // 14. k_norm for all layers - FP16
-  LOG(INFO) << "Loading k_norm layers (FP16)...";
   for (int32_t i = 0; i < config_->layer_num_; ++i) {
     auto rms_norm_layer = std::make_shared<op::RmsNormLayer>(device_type_, config_->head_size_);
     rms_norm_layer->set_weight_fp16(0, {config_->head_size_},
@@ -809,7 +795,6 @@ void Qwen3Model::init_mem() {
 
   CHECK(insert_buffer(ModelBufferType::kInputTokens, input_tokens));
   CHECK(insert_buffer(ModelBufferType::kInputEmbeddings, input_embeddings));
-  LOG(INFO) << "Allocated input buffers and embeddings buffers.";
 
   tensor::Tensor sin_cache(base::DataType::kDataTypeFp32, config_->head_size_ * config_->seq_len_,
                            true, alloc);
@@ -818,28 +803,20 @@ void Qwen3Model::init_mem() {
 
   CHECK(insert_buffer(ModelBufferType::kSinCache, sin_cache));
   CHECK(insert_buffer(ModelBufferType::kCosCache, cos_cache));
-  LOG(INFO) << "Allocated RoPE sin/cos cache buffers.";
 
   tensor::Tensor rms_output(activation_dtype, model_dim, true, alloc);
   tensor::Tensor out_mha(activation_dtype, config_->dim_, true, alloc);
 
   CHECK(insert_buffer(ModelBufferType::kOutputRMSNorm, rms_output));
-  LOG(INFO) << "Allocated output RMSNorm buffer.";
   CHECK(insert_buffer(ModelBufferType::kOutputMHA, out_mha));
-  LOG(INFO) << "Allocated output MHA buffer.";
   CHECK(insert_buffer(ModelBufferType::kW2Output, rms_output));
-  LOG(INFO) << "Allocated W2 output buffer.";
   CHECK(insert_buffer(ModelBufferType::kFFNRMSNorm, rms_output));
-  LOG(INFO) << "Allocated FFN RMSNorm buffer.";
-  LOG(INFO) << "Allocated intermediate layer output buffers.";
 
   tensor::Tensor w1_output(activation_dtype, intermediate_dim, true, alloc);
   tensor::Tensor w3_output(activation_dtype, intermediate_dim, true, alloc);
 
   CHECK(insert_buffer(ModelBufferType::kW1Output, w1_output));
-  LOG(INFO) << "Allocated W1 output buffer.";
   CHECK(insert_buffer(ModelBufferType::kW3Output, w3_output));
-  LOG(INFO) << "Allocated W3 output buffer.";
 
   // kv cache - use FP16 for memory efficiency and bandwidth when model is FP16
   tensor::Tensor key_cache(activation_dtype, config_->layer_num_, config_->seq_len_,
@@ -853,30 +830,24 @@ void Qwen3Model::init_mem() {
   // Wq query output
   tensor::Tensor query(activation_dtype, config_->dim_, true, alloc);
   CHECK(insert_buffer(ModelBufferType::kQuery, query));
-  LOG(INFO) << "Allocated query output buffer.";
 
   // Pos tensor - on CPU for normal path
   tensor::Tensor pos_tensor(base::DataType::kDataTypeInt32, 1, true, alloc_cpu);
   CHECK(insert_buffer(ModelBufferType::kInputPos, pos_tensor));
-  LOG(INFO) << "Allocated input position buffer on CPU.";
   
   // Pos tensor on GPU for CUDA Graph path
   tensor::Tensor pos_tensor_gpu(base::DataType::kDataTypeInt32, 1, true, alloc);
   CHECK(insert_buffer(ModelBufferType::kInputPosGPU, pos_tensor_gpu));
-  LOG(INFO) << "Allocated input position buffer on GPU.";
 
   // Temporary K/V buffers with fixed addresses for CUDA Graph optimization
   tensor::Tensor temp_key(activation_dtype, config_->kv_dim_, true, alloc);
   tensor::Tensor temp_value(activation_dtype, config_->kv_dim_, true, alloc);
   CHECK(insert_buffer(ModelBufferType::kTempKey, temp_key));
-  LOG(INFO) << "Allocated temporary key buffer.";
   CHECK(insert_buffer(ModelBufferType::kTempValue, temp_value));
-  LOG(INFO) << "Allocated temporary value buffer.";
   
   // Fixed decode input buffer for CUDA Graph optimization
   tensor::Tensor decode_input(activation_dtype, config_->dim_, true, alloc);
   CHECK(insert_buffer(ModelBufferType::kDecodeInput, decode_input));
-  LOG(INFO) << "Allocated decode input buffer.";
   
   // Pinned memory buffers for efficient async Host-Device transfers
   if (device_type_ == base::DeviceType::kDeviceCUDA) {
@@ -886,29 +857,24 @@ void Qwen3Model::init_mem() {
     // Pinned pos buffer for async H2D transfer
     tensor::Tensor pos_pinned(base::DataType::kDataTypeInt32, 1, true, alloc_pinned);
     CHECK(insert_buffer(ModelBufferType::kInputPosPinned, pos_pinned));
-    LOG(INFO) << "Allocated pinned input position buffer.";
 
     // Pre-allocated argmax output buffer on GPU
     tensor::Tensor argmax_output(base::DataType::kDataTypeInt32, 2, true, alloc);
     CHECK(insert_buffer(ModelBufferType::kArgmaxOutput, argmax_output));
-    LOG(INFO) << "Allocated argmax output buffer on GPU.";
     
     // Pinned argmax result buffer for async D2H transfer
     tensor::Tensor argmax_pinned(base::DataType::kDataTypeInt32, 2, true, alloc_pinned);
     CHECK(insert_buffer(ModelBufferType::kArgmaxOutputPinned, argmax_pinned));
-    LOG(INFO) << "Allocated pinned argmax output buffer.";
   }
 
   // Attention scores - keep FP32 for numerical stability in softmax
   tensor::Tensor attn(base::DataType::kDataTypeFp32, config_->head_num_, config_->seq_len_, true,
                       alloc);
   CHECK(insert_buffer(ModelBufferType::kScoreStorage, attn));
-  LOG(INFO) << "Allocated attention score buffer.";
 
   // Attention output uses activation dtype
   tensor::Tensor attn_output(activation_dtype, model_dim, true, alloc);
   CHECK(insert_buffer(ModelBufferType::kAttnOutput, attn_output));
-  LOG(INFO) << "Allocated attention output buffer.";
 
   // final forward output
   tensor::Tensor forward_output(base::DataType::kDataTypeFp32, config_->vocab_size_, true, alloc);
@@ -916,11 +882,9 @@ void Qwen3Model::init_mem() {
     tensor::Tensor forward_output_cpu(base::DataType::kDataTypeFp32, config_->vocab_size_, true,
                                       alloc_cpu);
     CHECK(insert_buffer(ModelBufferType::kForwardOutputCPU, forward_output_cpu));
-    LOG(INFO) << "Allocated forward output buffer on CPU.";
   }
 
   CHECK(insert_buffer(ModelBufferType::kForwardOutput, forward_output));
-  LOG(INFO) << "Allocated forward output buffer on device.";
 }
 
 base::Status Qwen3Model::create_layers() {

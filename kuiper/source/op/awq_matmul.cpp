@@ -93,9 +93,6 @@ void AWQMatmulLayer::to_cuda() {
                scales_.byte_size(), cudaMemcpyHostToDevice);
     scales_ = std::move(cuda_scales);
   }
-  
-  LOG(INFO) << "AWQ weights loaded to CUDA: [" 
-            << in_features_ << ", " << out_features_ << "]";
 }
 
 base::Status AWQMatmulLayer::forward(const tensor::Tensor& input, const tensor::Tensor& output) {

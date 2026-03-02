@@ -32,6 +32,33 @@
   - [4.3 ldmatrix 指令详解](#43-ldmatrix-指令详解)
   - [4.4 工程中 Tensor Core MMA 的完整使用流程](#44-工程中-tensor-core-mma-的完整使用流程)
   - [4.5 MMA 指令中的数据布局与线程映射](#45-mma-指令中的数据布局与线程映射)
+- [5. 工程中 Tensor Core MMA 的具体使用（源码级详解）](#5-工程中-tensor-core-mma-的具体使用源码级详解)
+  - [5.1 Tensor Core MMA 的调用位置](#51-tensor-core-mma-的调用位置)
+  - [5.2 内核整体架构](#52-内核整体架构)
+  - [5.3 PTX 指令详解：cvta.to.shared.u64](#53-ptx-指令详解cvtatosharedu64)
+  - [5.4 PTX 指令详解：ldmatrix.sync.aligned](#54-ptx-指令详解ldmatrixsyncaligned)
+  - [5.5 PTX 指令详解：mma.sync.aligned.m16n8k16](#55-ptx-指令详解mmasyncalignedm16n8k16)
+  - [5.6 完整计算流程](#56-完整计算流程)
+  - [5.7 MMA 计算的数据流图](#57-mma-计算的数据流图)
+  - [5.8 线程-数据映射关系](#58-线程-数据映射关系)
+  - [5.9 输出回写](#59-输出回写)
+- [6. awq_matmul.cpp 中使用的 CUDA Kernel 详解](#6-awq_matmulcpp-中使用的-cuda-kernel-详解)
+  - [6.1 整体调用链与分发逻辑](#61-整体调用链与分发逻辑)
+  - [6.2 AWQ 权重格式与反量化公式](#62-awq-权重格式与反量化公式)
+  - [6.3 Kernel ①：awq_gemv_fast_kernel](#63-kernel-awq_gemv_fast_kernel--decode-单行向量乘)
+  - [6.4 Kernel ②：awq_gemm_small_batch_kernel](#64-kernel-awq_gemm_small_batch_kernel--小批量-gemm)
+  - [6.5 Kernel ③：awq_gemm_fast_kernel](#65-kernel-awq_gemm_fast_kernel--大批量流水线-gemm)
+  - [6.6 Kernel ④：awq_gemm_vllm_kernel](#66-kernel-awq_gemm_vllm_kerneln--tensor-core-prefill-内核)
+  - [6.7 各 Kernel 对比总结](#67-各-kernel-对比总结)
+  - [6.8 从推理角度看 Kernel 选择](#68-从推理角度看-kernel-选择)
+- [7. awq_gemv_fast_kernel 核函数逐行深度解析](#7-awq_gemv_fast_kernel-核函数逐行深度解析)
+  - [7.1 设计目标与核心思想](#71-设计目标与核心思想)
+  - [7.2 Block/Thread/Warp 组织结构](#72-blockthreadwarp-组织结构)
+  - [7.3 Global Memory 访问模式](#73-global-memory-访问模式)
+  - [7.4 逐行注释详解](#74-逐行注释详解)
+  - [7.5 lop3_extract_int4_to_fp16x2 辅助函数详解](#75-lop3_extract_int4_to_fp16x2-辅助函数详解)
+  - [7.6 端到端数据流总视图](#76-端到端数据流总视图)
+  - [7.7 性能特征分析](#77-性能特征分析)
 
 ---
 
@@ -1903,6 +1930,705 @@ MMA 吞吐 (Orin, SM8.7):
 
 总计:
   Kernel ④: 224 次 (Prefill, 使用 Tensor Core)
-  Kernel ①: 11,200 次 (Decode, 标量 GEMV)
-  Kernel ②③: 0 次 (标准推理不触发)
+  Kernel ①: 11,200 次 (Decode, LOP3 GEMV)
+  Kernel ②③: 已移除 (标准推理永远不触发，属于死代码)
 ```
+
+---
+
+## 7. `awq_gemv_fast_kernel` 核函数逐行深度解析
+
+> 源文件：`kuiper/source/op/kernels/cuda/awq_gemm_fast.cu`  
+> 该 kernel 是 **Decode 阶段（M=1）** 的唯一计算路径，占 AWQ 推理 ~98% 的 kernel 调用次数。
+
+### 7.1 设计目标与核心思想
+
+Decode 阶段每次只处理 1 个 token，矩阵乘退化为 **矩阵-向量乘（GEMV）**：
+
+$$Y_{[1 \times N]} = X_{[1 \times K]} \times W_{[K \times N]}$$
+
+这是一个 **内存带宽受限** 操作（计算强度 ~4 FLOPs/byte，远低于 Orin roofline ~49 FLOPs/byte），因此 kernel 设计的核心目标是：
+
+1. **最大化内存带宽利用** — 使用向量化加载（`uint4`/`int32_t`）和 `__ldg()` 缓存提示
+2. **最小化反量化开销** — 使用 LOP3 PTX 指令代替标量位提取，half2 向量化操作
+3. **最大化 SM 占用率** — 256 线程/block + 4 block/SM，确保足够 warp 隐藏内存延迟
+
+### 7.2 Block/Thread/Warp 组织结构
+
+```
+Grid Layout:
+  gridDim.x = ceil(N / 64)     ← 每个 block 处理 64 个输出通道
+  blockDim.x = 256              ← 每个 block 256 个线程
+
+Block 内部结构 (256 threads = 8 warps × 32 lanes):
+  ┌─────────────────────────────────────────────────────────────┐
+  │ Block (blockIdx.x)                                          │
+  │                                                             │
+  │  Warp 0 (tid 0-31)   → 输出通道 [base+0  .. base+7 ]     │
+  │  Warp 1 (tid 32-63)  → 输出通道 [base+8  .. base+15]     │
+  │  Warp 2 (tid 64-95)  → 输出通道 [base+16 .. base+23]     │
+  │  Warp 3 (tid 96-127) → 输出通道 [base+24 .. base+31]     │
+  │  Warp 4 (tid 128-159)→ 输出通道 [base+32 .. base+39]     │
+  │  Warp 5 (tid 160-191)→ 输出通道 [base+40 .. base+47]     │
+  │  Warp 6 (tid 192-223)→ 输出通道 [base+48 .. base+55]     │
+  │  Warp 7 (tid 224-255)→ 输出通道 [base+56 .. base+63]     │
+  │                                                             │
+  │  其中 base = blockIdx.x * 64                                │
+  └─────────────────────────────────────────────────────────────┘
+
+Warp 内部分工 (32 lanes 沿 K 维度并行):
+  ┌────────────────────────────────────────────────────┐
+  │ Warp w → 负责 8 个输出通道 (一个 packed INT32)      │
+  │                                                    │
+  │  Lane 0:  k=0,   32,  64,  96, ...                │
+  │  Lane 1:  k=1,   33,  65,  97, ...                │
+  │  Lane 2:  k=2,   34,  66,  98, ...                │
+  │  ...                                               │
+  │  Lane 31: k=31,  63,  95,  127, ...               │
+  │                                                    │
+  │  每个 Lane 各自累加 partial sum，最终 shuffle 归约  │
+  └────────────────────────────────────────────────────┘
+```
+
+以 Qwen3-8B `q_proj` 为例（K=4096, N=4096, group_size=128）：
+- `gridDim.x = 4096 / 64 = 64` 个 block
+- 每个 block 8 个 warp，每个 warp 处理 8 个输出
+- 每个 warp 的 32 个 lane 沿 K=4096 并行，每 lane 处理 4096/32 = 128 个 K 元素
+
+### 7.3 Global Memory 访问模式
+
+```
+                     qweight [K × N/8]                        X [K]
+                ┌──────────────────────┐               ┌──────────────┐
+                │ packed INT32 columns │               │ FP16 vector  │
+     k=0        │  col0  col1 ... colN/8│     k=0      │   x[0]       │
+     k=1        │  ...   ...  ... ...  │     k=1      │   x[1]       │
+     ...        │  ...   ...  ... ...  │     ...      │   ...        │
+     k=K-1      │  ...   ...  ... ...  │     k=K-1    │   x[K-1]     │
+                └──────────────────────┘               └──────────────┘
+                        ↑                                     ↑
+              每 warp 读固定列                          所有 warp 广播读
+             (packed_out_idx)                         (同一 k_idx)
+
+  qzeros [K/G × N/8]           scales [K/G × N]
+  ┌─────────────────┐          ┌────────────────────────────┐
+  │ per-group zeros  │          │ per-group scales (FP16)    │
+  │ 每 group 变化 1次│          │ 每 group 变化 1次          │
+  └─────────────────┘          │ 每 warp 一次 uint4 加载    │
+                               └────────────────────────────┘
+```
+
+**访问特点**：
+| 数据 | 访问类型 | 频率 | 合并度 |
+|------|---------|------|--------|
+| `X[k_idx]` | 所有 warp 广播读同一地址 | 每 K 迭代 1 次 | L1/L2 cache 命中 |
+| `qweight[k_idx * packed_N + packed_out_idx]` | **每 warp 读不同列** | 每 K 迭代 1 次 | warp 内 32 lanes 读同一地址（broadcast） |
+| `qzeros[g * packed_N + packed_out_idx]` | 每 warp 读不同列 | 每 group 1 次 | 摊销到 group_size 次迭代 |
+| `scales[g * N + out_base]` | uint4 向量化加载 (128-bit) | 每 group 1 次 | 单次加载 8 个 half |
+| `Y[out_base]` | uint4 向量化写入 (128-bit) | kernel 结束 1 次 | 只有 lane 0 写 |
+
+### 7.4 逐行注释详解
+
+#### 7.4.1 Dispatcher 入口
+
+```cuda
+void awq_gemm_fast_cu(
+    const half* input,        // 输入激活 [1, K]，FP16
+    const int32_t* qweight,   // 量化权重 [K, N/8]，每个 INT32 包含 8 个 INT4
+    const int32_t* qzeros,    // 量化零点 [K/group_size, N/8]
+    const half* scales,       // 缩放因子 [K/group_size, N]，FP16
+    half* output,             // 输出 [1, N]，FP16
+    int M,                    // batch size，此处恒为 1
+    int K,                    // 输入特征维度 (e.g. 4096)
+    int N,                    // 输出特征维度 (e.g. 4096)
+    int group_size,           // AWQ 分组大小 (128)
+    cudaStream_t stream       // CUDA 流
+) {
+    // 此函数仅在 M=1 时被 awq_gemm_tensorcore_cu 调用。
+    // 每个 block 处理 64 个输出通道 (8 warps × 8 outputs/warp)。
+    const int num_blocks = (N + 63) / 64;
+    //                      ^^^^^^^^^^^^^^^^
+    //  向上取整：确保 N 不是 64 整数倍时，最后一个 block 仍能覆盖尾部通道
+    //  例：N=4096 → 64 blocks; N=1024 → 16 blocks
+
+    awq_gemv_fast_kernel<<<num_blocks, 256, 0, stream>>>(
+    //                  ^^^^^^^^^^  ^^^  ^  ^^^^^^
+    //                  grid size  block 无共享  所在
+    //                  (1D)       size  内存   stream
+        input, qweight, qzeros, scales, output,
+        K, N, group_size
+    );
+}
+```
+
+#### 7.4.2 Kernel 函数签名与启动配置
+
+```cuda
+__global__ __launch_bounds__(256, 4)
+// __global__        : 这是一个 GPU kernel，从 CPU 端启动
+// __launch_bounds__ : 编译器优化提示
+//   第1参数 256     : 每 block 最多 256 线程 → 编译器据此分配寄存器
+//   第2参数 4       : 每 SM 至少 4 个 block → 限制每线程寄存器数
+//                     256 × 4 = 1024 线程/SM，Orin SM_87 最大 1536 线程/SM
+//                     → ~67% 占用率，平衡寄存器压力与并行度
+void awq_gemv_fast_kernel(
+    const half* __restrict__ X,           // 输入向量 [K]，FP16
+    //         __restrict__               : 告诉编译器此指针不与其他指针别名
+    //                                      → 允许更激进的加载优化
+    const int32_t* __restrict__ qweight,  // 量化权重 [K, N/8]
+    //   每行 K 有 N/8 个 INT32，每个 INT32 = 8 个 INT4 权重
+    const int32_t* __restrict__ qzeros,   // 量化零点 [K/G, N/8]
+    //   按 group 存储，每个 group 共享同一组零点
+    const half* __restrict__ scales,      // 缩放因子 [K/G, N]，FP16
+    //   按 group 存储，每个输出通道独立 scale
+    half* __restrict__ Y,                 // 输出向量 [N]，FP16
+    int K,                                // 输入维度 (e.g. 4096)
+    int N,                                // 输出维度 (e.g. 4096, 1024, 12288)
+    int group_size                        // AWQ 分组大小 (128)
+) {
+```
+
+#### 7.4.3 线程身份计算
+
+```cuda
+    const int warp_id = threadIdx.x / 32;
+    // threadIdx.x ∈ [0, 255]
+    // warp_id ∈ [0, 7]  ← 每 block 8 个 warp
+    // 例：threadIdx.x = 100 → warp_id = 3
+
+    const int lane_id = threadIdx.x % 32;
+    // lane_id ∈ [0, 31]  ← warp 内的线程编号
+    // 例：threadIdx.x = 100 → lane_id = 4
+```
+
+#### 7.4.4 输出通道映射
+
+```cuda
+    // 每个 warp 处理 8 个输出通道（因为 8 个 INT4 打包在 1 个 INT32 中）
+    const int packed_out_idx = blockIdx.x * 8 + warp_id;
+    // blockIdx.x * 8 : block 级偏移（每 block 8 个 warp，每 warp 1 个 packed 列）
+    //                  block 0 → packed 列 0~7, block 1 → packed 列 8~15, ...
+    // + warp_id      : warp 级偏移（warp 0 → 第0列，warp 7 → 第7列）
+
+    const int out_base = packed_out_idx * 8;
+    //  packed_out_idx 指向 qweight 中的列索引（每列 = 8 个输出通道）
+    //  out_base 是实际输出通道的起始索引
+    //  例：blockIdx.x=0, warp_id=0 → packed_out_idx=0, out_base=0 (输出通道 0~7)
+    //  例：blockIdx.x=1, warp_id=3 → packed_out_idx=11, out_base=88 (输出通道 88~95)
+
+    if (out_base >= N) return;
+    //  边界检查：最后一个 block 的高 warp 可能超出 N
+    //  例：N=4000 时，blockIdx.x=62 的 warp 7 → out_base = 62*64+56 = 4024 > 4000，跳过
+```
+
+**映射关系图示（N=4096 为例）**：
+```
+Block 0:  Warp0→[0:7]   Warp1→[8:15]   ... Warp7→[56:63]
+Block 1:  Warp0→[64:71] Warp1→[72:79]  ... Warp7→[120:127]
+...
+Block 63: Warp0→[4032:4039] ... Warp7→[4088:4095]
+```
+
+#### 7.4.5 常量计算
+
+```cuda
+    const int packed_N = N / 8;
+    //  qweight/qzeros 表中的列数（packed 形式）
+    //  例：N=4096 → packed_N = 512
+
+    const int n_groups = K / group_size;
+    //  沿 K 维度的分组数
+    //  例：K=4096, group_size=128 → n_groups = 32
+```
+
+#### 7.4.6 FP32 累加器初始化
+
+```cuda
+    float acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    //  每个线程维护 8 个 FP32 部分和（对应 8 个输出通道）
+    //  使用 FP32 而非 FP16 累加：避免长序列求和时的精度丢失
+    //  最终写出时再转回 FP16
+    //
+    //  寄存器用量：8 × 4 bytes = 32 bytes / 线程
+    //  全 block：32 bytes × 256 = 8KB（寄存器，不占共享内存）
+```
+
+#### 7.4.7 外层循环 — 遍历量化分组
+
+```cuda
+    for (int g = 0; g < n_groups; g++) {
+    //  沿 K 维度按 group 遍历
+    //  每个 group 有独立的 scale 和 zero point
+    //  group g 覆盖 K 维度的 [g*group_size, (g+1)*group_size)
+    //
+    //  例：group_size=128, K=4096
+    //    g=0  → K[0:127]
+    //    g=1  → K[128:255]
+    //    ...
+    //    g=31 → K[3968:4095]
+```
+
+#### 7.4.8 LOP3 提取零点
+
+```cuda
+        const uint32_t qz = static_cast<uint32_t>(__ldg(&qzeros[g * packed_N + packed_out_idx]));
+        //  __ldg()     : 通过只读数据缓存（常量缓存/L1 texture cache）加载
+        //                比普通 load 多一级缓存，适合只读的 scale/zero 数据
+        //  g * packed_N: 第 g 个 group 的行起始
+        //  + packed_out_idx: 该 warp 负责的 packed 列
+        //
+        //  qz 是一个 INT32，包含 8 个 INT4 零点值
+        //  每 group 只加载 1 次，摊销到 group_size (128) 次内层迭代
+        //
+        //  Global Memory 访问：同 warp 32 个 lane 读同一地址 → broadcast
+
+        uint32_t z_h[4];
+        //  用于存放 4 个 half2 对（共 8 个 FP16 零点值）
+
+        lop3_extract_int4_to_fp16x2(qz, z_h);
+        //  LOP3 快速提取：1 个 INT32 → 4 个 half2
+        //
+        //  z_h[0] = half2{zero_0, zero_1}   ← bits[0:3]  和 bits[16:19]
+        //  z_h[1] = half2{zero_2, zero_3}   ← bits[4:7]  和 bits[20:23]
+        //  z_h[2] = half2{zero_4, zero_5}   ← bits[8:11] 和 bits[24:27]
+        //  z_h[3] = half2{zero_6, zero_7}   ← bits[12:15]和 bits[28:31]
+        //
+        //  零点值范围：[0, 15]（4-bit unsigned）
+        //
+        //  指令开销：4 条 lop3 + 2 条 sub.f16x2 + 2 条 fma.rn.f16x2 = 8 条
+        //  对比标量方案：8 × (shift + mask + int2float) = 24 条 → 节省 67%
+```
+
+#### 7.4.9 向量化加载 Scale
+
+```cuda
+        const uint4 scale_vec = *reinterpret_cast<const uint4*>(&scales[g * N + out_base]);
+        //  uint4 加载 = 128-bit = 16 bytes = 8 个 half 值
+        //  一次加载该 warp 负责的 8 个输出通道的全部 scale
+        //
+        //  内存布局 scales[g * N + out_base ... out_base+7]:
+        //    {s0, s1, s2, s3, s4, s5, s6, s7}
+        //
+        //  scale_vec.x = {s0, s1} (as uint32)
+        //  scale_vec.y = {s2, s3}
+        //  scale_vec.z = {s4, s5}
+        //  scale_vec.w = {s6, s7}
+        //
+        //  每 group 只加载 1 次，摊销到 128 次内层迭代
+
+        const half2* s_h2 = reinterpret_cast<const half2*>(&scale_vec);
+        //  将 uint4 重新解释为 4 个 half2 指针
+        //  s_h2[0] = half2{s0, s1}
+        //  s_h2[1] = half2{s2, s3}
+        //  s_h2[2] = half2{s4, s5}
+        //  s_h2[3] = half2{s6, s7}
+```
+
+#### 7.4.10 预计算 -scale × zero
+
+```cuda
+        half2 neg_sz_h2[4];
+        //  存放 -(scale * zero) 的 4 个 half2 对
+
+        #pragma unroll
+        //  编译器展开循环：j=0,1,2,3 四次迭代完全展开为直线代码
+        //  消除循环控制开销，允许指令交错调度
+        for (int j = 0; j < 4; j++) {
+            half2 z_h2 = *reinterpret_cast<const half2*>(&z_h[j]);
+            //  将 uint32 重新解释为 half2
+
+            neg_sz_h2[j] = __hneg2(__hmul2(s_h2[j], z_h2));
+            //  __hmul2: half2 逐元素乘法 → scale * zero
+            //  __hneg2: half2 逐元素取负 → -(scale * zero)
+            //
+            //  预计算的目的：后续内层循环中使用 FMA 代替 sub + mul
+            //    dequant = scale * (w - zero) = scale * w + (- scale * zero)
+            //                                  ^^^^^^^^     ^^^^^^^^^^^^^^^
+            //                                     FMA.a        FMA.c = neg_sz
+            //
+            //  每 group 只计算 1 次，摊销到 128 次迭代
+        }
+```
+
+**数学等价性**：
+
+$$\text{dequant}(w) = s \cdot (w - z) = s \cdot w + (-s \cdot z) = s \cdot w + \text{neg\_sz}$$
+
+转化为单条 FMA 指令：`__hfma2(scale, weight, neg_scale_zero)`
+
+#### 7.4.11 内层循环起始
+
+```cuda
+        const int group_start = g * group_size;
+        //  当前 group 在 K 维度上的起始位置
+        //  例：g=5, group_size=128 → group_start = 640
+
+        for (int k = lane_id; k < group_size; k += 32) {
+        //  32 个 lane 沿 K 维度交错处理（stride=32）
+        //  lane 0: k = 0, 32, 64, 96
+        //  lane 1: k = 1, 33, 65, 97
+        //  ...
+        //  lane 31: k = 31, 63, 95, 127
+        //
+        //  group_size=128 时，每 lane 迭代 128/32 = 4 次
+        //  总计每 warp 处理 128 个 K 元素
+
+            const int k_idx = group_start + k;
+            //  全局 K 索引
+            //  例：g=5, lane_id=10 → k_idx = 640 + 10 = 650
+```
+
+#### 7.4.12 加载输入向量
+
+```cuda
+            const half x_val = __ldg(&X[k_idx]);
+            //  从 global memory 加载输入向量的第 k_idx 个元素
+            //  __ldg: 通过只读缓存（L1 texture）加载
+            //
+            //  关键观察：所有 8 个 warp 中同一 lane_id 的线程读 X[k_idx] 的同一地址
+            //  → L1/L2 cache 广播，只产生 1 次 DRAM 访问（32-byte cache line）
+            //  → 这是 GEMV 的核心优化：输入向量被所有输出通道共享
+
+            const half2 x_h2 = __half2half2(x_val);
+            //  将标量 half 复制到 half2 的高低两位
+            //  x_h2 = {x_val, x_val}
+            //  目的：后续与 half2 格式的 dequant 结果做向量化乘法
+```
+
+#### 7.4.13 加载并解包权重
+
+```cuda
+            const uint32_t w_packed = static_cast<uint32_t>(
+                __ldg(&qweight[k_idx * packed_N + packed_out_idx])
+            );
+            //  Global Memory 加载：读取 1 个 INT32 = 8 个 INT4 权重
+            //
+            //  地址计算：qweight[k_idx][packed_out_idx]  (行主序)
+            //    k_idx * packed_N : 第 k_idx 行的起始
+            //    + packed_out_idx : 该 warp 负责的 packed 列
+            //
+            //  同一 warp 的 32 个 lane 读同一地址 → broadcast
+            //  4 bytes / warp / 迭代，对应 8 个 FP16 权重 (16 bytes)
+            //  → 4x 压缩比体现在此：INT4 vs FP16
+
+            uint32_t w_h[4];
+            lop3_extract_int4_to_fp16x2(w_packed, w_h);
+            //  LOP3 解包：1 个 INT32 → 4 个 half2 = 8 个 FP16 权重
+            //
+            //  w_h[0] = half2{w0, w1}   后续与 s_h2[0], neg_sz_h2[0] 配对
+            //  w_h[1] = half2{w2, w3}   后续与 s_h2[1], neg_sz_h2[1] 配对
+            //  w_h[2] = half2{w4, w5}   后续与 s_h2[2], neg_sz_h2[2] 配对
+            //  w_h[3] = half2{w6, w7}   后续与 s_h2[3], neg_sz_h2[3] 配对
+```
+
+#### 7.4.14 反量化 + 乘法 + 累加（融合）
+
+```cuda
+            #pragma unroll
+            for (int j = 0; j < 4; j++) {
+            //  展开 4 次，处理 4 个 half2 对 = 8 个输出通道
+
+                half2 w_h2 = *reinterpret_cast<const half2*>(&w_h[j]);
+                //  将 uint32 重新解释为 half2 权重对
+
+                half2 dq_h2 = __hfma2(s_h2[j], w_h2, neg_sz_h2[j]);
+                //  ┌──────────────────────────────────────────────────────┐
+                //  │  __hfma2(a, b, c) = a * b + c                       │
+                //  │                                                      │
+                //  │  = scale * weight + (- scale * zero)                 │
+                //  │  = scale * weight - scale * zero                     │
+                //  │  = scale * (weight - zero)                           │
+                //  │                                                      │
+                //  │  这就是 AWQ 反量化公式！                              │
+                //  │  1 条 half2 FMA = 同时反量化 2 个权重               │
+                //  └──────────────────────────────────────────────────────┘
+                //
+                //  dq_h2 = half2{dequant_wi, dequant_wi+1}
+                //  其中 dequant_wi = scale_i * (wi - zeroi)
+
+                half2 prod = __hmul2(x_h2, dq_h2);
+                //  x_h2 = {x, x}       ← 输入（广播）
+                //  dq_h2 = {dq_i, dq_i+1}  ← 反量化后的权重
+                //  prod = {x * dq_i, x * dq_i+1}
+                //
+                //  这是 Y[i] += X[k] * W_dequant[k][i] 的核心计算
+
+                acc[j * 2]     += __low2float(prod);
+                acc[j * 2 + 1] += __high2float(prod);
+                //  __low2float:  提取 half2 低位 → FP32
+                //  __high2float: 提取 half2 高位 → FP32
+                //
+                //  累加到 FP32 累加器：
+                //    acc[0] += x * dq0, acc[1] += x * dq1   ← j=0
+                //    acc[2] += x * dq2, acc[3] += x * dq3   ← j=1
+                //    acc[4] += x * dq4, acc[5] += x * dq5   ← j=2
+                //    acc[6] += x * dq6, acc[7] += x * dq7   ← j=3
+                //
+                //  为什么用 FP32 累加？
+                //    group_size=128, 每 group 128 次累加
+                //    K=4096, 共 32 groups → 4096 次累加
+                //    FP16 max ≈ 65504，大量累加会溢出或精度严重丢失
+            }
+        }
+    }
+```
+
+**内层循环的指令流水线分析**（每次迭代）：
+
+| 操作 | 指令 | 延迟(cycles) | 说明 |
+|------|------|-------------|------|
+| `__ldg(X[k_idx])` | LDG.E.64 | ~400 | L2 cache 命中时 ~100 |
+| `__ldg(qweight[...])` | LDG.E.32 | ~400 | 核心瓶颈：K×N/8 大矩阵 |
+| `lop3_extract_int4_to_fp16x2` | 4×LOP3 + 4×SUB/FMA | ~8 | 纯计算，流水线内完成 |
+| 4× `__hfma2` | 4×HFMA2 | ~4 | 反量化 |
+| 4× `__hmul2` | 4×HMUL2 | ~4 | 乘输入 |
+| 8× `__low2float`/`__high2float` + 累加 | 8×FADD | ~8 | FP32 累加 |
+
+**总计**：~16 条计算指令 vs 2 次内存加载。当 GPU 有足够 warp 可调度时，计算完全被内存延迟隐藏。
+
+#### 7.4.15 Warp Shuffle 归约
+
+```cuda
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+    //  5 轮归约：offset = 16, 8, 4, 2, 1
+    //  将 32 个 lane 的部分和归约到 lane 0
+
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            acc[i] += __shfl_down_sync(0xffffffff, acc[i], offset);
+            //  __shfl_down_sync(mask, val, delta):
+            //    lane_id 的线程获取 lane_id+delta 的 val
+            //    mask = 0xffffffff → 所有 32 个 lane 参与
+            //
+            //  第1轮 (offset=16):
+            //    lane 0 += lane 16,  lane 1 += lane 17, ..., lane 15 += lane 31
+            //  第2轮 (offset=8):
+            //    lane 0 += lane 8,   lane 1 += lane 9,  ..., lane 7  += lane 15
+            //  第3轮 (offset=4):
+            //    lane 0 += lane 4, ..., lane 3 += lane 7
+            //  第4轮 (offset=2):
+            //    lane 0 += lane 2,  lane 1 += lane 3
+            //  第5轮 (offset=1):
+            //    lane 0 += lane 1
+            //
+            //  最终 lane 0 拥有所有 32 个 lane 的总和
+        }
+    }
+```
+
+**归约过程图示**（以 acc[0] 为例，简化为 8 lanes）：
+
+```
+初始:  lane0  lane1  lane2  lane3  lane4  lane5  lane6  lane7
+         ↓      ↓      ↓      ↓
+off=4: lane0+4 lane1+5 lane2+6 lane3+7  (lane4-7 结果不再使用)
+         ↓      ↓
+off=2: (0+4)+(2+6) (1+5)+(3+7)
+         ↓
+off=1: 全部 8 个 lane 的总和 → lane 0
+```
+
+指令开销：5 轮 × 8 个累加器 = 40 条 `__shfl_down_sync`，延迟约 ~5 cycles/轮。
+
+#### 7.4.16 结果写回
+
+```cuda
+    if (lane_id == 0) {
+    //  只有 lane 0 拥有最终归约结果
+
+        half out_half[8];
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            out_half[i] = __float2half(acc[i]);
+            //  FP32 → FP16 转换（rounding to nearest even）
+        }
+
+        *reinterpret_cast<uint4*>(&Y[out_base]) = *reinterpret_cast<uint4*>(out_half);
+        //  向量化写入：1 次 128-bit store 写 8 个 half 值
+        //
+        //  Y[out_base]   = dequant_result_0
+        //  Y[out_base+1] = dequant_result_1
+        //  ...
+        //  Y[out_base+7] = dequant_result_7
+        //
+        //  每 warp 只有 1 个线程写入，无需同步
+        //  block 内 8 个 warp 写不重叠的 8 段 → 无冲突
+    }
+```
+
+### 7.5 `lop3_extract_int4_to_fp16x2` 辅助函数详解
+
+```cuda
+__device__ __forceinline__ void lop3_extract_int4_to_fp16x2(
+    uint32_t packed,       // 输入：1 个 INT32 包含 8 个 INT4
+    uint32_t* out          // 输出：4 个 uint32_t，每个解释为 half2
+) {
+    constexpr uint32_t BOTTOM_MASK = 0x000f000f;
+    //  掩码：提取 bits[0:3] 和 bits[16:19]
+    //  二进制：0000 0000 0000 1111 | 0000 0000 0000 1111
+    //                  高16位 ↑           低16位 ↑
+
+    constexpr uint32_t TOP_MASK = 0x00f000f0;
+    //  掩码：提取 bits[4:7] 和 bits[20:23]
+    //  比 BOTTOM_MASK 左移 4 位
+
+    constexpr uint32_t FP16_MAGIC = 0x64006400;
+    //  half2{1024.0, 1024.0} 的二进制表示
+    //  FP16 编码：sign=0, exp=10100, mantissa=0000000000 = 1024.0
+    //  用途：与 INT4 值 OR 后形成 "1024 + value" 的 FP16 编码
+
+    constexpr uint32_t ONE_16TH = 0x2c002c00;
+    //  half2{1/16, 1/16}
+    //  用于 TOP_MASK 提取的值需要右移 4 bit，等价于乘 1/16
+
+    constexpr uint32_t NEG_64 = 0xd400d400;
+    //  half2{-64, -64}
+    //  TOP_MASK 路径：1024/16 = 64，减去抵消 magic number 的偏移
+
+    const uint32_t packed_hi = packed >> 8;
+    //  右移 8 位，使 bits[8:15] 和 bits[24:31] 对齐到 bits[0:7] 和 bits[16:23]
+    //  用于提取 elem 4,5,6,7
+
+    // ============ LOP3 提取 ============
+    // LOP3 真值表 0xea = (a & b) | c
+    //   a = packed (或 packed_hi)
+    //   b = mask (BOTTOM 或 TOP)
+    //   c = FP16_MAGIC
+
+    asm volatile("lop3.b32 %0, %1, %2, %3, %4;\n"
+        : "=r"(out[0]) : "r"(packed), "n"(BOTTOM_MASK), "n"(FP16_MAGIC), "n"(0xea));
+    //  out[0] = (packed & 0x000f000f) | 0x64006400
+    //
+    //  低16位：bits[0:3] | 0x6400 → FP16 编码 "1024 + elem0"
+    //  高16位：bits[16:19] | 0x6400 → FP16 编码 "1024 + elem1"
+    //
+    //  例：elem0=5, elem1=10
+    //    低16位：0x0005 | 0x6400 = 0x6405 = FP16(1029.0)
+    //    高16位：0x000a | 0x6400 = 0x640a = FP16(1034.0)
+
+    asm volatile("lop3.b32 %0, %1, %2, %3, %4;\n"
+        : "=r"(out[1]) : "r"(packed), "n"(TOP_MASK), "n"(FP16_MAGIC), "n"(0xea));
+    //  out[1] = (packed & 0x00f000f0) | 0x64006400
+    //  提取 elem2 和 elem3，但值左移了 4 位（×16）
+
+    asm volatile("lop3.b32 %0, %1, %2, %3, %4;\n"
+        : "=r"(out[2]) : "r"(packed_hi), "n"(BOTTOM_MASK), "n"(FP16_MAGIC), "n"(0xea));
+    //  提取 elem4 和 elem5
+
+    asm volatile("lop3.b32 %0, %1, %2, %3, %4;\n"
+        : "=r"(out[3]) : "r"(packed_hi), "n"(TOP_MASK), "n"(FP16_MAGIC), "n"(0xea));
+    //  提取 elem6 和 elem7
+
+    // ============ FP16 值修正 ============
+
+    asm volatile("sub.f16x2 %0, %1, %2;\n"
+        : "=r"(out[0]) : "r"(out[0]), "r"(FP16_MAGIC));
+    //  BOTTOM 路径：out[0] -= 1024.0
+    //  (1024 + elem0) - 1024 = elem0  ✓
+    //  结果：half2{elem0, elem1}，值域 [0, 15]
+
+    asm volatile("fma.rn.f16x2 %0, %1, %2, %3;\n"
+        : "=r"(out[1]) : "r"(out[1]), "r"(ONE_16TH), "r"(NEG_64));
+    //  TOP 路径：out[1] = out[1] * (1/16) + (-64)
+    //  = (1024 + elem2*16) / 16 - 64
+    //  = 64 + elem2 - 64
+    //  = elem2  ✓
+    //  结果：half2{elem2, elem3}，值域 [0, 15]
+
+    asm volatile("sub.f16x2 %0, %1, %2;\n"
+        : "=r"(out[2]) : "r"(out[2]), "r"(FP16_MAGIC));
+    //  half2{elem4, elem5}
+
+    asm volatile("fma.rn.f16x2 %0, %1, %2, %3;\n"
+        : "=r"(out[3]) : "r"(out[3]), "r"(ONE_16TH), "r"(NEG_64));
+    //  half2{elem6, elem7}
+}
+```
+
+### 7.6 端到端数据流总视图
+
+以 Qwen3-8B `q_proj`（K=4096, N=4096, group_size=128）为例：
+
+```
+Global Memory                    Registers                    Global Memory
+─────────────                    ─────────                    ─────────────
+
+X[4096] ──────┐
+   (FP16)     │
+              ▼                ┌─────────────────┐
+         x_val = X[k]  ─────▶ │ x_h2 = {x, x}   │
+              │                └────────┬────────┘
+              │                         │
+qweight      │                         │
+[4096×512] ──┤                         │
+   (INT32)    │                         ▼
+              ▼               ┌──────────────────────┐
+      w_packed=qweight[k][n]  │ lop3_extract          │
+              │               │   w_h[0]={w0,w1}     │
+              │               │   w_h[1]={w2,w3}     │
+              │               │   w_h[2]={w4,w5}     │
+              │               │   w_h[3]={w6,w7}     │
+              │               └──────────┬───────────┘
+              │                          │
+scales       │                          ▼
+[32×4096] ───┤   ┌─────────────────────────────────────┐
+  (FP16)      │   │ dq = __hfma2(scale, w, neg_sz)      │
+              │   │    = scale * w - scale * zero        │
+qzeros       │   │    = scale * (w - zero)    ← AWQ公式 │
+[32×512] ────┘   └──────────────┬──────────────────────┘
+  (INT32)                       │
+                                ▼
+                   ┌───────────────────────────┐
+                   │ prod = __hmul2(x_h2, dq)   │
+                   │ acc[i] += float(prod)       │
+                   │       (FP32 累加)           │
+                   └──────────────┬────────────┘
+                                  │
+                                  ▼
+                      ┌───────────────────────┐
+                      │ Warp Shuffle 归约      │
+                      │  32 lanes → lane 0     │
+                      │  5 轮 × 8 acc          │
+                      └───────────┬───────────┘
+                                  │
+                                  ▼
+                      ┌───────────────────────┐
+                      │ Y[out_base:+8]         │
+                      │ = FP32→FP16 + 向量写   │  ──────▶  Y[4096]
+                      │ (uint4 store, 128-bit) │           (FP16)
+                      └───────────────────────┘
+```
+
+### 7.7 性能特征分析
+
+#### 指令统计（每 warp 每次内层迭代）
+
+| 类别 | 指令 | 数量 | 说明 |
+|------|------|------|------|
+| **全局加载** | `LDG` X | 1 | 2 bytes, cache broadcast |
+| **全局加载** | `LDG` qweight | 1 | 4 bytes, 含 8 个 INT4 |
+| **LOP3 解包** | `lop3.b32` | 4 | 纯 ALU |
+| **FP16 修正** | `sub/fma.f16x2` | 4 | 纯 ALU |
+| **反量化** | `__hfma2` | 4 | 4 条 half2 FMA |
+| **乘输入** | `__hmul2` | 4 | 4 条 half2 MUL |
+| **累加** | `FADD` (FP32) | 8 | 8 个输出通道 |
+| **总计** | | **~26 条** | 其中 2 条 memory, 24 条 ALU |
+
+#### 带宽利用率
+
+以 Qwen3-8B `q_proj`（K=4096, N=4096）为例：
+
+| 数据 | 总量 | 说明 |
+|------|------|------|
+| X 向量 | 8 KB | 4096 × 2B, 全 block 共享 |
+| qweight 矩阵 | 8 MB | 4096 × 512 × 4B |
+| qzeros | 8 KB | 32 × 512 × 4B, 每 group 1 次 |
+| scales | 256 KB | 32 × 4096 × 2B, 每 group 1 次 |
+| Y 输出 | 8 KB | 4096 × 2B |
+| **总读取** | **~8.3 MB** | 主要瓶颈是 qweight |
+
+Orin 内存带宽 ~102 GB/s，理论下界：8.3MB / 102GB/s ≈ **0.08 ms**。
+
+对比 FP16 全精度 GEMV：权重 = 4096 × 4096 × 2B = 32 MB → 0.31 ms。  
+**INT4 的 4x 压缩直接转化为 ~4x 带宽加速**，这就是为什么 AWQ decode 比 FP16 更快的核心原因。
