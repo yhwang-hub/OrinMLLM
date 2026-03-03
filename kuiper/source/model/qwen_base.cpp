@@ -6,7 +6,6 @@
 #include <op/mha.h>
 #include <op/rmsnorm.h>
 #include <op/embedding.h>
-#include <op/awq_matmul.h>
 #include <utility>
 #include "sampler/argmax_sampler.h"
 #include "base/tick.h"
@@ -254,48 +253,9 @@ void QwenBaseModel::feed_forward_fused(int32_t layer_idx, const tensor::Tensor& 
   CHECK_NE(ffn_rmsnorm, nullptr);
   STATUS_CHECK(ffn_rmsnorm->forward(input, ffn_norm_output));
 
-  // Fused W1 + W3 + SwiGLU kernel
+  // W1 + W3 + SwiGLU (virtual: FP16 uses fused kernel, AWQ uses separate ops)
   tensor::Tensor w1_output = get_buffer(ModelBufferType::kW1Output);
-  const auto& w1_layer = layers->w1_layers_.at(layer_idx);
-  const auto& w3_layer = layers->w3_layers_.at(layer_idx);
-  CHECK_NE(w1_layer, nullptr);
-  CHECK_NE(w3_layer, nullptr);
-
-  // Check if AWQ layers (AWQ doesn't support fused kernel, fall back to standard)
-  auto w1_awq = std::dynamic_pointer_cast<op::AWQMatmulLayer>(w1_layer);
-  auto w3_awq = std::dynamic_pointer_cast<op::AWQMatmulLayer>(w3_layer);
-
-  if (w1_awq || w3_awq) {
-    // AWQ fallback: standard separate operations
-    tensor::Tensor w3_output = get_buffer(ModelBufferType::kW3Output);
-    STATUS_CHECK(w1_layer->forward(ffn_norm_output, w1_output));
-    STATUS_CHECK(w3_layer->forward(ffn_norm_output, w3_output));
-    CHECK_NE(layers->swiglu_layer_, nullptr);
-    STATUS_CHECK(layers->swiglu_layer_->forward(w1_output, w3_output, w1_output));
-  } else {
-    // Standard path with fused FFN kernel
-    auto w1_matmul = std::dynamic_pointer_cast<op::MatmulLayer>(w1_layer);
-    auto w3_matmul = std::dynamic_pointer_cast<op::MatmulLayer>(w3_layer);
-    CHECK_NE(w1_matmul, nullptr) << "W1 layer is not a MatmulLayer";
-    CHECK_NE(w3_matmul, nullptr) << "W3 layer is not a MatmulLayer";
-
-    const auto& w1_weight = w1_matmul->get_weight(0);
-    const auto& w3_weight = w3_matmul->get_weight(0);
-
-    auto fused_ffn = layers->fused_ffn_layer_;
-    bool is_fp16 = input.data_type() == base::DataType::kDataTypeFp16 &&
-                   w1_weight.data_type() == base::DataType::kDataTypeFp16;
-    bool is_mixed = input.data_type() == base::DataType::kDataTypeFp32 &&
-                    w1_weight.data_type() == base::DataType::kDataTypeFp16;
-    fused_ffn->set_use_fp16(is_fp16);
-    fused_ffn->set_use_mixed(is_mixed);
-    fused_ffn->set_input(0, ffn_norm_output);
-    fused_ffn->set_input(1, w1_weight);
-    fused_ffn->set_input(2, w3_weight);
-    fused_ffn->set_output(0, w1_output);
-    fused_ffn->set_cuda_config(cuda_config_);
-    STATUS_CHECK(fused_ffn->forward());
-  }
+  gate_up_swiglu(layer_idx, ffn_norm_output, w1_output);
 
   // w2 (down projection)
   tensor::Tensor w2_output = get_buffer(ModelBufferType::kW2Output);
@@ -408,16 +368,7 @@ void QwenBaseModel::batched_attention_mha(int32_t layer_idx, const tensor::Tenso
   std::shared_ptr<base::DeviceAllocator> alloc = base::CUDADeviceAllocatorFactory::get_instance();
   tensor::Tensor wo_out(activation_dtype, seq_len, config_->dim_, true, alloc);
 
-  // Check if AWQ layer
-  auto wo_awq = std::dynamic_pointer_cast<op::AWQMatmulLayer>(wo_layer);
-  if (wo_awq) {
-    STATUS_CHECK(wo_awq->forward(mha_out, wo_out));
-  } else {
-    auto wo_matmul = std::dynamic_pointer_cast<op::MatmulLayer>(wo_layer);
-    CHECK_NE(wo_matmul, nullptr) << "WO layer is not a MatmulLayer";
-    STATUS_CHECK(layers->batched_matmul_helper_layer_->forward(
-        mha_out, wo_matmul->get_weight(0), wo_out, seq_len, 1.f));
-  }
+  batched_matmul_forward(wo_layer, mha_out, wo_out, seq_len);
 
   // Copy back to mha_out
   cudaMemcpyAsync(const_cast<void*>(mha_out.get_buffer()->ptr()),
@@ -463,15 +414,7 @@ void QwenBaseModel::batched_attention_mha(int32_t layer_idx, const tensor::Tenso
 
   // wo projection directly to pre-allocated wo_out
   const auto& wo_layer = layers->wo_layers_.at(layer_idx);
-  auto wo_awq = std::dynamic_pointer_cast<op::AWQMatmulLayer>(wo_layer);
-  if (wo_awq) {
-    STATUS_CHECK(wo_awq->forward(mha_out, wo_out));
-  } else {
-    auto wo_matmul = std::dynamic_pointer_cast<op::MatmulLayer>(wo_layer);
-    CHECK_NE(wo_matmul, nullptr) << "WO layer is not a MatmulLayer";
-    STATUS_CHECK(layers->batched_matmul_helper_layer_->forward(
-        mha_out, wo_matmul->get_weight(0), wo_out, seq_len, 1.f));
-  }
+  batched_matmul_forward(wo_layer, mha_out, wo_out, seq_len);
 }
 
 // ==================== Batched Feed Forward ====================
@@ -497,23 +440,8 @@ void QwenBaseModel::batched_feed_forward(int32_t layer_idx, const tensor::Tensor
   tensor::Tensor w1_out(activation_dtype, seq_len, hidden_dim, true, alloc);
   tensor::Tensor w3_out(activation_dtype, seq_len, hidden_dim, true, alloc);
 
-  // Check if AWQ layers
-  auto w1_awq = std::dynamic_pointer_cast<op::AWQMatmulLayer>(w1_layer);
-  auto w3_awq = std::dynamic_pointer_cast<op::AWQMatmulLayer>(w3_layer);
-
-  if (w1_awq && w3_awq) {
-    STATUS_CHECK(w1_awq->forward(ffn_norm_out, w1_out));
-    STATUS_CHECK(w3_awq->forward(ffn_norm_out, w3_out));
-  } else {
-    auto w1_matmul = std::dynamic_pointer_cast<op::MatmulLayer>(w1_layer);
-    auto w3_matmul = std::dynamic_pointer_cast<op::MatmulLayer>(w3_layer);
-    CHECK_NE(w1_matmul, nullptr) << "W1 layer is not a MatmulLayer";
-    CHECK_NE(w3_matmul, nullptr) << "W3 layer is not a MatmulLayer";
-    STATUS_CHECK(layers->batched_matmul_helper_layer_->forward(
-        ffn_norm_out, w1_matmul->get_weight(0), w1_out, seq_len, 1.f));
-    STATUS_CHECK(layers->batched_matmul_helper_layer_->forward(
-        ffn_norm_out, w3_matmul->get_weight(0), w3_out, seq_len, 1.f));
-  }
+  batched_matmul_forward(w1_layer, ffn_norm_out, w1_out, seq_len);
+  batched_matmul_forward(w3_layer, ffn_norm_out, w3_out, seq_len);
 
   // Batched SwiGLU
   STATUS_CHECK(layers->batched_swiglu_layer_->forward(w1_out, w3_out, w1_out));
@@ -522,15 +450,7 @@ void QwenBaseModel::batched_feed_forward(int32_t layer_idx, const tensor::Tensor
   const auto& w2_layer = layers->w2_layers_.at(layer_idx);
   tensor::Tensor w2_out(activation_dtype, seq_len, config_->dim_, true, alloc);
 
-  auto w2_awq = std::dynamic_pointer_cast<op::AWQMatmulLayer>(w2_layer);
-  if (w2_awq) {
-    STATUS_CHECK(w2_awq->forward(w1_out, w2_out));
-  } else {
-    auto w2_matmul = std::dynamic_pointer_cast<op::MatmulLayer>(w2_layer);
-    CHECK_NE(w2_matmul, nullptr) << "W2 layer is not a MatmulLayer";
-    STATUS_CHECK(layers->batched_matmul_helper_layer_->forward(
-        w1_out, w2_matmul->get_weight(0), w2_out, seq_len, 1.f));
-  }
+  batched_matmul_forward(w2_layer, w1_out, w2_out, seq_len);
 
   // Residual add
   STATUS_CHECK(layers->batched_add_layer_->forward(input, w2_out, input));
@@ -552,37 +472,15 @@ void QwenBaseModel::batched_feed_forward_optimized(
   const auto& w1_layer = layers->w1_layers_.at(layer_idx);
   const auto& w3_layer = layers->w3_layers_.at(layer_idx);
 
-  auto w1_awq = std::dynamic_pointer_cast<op::AWQMatmulLayer>(w1_layer);
-  auto w3_awq = std::dynamic_pointer_cast<op::AWQMatmulLayer>(w3_layer);
-
-  if (w1_awq && w3_awq) {
-    STATUS_CHECK(w1_awq->forward(ffn_norm_out, w1_out));
-    STATUS_CHECK(w3_awq->forward(ffn_norm_out, w3_out));
-  } else {
-    auto w1_matmul = std::dynamic_pointer_cast<op::MatmulLayer>(w1_layer);
-    auto w3_matmul = std::dynamic_pointer_cast<op::MatmulLayer>(w3_layer);
-    CHECK_NE(w1_matmul, nullptr) << "W1 layer is not a MatmulLayer";
-    CHECK_NE(w3_matmul, nullptr) << "W3 layer is not a MatmulLayer";
-    STATUS_CHECK(layers->batched_matmul_helper_layer_->forward(
-        ffn_norm_out, w1_matmul->get_weight(0), w1_out, seq_len, 1.f));
-    STATUS_CHECK(layers->batched_matmul_helper_layer_->forward(
-        ffn_norm_out, w3_matmul->get_weight(0), w3_out, seq_len, 1.f));
-  }
+  batched_matmul_forward(w1_layer, ffn_norm_out, w1_out, seq_len);
+  batched_matmul_forward(w3_layer, ffn_norm_out, w3_out, seq_len);
 
   // Batched SwiGLU
   STATUS_CHECK(layers->batched_swiglu_layer_->forward(w1_out, w3_out, w1_out));
 
   // Batched W2
   const auto& w2_layer = layers->w2_layers_.at(layer_idx);
-  auto w2_awq = std::dynamic_pointer_cast<op::AWQMatmulLayer>(w2_layer);
-  if (w2_awq) {
-    STATUS_CHECK(w2_awq->forward(w1_out, w2_out));
-  } else {
-    auto w2_matmul = std::dynamic_pointer_cast<op::MatmulLayer>(w2_layer);
-    CHECK_NE(w2_matmul, nullptr) << "W2 layer is not a MatmulLayer";
-    STATUS_CHECK(layers->batched_matmul_helper_layer_->forward(
-        w1_out, w2_matmul->get_weight(0), w2_out, seq_len, 1.f));
-  }
+  batched_matmul_forward(w2_layer, w1_out, w2_out, seq_len);
 
   // Residual add
   STATUS_CHECK(layers->batched_add_layer_->forward(input, w2_out, input));
@@ -778,6 +676,51 @@ base::Status QwenBaseModel::decode(const tensor::Tensor& input, int32_t pos, int
 
   next = post_processing(pos_tensor, false);
   return base::error::Success();
+}
+
+// ==================== Virtual Dispatch Helpers ====================
+
+void QwenBaseModel::batched_matmul_forward(const std::shared_ptr<op::Layer>& layer,
+                                           const tensor::Tensor& input,
+                                           const tensor::Tensor& output,
+                                           int32_t seq_len) const {
+  auto* layers = get_base_layers();
+  auto matmul = std::dynamic_pointer_cast<op::MatmulLayer>(layer);
+  CHECK_NE(matmul, nullptr) << "Layer is not a MatmulLayer";
+  STATUS_CHECK(layers->batched_matmul_helper_layer_->forward(
+      input, matmul->get_weight(0), output, seq_len, 1.f));
+}
+
+void QwenBaseModel::gate_up_swiglu(int32_t layer_idx,
+                                   const tensor::Tensor& input,
+                                   const tensor::Tensor& output) const {
+  auto* layers = get_base_layers();
+  const auto& w1_layer = layers->w1_layers_.at(layer_idx);
+  const auto& w3_layer = layers->w3_layers_.at(layer_idx);
+  CHECK_NE(w1_layer, nullptr);
+  CHECK_NE(w3_layer, nullptr);
+
+  auto w1_matmul = std::dynamic_pointer_cast<op::MatmulLayer>(w1_layer);
+  auto w3_matmul = std::dynamic_pointer_cast<op::MatmulLayer>(w3_layer);
+  CHECK_NE(w1_matmul, nullptr) << "W1 layer is not a MatmulLayer";
+  CHECK_NE(w3_matmul, nullptr) << "W3 layer is not a MatmulLayer";
+
+  const auto& w1_weight = w1_matmul->get_weight(0);
+  const auto& w3_weight = w3_matmul->get_weight(0);
+
+  auto fused_ffn = layers->fused_ffn_layer_;
+  bool is_fp16 = input.data_type() == base::DataType::kDataTypeFp16 &&
+                 w1_weight.data_type() == base::DataType::kDataTypeFp16;
+  bool is_mixed = input.data_type() == base::DataType::kDataTypeFp32 &&
+                  w1_weight.data_type() == base::DataType::kDataTypeFp16;
+  fused_ffn->set_use_fp16(is_fp16);
+  fused_ffn->set_use_mixed(is_mixed);
+  fused_ffn->set_input(0, input);
+  fused_ffn->set_input(1, w1_weight);
+  fused_ffn->set_input(2, w3_weight);
+  fused_ffn->set_output(0, output);
+  fused_ffn->set_cuda_config(cuda_config_);
+  STATUS_CHECK(fused_ffn->forward());
 }
 
 // ==================== KV Cache Management ====================

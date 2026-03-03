@@ -7,7 +7,6 @@
 #include <op/mha.h>
 #include <op/rmsnorm.h>
 #include <op/embedding.h>
-#include <op/awq_matmul.h>
 #include <sentencepiece_processor.h>
 #include <utility>
 #include <set>
@@ -22,7 +21,6 @@
 #include "../op/kernels/cuda/kv_cache_kernel.cuh"
 #include "../op/kernels/cuda/fused_ffn_kernel.cuh"
 #include "../op/kernels/cuda/argmax_kernel.cuh"
-#include "../op/kernels/cuda/awq_gemm_tensorcore.cuh"
 #include "sampler/argmax_sampler.h"
 #include "base/tick.h"
 
@@ -292,20 +290,13 @@ void Qwen3Model::create_nonparam_layers() {
 }
 
 void Qwen3Model::create_param_quant_layers() {
-  // AWQ quantized layers
-  if (is_awq_model_) {
-    create_param_layers_awq();
-  }
+  // No quantized layers for base FP16/FP32 model.
+  // AWQ quantized layers are handled by Qwen3AWQModel.
 }
 
 void Qwen3Model::create_param_layers() {
-  // This function is for FP32 weights
-  // For FP16 weights, use create_param_layers_fp16()
-  // For AWQ weights, use create_param_layers_awq()
-  if (is_awq_model_) {
-    create_param_layers_awq();
-    return;
-  }
+  // This function handles FP32 and FP16 weights.
+  // AWQ weights are handled by Qwen3AWQModel::create_param_layers().
   if (is_fp16_model_) {
     create_param_layers_fp16();
     return;
@@ -598,158 +589,6 @@ void Qwen3Model::create_param_layers_fp16() {
   LOG(INFO) << "Qwen3 FP16 model loaded successfully. Total FP16 elements: " << pos;
 }
 
-void Qwen3Model::create_param_layers_awq() {
-  CHECK(qwen_layers_ != nullptr);
-  LOG(INFO) << "Loading Qwen3 AWQ INT4 model weights...";
-
-  // For AWQ, we need to use raw byte pointers since we mix INT32 and FP16 data
-  // weight_data points to the start of weights (after 256-byte header)
-  const uint8_t* base_ptr = static_cast<const uint8_t*>(raw_model_data_->weight_data);
-  size_t pos = 0;  // position in bytes from base_ptr
-  
-  int32_t dim = config_->dim_;
-  int32_t kv_dim = config_->kv_dim_;
-  int32_t hidden_dim = config_->hidden_dim_;
-  int32_t immediate_dim = config_->immediate_dim_;
-  auto cpu_device_type = base::DeviceType::kDeviceCPU;
-
-  // AWQ weight order (from export_qwen3-8B-awq.py):
-  // == FP16 weights ==
-  // 1. attention_norm (input_layernorm) for all layers - FP16, size: dim * 2 bytes
-  // 2. ffn_norm (post_attention_layernorm) for all layers - FP16, size: dim * 2 bytes
-  // 3. final norm - FP16, size: dim * 2 bytes
-  // 4. token embeddings - FP16, size: vocab_size * dim * 2 bytes
-  //
-  // == AWQ quantized weights (for each layer) ==
-  // Each linear layer has: qweight (INT32), qzeros (INT32), scales (FP16)
-  // 5-11. wq, wk, wv, wo, w1, w2, w3 for all layers
-  //
-  // == FP16 weights ==
-  // 12. lm_head - FP16 (if not shared)
-  // 13. q_norm for all layers - FP16
-  // 14. k_norm for all layers - FP16
-
-  // 1. attention_norm layers (input_layernorm) - FP16
-  for (int32_t i = 0; i < config_->layer_num_; ++i) {
-    auto rms_norm_layer = std::make_shared<op::RmsNormLayer>(device_type_, dim);
-    rms_norm_layer->set_weight_fp16(0, {dim}, base_ptr + pos, cpu_device_type);
-    qwen_layers_->rmsnorm_layers_.push_back(rms_norm_layer);
-    pos += dim * sizeof(uint16_t);
-  }
-
-  // 2. ffn_norm layers (post_attention_layernorm) - FP16
-  for (int32_t i = 0; i < config_->layer_num_; ++i) {
-    auto rms_norm_layer = std::make_shared<op::RmsNormLayer>(device_type_, dim);
-    rms_norm_layer->set_weight_fp16(0, {dim}, base_ptr + pos, cpu_device_type);
-    qwen_layers_->rmsnorm_layers_.push_back(rms_norm_layer);
-    pos += dim * sizeof(uint16_t);
-  }
-
-  // 3. final norm - FP16
-  {
-    auto final_norm_layer = std::make_shared<op::RmsNormLayer>(device_type_, dim);
-    final_norm_layer->set_weight_fp16(0, {dim}, base_ptr + pos, cpu_device_type);
-    qwen_layers_->rmsnorm_layers_.push_back(final_norm_layer);
-    pos += dim * sizeof(uint16_t);
-  }
-
-  // 4. token embeddings - FP16
-  {
-    auto emb_layer = std::make_shared<op::EmbeddingLayer>(
-        device_type_, dim, config_->seq_len_, std::abs(config_->vocab_size_));
-    emb_layer->set_weight_fp16(0, {std::abs(config_->vocab_size_), dim},
-                               base_ptr + pos, cpu_device_type);
-    qwen_layers_->embedding_layer_ = emb_layer;
-  }
-  pos += config_->vocab_size_ * dim * sizeof(uint16_t);
-
-  // Helper function to load AWQ quantized linear layer
-  auto load_awq_layer = [&](int32_t in_features, int32_t out_features, 
-                            std::vector<std::shared_ptr<op::Layer>>& layer_list,
-                            const std::string& name) {
-    int32_t packed_out = out_features / 8;
-    int32_t num_groups = in_features / group_size_;
-    
-    for (int32_t i = 0; i < config_->layer_num_; ++i) {
-      auto awq_layer = std::make_shared<op::AWQMatmulLayer>(
-          device_type_, in_features, out_features, group_size_);
-      
-      // Read qweight, qzeros, scales in order using raw byte pointers
-      const void* qweight_ptr = base_ptr + pos;
-      size_t qweight_size = static_cast<size_t>(in_features) * packed_out * sizeof(int32_t);
-      pos += qweight_size;
-      
-      const void* qzeros_ptr = base_ptr + pos;
-      size_t qzeros_size = static_cast<size_t>(num_groups) * packed_out * sizeof(int32_t);
-      pos += qzeros_size;
-      
-      const void* scales_ptr = base_ptr + pos;
-      size_t scales_size = static_cast<size_t>(num_groups) * out_features * sizeof(uint16_t);
-      pos += scales_size;
-      
-      awq_layer->set_awq_weights(qweight_ptr, qzeros_ptr, scales_ptr, cpu_device_type);
-      layer_list.push_back(awq_layer);
-    }
-  };
-
-  // 5. wq layers (q_proj) - AWQ
-  load_awq_layer(dim, dim, qwen_layers_->wq_layers_, "wq");
-
-  // 6. wk layers (k_proj) - AWQ
-  load_awq_layer(dim, kv_dim, qwen_layers_->wk_layers_, "wk");
-
-  // 7. wv layers (v_proj) - AWQ
-  load_awq_layer(dim, kv_dim, qwen_layers_->wv_layers_, "wv");
-
-  // 8. wo layers (o_proj) - AWQ
-  load_awq_layer(dim, dim, qwen_layers_->wo_layers_, "wo");
-
-  // 9. w1 layers (gate_proj) - AWQ
-  load_awq_layer(dim, immediate_dim, qwen_layers_->w1_layers_, "w1");
-
-  // 10. w2 layers (down_proj) - AWQ
-  load_awq_layer(immediate_dim, dim, qwen_layers_->w2_layers_, "w2");
-
-  // 11. w3 layers (up_proj) - AWQ
-  load_awq_layer(dim, immediate_dim, qwen_layers_->w3_layers_, "w3");
-
-  // 12. output (lm_head) - FP16 (not quantized)
-  if (!config_->is_shared_weight_) {
-    auto lm_head = std::make_shared<op::MatmulLayer>(device_type_, config_->vocab_size_, dim, false);
-    lm_head->set_weight_fp16(0, {config_->vocab_size_, dim},
-                             base_ptr + pos, cpu_device_type);
-    qwen_layers_->cls_layer_ = lm_head;
-    pos += config_->vocab_size_ * dim * sizeof(uint16_t);
-  } else {
-    // Share weights with embedding layer
-    auto lm_head = std::make_shared<op::MatmulLayer>(device_type_, config_->vocab_size_, dim, false);
-    size_t emb_pos = (2 * config_->layer_num_ + 1) * dim * sizeof(uint16_t);
-    lm_head->set_weight_fp16(0, {config_->vocab_size_, dim},
-                             base_ptr + emb_pos, cpu_device_type);
-    qwen_layers_->cls_layer_ = lm_head;
-  }
-
-  // 13. q_norm for all layers - FP16
-  for (int32_t i = 0; i < config_->layer_num_; ++i) {
-    auto rms_norm_layer = std::make_shared<op::RmsNormLayer>(device_type_, config_->head_size_);
-    rms_norm_layer->set_weight_fp16(0, {config_->head_size_},
-                                    base_ptr + pos, cpu_device_type);
-    qwen_layers_->rmsnorm_layers_.push_back(rms_norm_layer);
-    pos += config_->head_size_ * sizeof(uint16_t);
-  }
-
-  // 14. k_norm for all layers - FP16
-  for (int32_t i = 0; i < config_->layer_num_; ++i) {
-    auto rms_norm_layer = std::make_shared<op::RmsNormLayer>(device_type_, config_->head_size_);
-    rms_norm_layer->set_weight_fp16(0, {config_->head_size_},
-                                    base_ptr + pos, cpu_device_type);
-    qwen_layers_->rmsnorm_layers_.push_back(rms_norm_layer);
-    pos += config_->head_size_ * sizeof(uint16_t);
-  }
-
-  LOG(INFO) << "Qwen3 AWQ INT4 model loaded successfully. Total bytes: " << pos;
-}
-
 void Qwen3Model::init_mem() {
   std::shared_ptr<base::DeviceAllocator> alloc;
   if (device_type_ == base::DeviceType::kDeviceCPU) {
@@ -763,12 +602,7 @@ void Qwen3Model::init_mem() {
     // Keep FP16 weights on GPU for FP16 models to save memory and enable FP16 compute
     qwen_layers_->to_cuda(cuda_config_, is_fp16_model_);
     
-    // Note: Pre-dequantization is disabled to preserve AWQ's memory advantage
-    // The optimized W4A16 fused kernels are used instead for both GEMV (decode) and GEMM (prefill)
-    // This keeps AWQ at ~6GB memory while achieving competitive performance
-    if (is_awq_model_) {
-      LOG(INFO) << "AWQ model loaded with optimized W4A16 fused kernels (no pre-dequant)";
-    }
+
   }
 
   std::shared_ptr<base::DeviceAllocator> alloc_cpu =
@@ -1091,50 +925,37 @@ void Qwen3Model::attention_qkv_with_graph(int32_t layer_idx, const tensor::Tenso
 }
 
 
+void Qwen3Model::batched_qkv_projection(int32_t layer_idx, const tensor::Tensor& rms_out,
+                                         const tensor::Tensor& query_out, const tensor::Tensor& key_out,
+                                         const tensor::Tensor& value_out, int32_t seq_len) const {
+  const auto& query_layer = qwen_layers_->wq_layers_.at(layer_idx);
+  const auto& key_layer = qwen_layers_->wk_layers_.at(layer_idx);
+  const auto& value_layer = qwen_layers_->wv_layers_.at(layer_idx);
+
+  auto query_matmul = std::dynamic_pointer_cast<op::MatmulLayer>(query_layer);
+  auto key_matmul = std::dynamic_pointer_cast<op::MatmulLayer>(key_layer);
+  auto value_matmul = std::dynamic_pointer_cast<op::MatmulLayer>(value_layer);
+
+  CHECK_NE(query_matmul, nullptr) << "Query layer is not a MatmulLayer";
+  CHECK_NE(key_matmul, nullptr) << "Key layer is not a MatmulLayer";
+  CHECK_NE(value_matmul, nullptr) << "Value layer is not a MatmulLayer";
+
+  STATUS_CHECK(qwen_layers_->batched_matmul_helper_layer_->forward(
+      rms_out, query_matmul->get_weight(0), query_out, seq_len, 1.f));
+  STATUS_CHECK(qwen_layers_->batched_matmul_helper_layer_->forward(
+      rms_out, key_matmul->get_weight(0), key_out, seq_len, 1.f));
+  STATUS_CHECK(qwen_layers_->batched_matmul_helper_layer_->forward(
+      rms_out, value_matmul->get_weight(0), value_out, seq_len, 1.f));
+}
+
 void Qwen3Model::batched_attention_qkv(int32_t layer_idx, const tensor::Tensor& rms_out,
                                        const tensor::Tensor& query_out, const tensor::Tensor& key_out, 
                                        const tensor::Tensor& value_out,
                                        int32_t seq_len, int32_t start_pos) const {
   CHECK(qwen_layers_ != nullptr);
-  
-  const auto& query_layer = qwen_layers_->wq_layers_.at(layer_idx);
-  const auto& key_layer = qwen_layers_->wk_layers_.at(layer_idx);
-  const auto& value_layer = qwen_layers_->wv_layers_.at(layer_idx);
-  
-  CHECK_NE(query_layer, nullptr);
-  CHECK_NE(key_layer, nullptr);
-  CHECK_NE(value_layer, nullptr);
-  
-  // Check if this is AWQ layer
-  auto query_awq = std::dynamic_pointer_cast<op::AWQMatmulLayer>(query_layer);
-  auto key_awq = std::dynamic_pointer_cast<op::AWQMatmulLayer>(key_layer);
-  auto value_awq = std::dynamic_pointer_cast<op::AWQMatmulLayer>(value_layer);
-  
-  if (query_awq && key_awq && value_awq) {
-    // AWQ path: use layer forward which handles dispatch internally
-    STATUS_CHECK(query_awq->forward(rms_out, query_out));
-    STATUS_CHECK(key_awq->forward(rms_out, key_out));
-    STATUS_CHECK(value_awq->forward(rms_out, value_out));
-  } else {
-    // Standard FP16/FP32 path
-    auto query_matmul = std::dynamic_pointer_cast<op::MatmulLayer>(query_layer);
-    auto key_matmul = std::dynamic_pointer_cast<op::MatmulLayer>(key_layer);
-    auto value_matmul = std::dynamic_pointer_cast<op::MatmulLayer>(value_layer);
-    
-    CHECK_NE(query_matmul, nullptr) << "Query layer is not a MatmulLayer";
-    CHECK_NE(key_matmul, nullptr) << "Key layer is not a MatmulLayer";
-    CHECK_NE(value_matmul, nullptr) << "Value layer is not a MatmulLayer";
-    
-    // Batched matmul
-    STATUS_CHECK(qwen_layers_->batched_matmul_helper_layer_->forward(
-        rms_out, query_matmul->get_weight(0), query_out, seq_len, 1.f));
-    
-    STATUS_CHECK(qwen_layers_->batched_matmul_helper_layer_->forward(
-        rms_out, key_matmul->get_weight(0), key_out, seq_len, 1.f));
-    
-    STATUS_CHECK(qwen_layers_->batched_matmul_helper_layer_->forward(
-        rms_out, value_matmul->get_weight(0), value_out, seq_len, 1.f));
-  }
+
+  // QKV projection (virtual: FP16/FP32 in base, AWQ in subclass)
+  batched_qkv_projection(layer_idx, rms_out, query_out, key_out, value_out, seq_len);
   
   // Apply Q/K norms for Qwen3 (per-head normalization)
   auto q_norm = qwen_layers_->rmsnorm_layers_.at(layer_idx + 2 * config_->layer_num_ + 1);

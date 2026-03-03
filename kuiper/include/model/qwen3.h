@@ -1,7 +1,6 @@
 #ifndef KUIPER_INCLUDE_MODEL_QWEN3_H_
 #define KUIPER_INCLUDE_MODEL_QWEN3_H_
 #include "qwen_base.h"
-#include "op/awq_matmul.h"
 #include "op/flash_attention.h"
 #include "op/kv_cache.h"
 #include "op/misc_layers.h"
@@ -57,16 +56,19 @@ class Qwen3Model : public QwenBaseModel {
                              const tensor::Tensor& value_out,
                              int32_t seq_len, int32_t start_pos) const override;
 
- private:
+  virtual void batched_qkv_projection(int32_t layer_idx, const tensor::Tensor& rms_out,
+                                      const tensor::Tensor& query_out, const tensor::Tensor& key_out,
+                                      const tensor::Tensor& value_out, int32_t seq_len) const;
+
+ protected:
   void init_mem() override;
   base::Status create_layers() override;
   void create_param_layers() override;
   void create_param_layers_fp16();
-  void create_param_layers_awq();
   void create_nonparam_layers() override;
   void create_param_quant_layers() override;
 
- private:
+ protected:
   std::unique_ptr<Qwen3Layers> qwen_layers_;
 };
 }  // namespace model

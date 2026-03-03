@@ -183,6 +183,18 @@ class QwenBaseModel : public Model {
                                       tensor::Tensor& w3_out, tensor::Tensor& w2_out,
                                       int32_t seq_len) const;
 
+  // Virtual dispatch helpers for FP16/AWQ polymorphism
+  /// Batched matmul dispatch: FP16 uses batched_matmul_helper, AWQ uses layer->forward()
+  virtual void batched_matmul_forward(const std::shared_ptr<op::Layer>& layer,
+                                      const tensor::Tensor& input,
+                                      const tensor::Tensor& output,
+                                      int32_t seq_len) const;
+
+  /// Gate/Up + SwiGLU dispatch for decode fused FFN: FP16 uses fused kernel, AWQ uses separate ops
+  virtual void gate_up_swiglu(int32_t layer_idx,
+                              const tensor::Tensor& input,
+                              const tensor::Tensor& output) const;
+
  protected:
   std::shared_ptr<kernel::CudaConfig> cuda_config_;
   bool use_fused_ffn_ = true;
