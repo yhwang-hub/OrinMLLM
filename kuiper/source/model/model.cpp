@@ -67,9 +67,10 @@ base::Status Model::read_model_file() {
   // magic = 0x616b3432 = "ak42" for Qwen2.5
   // magic = 0x616b3437 = "ak47" for Qwen3
   // magic = 0x616b3438 = "ak48" for Qwen3 AWQ
-  if (magic == 0x616b3432 || magic == 0x616b3437 || magic == 0x616b3438) {
-    bool is_qwen3_format = (magic == 0x616b3437 || magic == 0x616b3438);
+  if (magic == 0x616b3432 || magic == 0x616b3437 || magic == 0x616b3438 || magic == 0x73713438) {
+    bool is_qwen3_format = (magic == 0x616b3437 || magic == 0x616b3438 || magic == 0x73713438);
     bool is_awq_format = (magic == 0x616b3438);
+    bool is_sq_format = (magic == 0x73713438);
     
     if (fread(&version, sizeof(int32_t), 1, file) != 1) {
       return error::ModelParseError("Failed to read version from model file.");
@@ -91,6 +92,11 @@ base::Status Model::read_model_file() {
       is_awq_model_ = true;
       is_fp16_model_ = true;  // AWQ uses FP16 for non-quantized weights
       LOG(INFO) << "Loading AWQ INT4 model format (Qwen3)";
+    } else if (version == 6) {
+      // SmoothQuant INT8 format for Qwen3
+      is_sq_model_ = true;
+      is_fp16_model_ = true;  // SQ uses FP16 for non-quantized weights
+      LOG(INFO) << "Loading SmoothQuant INT8 model format (Qwen3)";
     } else if (version == 1) {
       // FP32 format with header
       is_fp16_model_ = false;
@@ -211,8 +217,8 @@ base::Status Model::read_model_file() {
   // Legacy format header size: 7 x int32_t = 28 bytes (without QWEN3_SUPPORT field)
   constexpr size_t kLegacyHeaderSize = 7 * sizeof(int32_t);  // 28 bytes
   
-  if (magic == 0x616b3432 || magic == 0x616b3437 || magic == 0x616b3438) {
-    // Versioned format: 256 byte header (for ak42, ak47, and ak48/AWQ)
+  if (magic == 0x616b3432 || magic == 0x616b3437 || magic == 0x616b3438 || magic == 0x73713438) {
+    // Versioned format: 256 byte header (for ak42, ak47, ak48/AWQ, and sq48/SQ)
     raw_model_data_->weight_data =
         static_cast<int8_t*>(raw_model_data_->data) + 256;
   } else if (!is_quant_model_) {

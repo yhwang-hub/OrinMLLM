@@ -11,7 +11,7 @@ include(cmake/cuda.cmake)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
-set(CMAKE_CUDA_STANDARD 14)
+set(CMAKE_CUDA_STANDARD 17)
 
 option(LLAMA3_SUPPORT OFF)
 if (LLAMA3_SUPPORT)
@@ -114,6 +114,7 @@ target_include_directories(llama PUBLIC ${glog_INCLUDE_DIR})
 target_include_directories(llama PUBLIC ${PROJECT_SOURCE_DIR}/kuiper/include)
 target_include_directories(llama PUBLIC ${Armadillo_INCLUDE_DIR})
 target_include_directories(llama PUBLIC ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+target_include_directories(llama PUBLIC ${PROJECT_SOURCE_DIR}/3rdparty/cutlass/include)
 
 if(USE_CPM)
   # Add sentencepiece include directory
