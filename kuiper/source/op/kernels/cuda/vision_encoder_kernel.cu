@@ -206,6 +206,75 @@ __global__ void bias_gelu_fp16_kernel(
   }
 }
 
+/**
+ * @brief Fused Bias + GELU with FP16 precision preservation
+ * 
+ * This kernel simulates the behavior of separate bias_add → gelu operations
+ * by inserting an FP16 round-trip between bias addition and GELU activation,
+ * while avoiding the global memory write/read between them.
+ * 
+ * Numerical equivalence: output = gelu(half(input + bias))
+ * Original flow:         bias_add→store_fp16→load_fp16→gelu
+ * This fused flow:       bias_add→fp16_roundtrip_in_reg→gelu
+ * 
+ * Saves: 1 kernel launch + 1 global memory round-trip
+ */
+__global__ void bias_gelu_roundtrip_fp16_kernel(
+    const half* __restrict__ input,
+    const half* __restrict__ bias,
+    half* __restrict__ output,
+    int size,
+    int bias_size) {
+  
+  const int VEC = 8;
+  int base_idx = (blockIdx.x * blockDim.x + threadIdx.x) * VEC;
+  
+  if (base_idx + VEC <= size) {
+    float4 in_data = *reinterpret_cast<const float4*>(&input[base_idx]);
+    const half* in_h = reinterpret_cast<const half*>(&in_data);
+    
+    int bias_idx = base_idx % bias_size;
+    float4 b_data = *reinterpret_cast<const float4*>(&bias[bias_idx]);
+    const half* b_h = reinterpret_cast<const half*>(&b_data);
+    
+    half result[8];
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+      // FP16 round-trip: simulates bias_add store/load without global memory access
+      half sum_h = __float2half(__half2float(in_h[i]) + __half2float(b_h[i]));
+      result[i] = __float2half(gelu_approx(__half2float(sum_h)));
+    }
+    
+    *reinterpret_cast<float4*>(&output[base_idx]) = *reinterpret_cast<const float4*>(result);
+  } else {
+    for (int i = base_idx; i < size; i++) {
+      int bias_idx = i % bias_size;
+      half sum_h = __float2half(__half2float(input[i]) + __half2float(bias[bias_idx]));
+      output[i] = __float2half(gelu_approx(__half2float(sum_h)));
+    }
+  }
+}
+
+static void bias_gelu_roundtrip_cu(
+    const tensor::Tensor& input,
+    const tensor::Tensor& bias,
+    tensor::Tensor& output,
+    cudaStream_t stream) {
+  
+  int size = static_cast<int>(input.size());
+  int bias_size = static_cast<int>(bias.size());
+  int block_size = 256;
+  int num_vecs = (size + 7) / 8;
+  int grid_size = (num_vecs + block_size - 1) / block_size;
+  
+  bias_gelu_roundtrip_fp16_kernel<<<grid_size, block_size, 0, stream>>>(
+      input.ptr<half>(),
+      bias.ptr<half>(),
+      output.ptr<half>(),
+      size,
+      bias_size);
+}
+
 void bias_gelu_cu(
     const tensor::Tensor& input,
     const tensor::Tensor& bias,
@@ -363,72 +432,110 @@ __global__ void pos_embed_interpolate_fp16_kernel(
     int num_grid_per_side,
     int spatial_merge_size) {
   
+  // OPTIMIZED: One block per patch, all threads share bilinear weights via shared memory
+  // Uses half2 vectorization for 2x throughput on memory ops
+  
   int patch_idx = blockIdx.x;
-  int hidden_idx = threadIdx.x + blockIdx.y * blockDim.x;
+  if (patch_idx >= num_patches) return;
   
-  if (patch_idx >= num_patches || hidden_idx >= hidden_size) return;
+  int tid = threadIdx.x;
   
-  // Calculate grid position for this patch
-  // Input patch_embeds is in 2x2 block-interleaved order (after patch_embed + pixel reordering)
-  // We need to compute the position embedding for this patch
+  // Shared memory for bilinear interpolation parameters (computed once per block)
+  __shared__ float s_w00, s_w01, s_w10, s_w11;
+  __shared__ int s_base00, s_base01, s_base10, s_base11;
   
-  int patches_per_frame = grid_h * grid_w;
-  int frame_idx = patch_idx / patches_per_frame;
-  int in_frame_idx = patch_idx % patches_per_frame;
+  if (tid == 0) {
+    // Calculate grid position for this patch (2x2 block-interleaved order)
+    int patches_per_frame = grid_h * grid_w;
+    int in_frame_idx = patch_idx % patches_per_frame;
+    
+    int w_div = grid_w / spatial_merge_size;
+    int block_idx_local = in_frame_idx / (spatial_merge_size * spatial_merge_size);
+    int in_block_idx = in_frame_idx % (spatial_merge_size * spatial_merge_size);
+    
+    int block_h = block_idx_local / w_div;
+    int block_w = block_idx_local % w_div;
+    int local_h = in_block_idx / spatial_merge_size;
+    int local_w = in_block_idx % spatial_merge_size;
+    
+    int h_pos = block_h * spatial_merge_size + local_h;
+    int w_pos = block_w * spatial_merge_size + local_w;
+    
+    // Bilinear interpolation indices from base grid
+    float h_idx = (grid_h > 1) ? (static_cast<float>(h_pos) * (num_grid_per_side - 1) / (grid_h - 1)) : 0.0f;
+    float w_idx = (grid_w > 1) ? (static_cast<float>(w_pos) * (num_grid_per_side - 1) / (grid_w - 1)) : 0.0f;
+    
+    int h_floor = static_cast<int>(h_idx);
+    int w_floor = static_cast<int>(w_idx);
+    int h_ceil = min(h_floor + 1, num_grid_per_side - 1);
+    int w_ceil = min(w_floor + 1, num_grid_per_side - 1);
+    
+    float dh = h_idx - h_floor;
+    float dw = w_idx - w_floor;
+    
+    s_w00 = (1.0f - dh) * (1.0f - dw);
+    s_w01 = (1.0f - dh) * dw;
+    s_w10 = dh * (1.0f - dw);
+    s_w11 = dh * dw;
+    
+    // Base offsets for 4 corners in pos_embed (without hidden_idx)
+    s_base00 = (h_floor * num_grid_per_side + w_floor) * hidden_size;
+    s_base01 = (h_floor * num_grid_per_side + w_ceil) * hidden_size;
+    s_base10 = (h_ceil * num_grid_per_side + w_floor) * hidden_size;
+    s_base11 = (h_ceil * num_grid_per_side + w_ceil) * hidden_size;
+  }
+  __syncthreads();
   
-  // The patch_embeds is in 2x2 block-interleaved order:
-  // For patch_idx in the input, find its (h_pos, w_pos) in the original grid
-  int w_div = grid_w / spatial_merge_size;  // number of 2x2 blocks in width
+  // Load shared values to registers
+  float w00 = s_w00, w01 = s_w01, w10 = s_w10, w11 = s_w11;
+  int base00 = s_base00, base01 = s_base01, base10 = s_base10, base11 = s_base11;
+  int out_base = patch_idx * hidden_size;
   
-  int block_idx = in_frame_idx / (spatial_merge_size * spatial_merge_size);
-  int in_block_idx = in_frame_idx % (spatial_merge_size * spatial_merge_size);
+  // Process elements using half2 vectorization
+  int hidden_half2 = hidden_size / 2;
+  const half2* patch_h2 = reinterpret_cast<const half2*>(patch_embeds + out_base);
+  const half2* pe00_h2 = reinterpret_cast<const half2*>(pos_embed + base00);
+  const half2* pe01_h2 = reinterpret_cast<const half2*>(pos_embed + base01);
+  const half2* pe10_h2 = reinterpret_cast<const half2*>(pos_embed + base10);
+  const half2* pe11_h2 = reinterpret_cast<const half2*>(pos_embed + base11);
+  half2* out_h2 = reinterpret_cast<half2*>(output + out_base);
   
-  int block_h = block_idx / w_div;
-  int block_w = block_idx % w_div;
-  int local_h = in_block_idx / spatial_merge_size;
-  int local_w = in_block_idx % spatial_merge_size;
+  for (int i = tid; i < hidden_half2; i += blockDim.x) {
+    // Load 4 corner position embeddings (half2)
+    half2 v00 = pe00_h2[i];
+    half2 v01 = pe01_h2[i];
+    half2 v10 = pe10_h2[i];
+    half2 v11 = pe11_h2[i];
+    
+    // Convert to float2 for interpolation
+    float2 f00 = __half22float2(v00);
+    float2 f01 = __half22float2(v01);
+    float2 f10 = __half22float2(v10);
+    float2 f11 = __half22float2(v11);
+    
+    // Bilinear interpolation with FMA
+    float2 pos_val;
+    pos_val.x = __fmaf_rn(w00, f00.x, __fmaf_rn(w01, f01.x, __fmaf_rn(w10, f10.x, w11 * f11.x)));
+    pos_val.y = __fmaf_rn(w00, f00.y, __fmaf_rn(w01, f01.y, __fmaf_rn(w10, f10.y, w11 * f11.y)));
+    
+    // Load patch embedding and add
+    half2 patch_val = patch_h2[i];
+    float2 fp = __half22float2(patch_val);
+    fp.x += pos_val.x;
+    fp.y += pos_val.y;
+    
+    out_h2[i] = __float22half2_rn(fp);
+  }
   
-  // Original grid position for this patch
-  int h_pos = block_h * spatial_merge_size + local_h;
-  int w_pos = block_w * spatial_merge_size + local_w;
-  
-  // Bilinear interpolation from base grid (48x48)
-  // HuggingFace uses torch.linspace(0, num_grid_per_side-1, grid_h)
-  // This produces indices: 0, step, 2*step, ..., (grid_h-1)*step = num_grid_per_side-1
-  // where step = (num_grid_per_side - 1) / (grid_h - 1)
-  float h_idx = (grid_h > 1) ? (static_cast<float>(h_pos) * (num_grid_per_side - 1) / (grid_h - 1)) : 0.0f;
-  float w_idx = (grid_w > 1) ? (static_cast<float>(w_pos) * (num_grid_per_side - 1) / (grid_w - 1)) : 0.0f;
-  
-  int h_floor = static_cast<int>(h_idx);
-  int w_floor = static_cast<int>(w_idx);
-  int h_ceil = min(h_floor + 1, num_grid_per_side - 1);
-  int w_ceil = min(w_floor + 1, num_grid_per_side - 1);
-  
-  float dh = h_idx - h_floor;
-  float dw = w_idx - w_floor;
-  
-  // Bilinear weights
-  float w00 = (1 - dh) * (1 - dw);
-  float w01 = (1 - dh) * dw;
-  float w10 = dh * (1 - dw);
-  float w11 = dh * dw;
-  
-  // Fetch position embeddings from base grid (row-major order)
-  int idx00 = (h_floor * num_grid_per_side + w_floor) * hidden_size + hidden_idx;
-  int idx01 = (h_floor * num_grid_per_side + w_ceil) * hidden_size + hidden_idx;
-  int idx10 = (h_ceil * num_grid_per_side + w_floor) * hidden_size + hidden_idx;
-  int idx11 = (h_ceil * num_grid_per_side + w_ceil) * hidden_size + hidden_idx;
-  
-  // Bilinear interpolation with FMA for pos_embed
-  float pos_val = __fmaf_rn(w00, __half2float(pos_embed[idx00]),
-                  __fmaf_rn(w01, __half2float(pos_embed[idx01]),
-                  __fmaf_rn(w10, __half2float(pos_embed[idx10]),
-                            w11 * __half2float(pos_embed[idx11]))));
-  
-  // Add to patch embedding
-  int out_idx = patch_idx * hidden_size + hidden_idx;
-  float patch_val = __half2float(patch_embeds[out_idx]);
-  output[out_idx] = __float2half(patch_val + pos_val);
+  // Handle odd hidden_size (unlikely but safe)
+  if (hidden_size % 2 != 0 && tid == 0) {
+    int idx = hidden_size - 1;
+    float pos_val = __fmaf_rn(w00, __half2float(pos_embed[base00 + idx]),
+                    __fmaf_rn(w01, __half2float(pos_embed[base01 + idx]),
+                    __fmaf_rn(w10, __half2float(pos_embed[base10 + idx]),
+                              w11 * __half2float(pos_embed[base11 + idx]))));
+    output[out_base + idx] = __float2half(__half2float(patch_embeds[out_base + idx]) + pos_val);
+  }
 }
 
 void pos_embed_interpolate_cu(
@@ -445,8 +552,10 @@ void pos_embed_interpolate_cu(
   int num_patches = patch_embeds.get_dim(0);
   int hidden_size = patch_embeds.get_dim(1);
   
+  // OPTIMIZED: One block per patch (was num_patches × ceil(hidden/256))
+  // For hidden_size=1152, each thread processes ~2.25 half2 elements
   dim3 block_size(256);
-  dim3 grid_size(num_patches, (hidden_size + 255) / 256);
+  dim3 grid_size(num_patches);
   
   pos_embed_interpolate_fp16_kernel<<<grid_size, block_size, 0, stream>>>(
       patch_embeds.ptr<half>(),
@@ -468,45 +577,9 @@ void pos_embed_interpolate_cu(
 // Spatial merge for 2x2 block-interleaved input
 // Input is already in block order: patches 0,1,2,3 form block 0, patches 4,5,6,7 form block 1, etc.
 // HuggingFace does: x.view(-1, hidden_size * 4) which simply concatenates every 4 consecutive patches
-// So we just need to reshape: [num_patches, hidden] -> [num_patches/4, hidden*4]
-__global__ void spatial_merge_fp16_kernel(
-    const half* __restrict__ input,
-    half* __restrict__ output,
-    int num_patches,
-    int hidden_size,
-    int merge_area) {
-  
-  // Optimized: float4 vectorized copy (8 halfs per thread)
-  int num_out_tokens = num_patches / merge_area;
-  int out_hidden_size = hidden_size * merge_area;
-  
-  int token_idx = blockIdx.x;
-  int base_idx = (threadIdx.x + blockIdx.y * blockDim.x) * 8;
-  
-  if (token_idx >= num_out_tokens || base_idx >= out_hidden_size) return;
-  
-  // For hidden_size divisible by 8, float4 never crosses patch boundaries
-  int local_patch = base_idx / hidden_size;
-  int local_hidden = base_idx % hidden_size;
-  
-  int in_patch_idx = token_idx * merge_area + local_patch;
-  int in_idx = in_patch_idx * hidden_size + local_hidden;
-  int out_idx = token_idx * out_hidden_size + base_idx;
-  
-  if (base_idx + 8 <= out_hidden_size && local_hidden + 8 <= hidden_size) {
-    float4 data = *reinterpret_cast<const float4*>(&input[in_idx]);
-    *reinterpret_cast<float4*>(&output[out_idx]) = data;
-  } else {
-    // Scalar fallback
-    for (int i = 0; i < 8 && base_idx + i < out_hidden_size; i++) {
-      int h_idx = base_idx + i;
-      int lp = h_idx / hidden_size;
-      int lh = h_idx % hidden_size;
-      int ip = token_idx * merge_area + lp;
-      output[token_idx * out_hidden_size + h_idx] = input[ip * hidden_size + lh];
-    }
-  }
-}
+// Since patches are already contiguous in memory, this is a zero-copy reshape —
+// the input [num_patches, hidden] IS the output [num_patches/4, hidden*4] in memory.
+// We use cudaMemcpyAsync as a simple contiguous copy (or pointer aliasing when possible).
 
 void spatial_merge_cu(
     const tensor::Tensor& input,
@@ -520,19 +593,13 @@ void spatial_merge_cu(
   
   int merge_area = spatial_merge_size * spatial_merge_size;  // 4
   int num_patches = input.get_dim(0);  // grid_t * grid_h * grid_w
-  int num_out_tokens = num_patches / merge_area;
-  int out_hidden_size = hidden_size * merge_area;
   
-  dim3 block_size(256);
-  int num_vecs = (out_hidden_size + 7) / 8;
-  dim3 grid_size(num_out_tokens, (num_vecs + 255) / 256);
-  
-  spatial_merge_fp16_kernel<<<grid_size, block_size, 0, stream>>>(
-      input.ptr<half>(),
-      output.ptr<half>(),
-      num_patches,
-      hidden_size,
-      merge_area);
+  // The data is contiguous: input[0..num_patches-1] maps directly to
+  // output[0..num_patches/merge_area-1] with wider hidden dim.
+  // Just do a single async memcpy (DtoD, same GPU, very fast).
+  size_t total_bytes = static_cast<size_t>(num_patches) * hidden_size * sizeof(half);
+  cudaMemcpyAsync(output.ptr<half>(), input.ptr<half>(), total_bytes,
+                  cudaMemcpyDeviceToDevice, stream);
 }
 
 // ============================================================================
@@ -596,7 +663,8 @@ void vision_mlp_cu(
 // Vision Merger Implementation
 // ============================================================================
 
-// Vision merger MLP only (LayerNorm is done separately before spatial merge)
+// Vision merger MLP: fc2(gelu(fc1(x) + bias1)) + bias2
+// Optimized: fused bias+GELU replaces separate bias_add + gelu (saves 1 kernel + 1 memory pass)
 void vision_merger_mlp_cu(
     const tensor::Tensor& input,
     const tensor::Tensor& fc1_weight,
@@ -624,8 +692,9 @@ void vision_merger_mlp_cu(
               &beta,
               intermediate.ptr<half>(), merged_hidden);
   
-  bias_add_residual_cu(intermediate, fc1_bias, tensor::Tensor(), intermediate, config->stream);
-  gelu_cu(intermediate, intermediate, config->stream);
+  // Fused bias + GELU with FP16 round-trip: preserves bit-exact behavior of 
+  // original separate bias_add + gelu, while saving 1 kernel + 1 memory pass
+  bias_gelu_roundtrip_cu(intermediate, fc1_bias, intermediate, config->stream);
   
   // fc2: [num_tokens, merged_hidden] -> [num_tokens, out_hidden]
   cublasHgemm(config->cublas_handle,
@@ -637,6 +706,7 @@ void vision_merger_mlp_cu(
               &beta,
               output.ptr<half>(), out_hidden);
   
+  // bias add (no residual for merger)
   bias_add_residual_cu(output, fc2_bias, tensor::Tensor(), output, config->stream);
 }
 
@@ -668,78 +738,78 @@ __global__ void fused_split_rope_transpose_kernel(
     half* __restrict__ v_trans,             // [num_heads, num_tokens, head_dim]
     int num_tokens,
     int num_heads,
-    int head_dim) {
+    int head_dim,
+    int half_head_dim,
+    int half_head_dim_h2,
+    int hidden_size,
+    int rope_total,      // num_heads * num_tokens * half_head_dim_h2
+    int v_total) {       // num_heads * num_tokens * head_dim_f4
   
-  // Grid: [num_heads, num_tokens]
-  // Block: [head_dim] or (head_dim + blockDim - 1) / blockDim threads
-  const int head_idx = blockIdx.x;
-  const int token_idx = blockIdx.y;
-  const int hidden_size = num_heads * head_dim;
-  const int half_head_dim = head_dim / 2;
+  // --- Phase 1: RoPE for Q and K using half2 vectorization ---
+  // 1D grid-stride loop: each thread processes one half2 pair of one (head, token)
+  // Total work items: num_heads * num_tokens * half_head_dim_h2  (all useful, no idle threads)
+  const int stride = blockDim.x * gridDim.x;
   
-  if (head_idx >= num_heads || token_idx >= num_tokens) return;
-  
-  // Base pointers for this token in qkv
-  const half* qkv_token = qkv + token_idx * 3 * hidden_size;
-  const half* q_in = qkv_token + head_idx * head_dim;
-  const half* k_in = qkv_token + hidden_size + head_idx * head_dim;
-  const half* v_in = qkv_token + 2 * hidden_size + head_idx * head_dim;
-  
-  // RoPE cache for this token
-  const half* cos_ptr = cos_cache + token_idx * head_dim;
-  const half* sin_ptr = sin_cache + token_idx * head_dim;
-  
-  // Output base pointers (transposed layout)
-  // Output layout: [head_idx, token_idx, dim] = [head_idx * num_tokens * head_dim + token_idx * head_dim + dim]
-  int out_offset = head_idx * num_tokens * head_dim + token_idx * head_dim;
-  half* q_out = q_trans + out_offset;
-  half* k_out = k_trans + out_offset;
-  half* v_out = v_trans + out_offset;
-  
-  // Process dimensions in parallel
-  for (int d = threadIdx.x; d < half_head_dim; d += blockDim.x) {
-    // Load Q, K pairs from input
-    float q1 = __half2float(q_in[d]);
-    float q2 = __half2float(q_in[d + half_head_dim]);
-    float k1 = __half2float(k_in[d]);
-    float k2 = __half2float(k_in[d + half_head_dim]);
+  for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < rope_total; idx += stride) {
+    int d = idx % half_head_dim_h2;
+    int temp = idx / half_head_dim_h2;
+    int token_idx = temp % num_tokens;
+    int head_idx = temp / num_tokens;
     
-    // Load rotation angles
-    float cos_val = __half2float(cos_ptr[d]);
-    float sin_val = __half2float(sin_ptr[d]);
-    float cos_val2 = __half2float(cos_ptr[d + half_head_dim]);
-    float sin_val2 = __half2float(sin_ptr[d + half_head_dim]);
+    // Input pointers
+    const half* qkv_token = qkv + token_idx * 3 * hidden_size;
+    const half2* q_in_h2 = reinterpret_cast<const half2*>(qkv_token + head_idx * head_dim);
+    const half2* k_in_h2 = reinterpret_cast<const half2*>(qkv_token + hidden_size + head_idx * head_dim);
+    const half2* cos_h2 = reinterpret_cast<const half2*>(cos_cache + token_idx * head_dim);
+    const half2* sin_h2 = reinterpret_cast<const half2*>(sin_cache + token_idx * head_dim);
     
-    // Apply RoPE rotation with FMA instructions
-    // rotate_half: [x1, x2] -> [-x2, x1]
-    float q1_rot = __fmaf_rn(q1, cos_val, -(q2 * sin_val));
-    float q2_rot = __fmaf_rn(q1, sin_val2, q2 * cos_val2);
-    float k1_rot = __fmaf_rn(k1, cos_val, -(k2 * sin_val));
-    float k2_rot = __fmaf_rn(k1, sin_val2, k2 * cos_val2);
+    // Output pointer (transposed layout)
+    int out_offset = head_idx * num_tokens * head_dim + token_idx * head_dim;
+    half2* q_out_h2 = reinterpret_cast<half2*>(q_trans + out_offset);
+    half2* k_out_h2 = reinterpret_cast<half2*>(k_trans + out_offset);
     
-    // Write to transposed output
-    q_out[d] = __float2half(q1_rot);
-    q_out[d + half_head_dim] = __float2half(q2_rot);
-    k_out[d] = __float2half(k1_rot);
-    k_out[d + half_head_dim] = __float2half(k2_rot);
+    // Load via read-only cache
+    float2 q1f = __half22float2(__ldg(&q_in_h2[d]));
+    float2 q2f = __half22float2(__ldg(&q_in_h2[d + half_head_dim_h2]));
+    float2 k1f = __half22float2(__ldg(&k_in_h2[d]));
+    float2 k2f = __half22float2(__ldg(&k_in_h2[d + half_head_dim_h2]));
+    
+    float2 cosf  = __half22float2(__ldg(&cos_h2[d]));
+    float2 sinf  = __half22float2(__ldg(&sin_h2[d]));
+    float2 cosf2 = __half22float2(__ldg(&cos_h2[d + half_head_dim_h2]));
+    float2 sinf2 = __half22float2(__ldg(&sin_h2[d + half_head_dim_h2]));
+    
+    // RoPE rotation with FMA
+    float2 q1_rot, q2_rot, k1_rot, k2_rot;
+    q1_rot.x = __fmaf_rn(q1f.x, cosf.x, -(q2f.x * sinf.x));
+    q1_rot.y = __fmaf_rn(q1f.y, cosf.y, -(q2f.y * sinf.y));
+    q2_rot.x = __fmaf_rn(q1f.x, sinf2.x, q2f.x * cosf2.x);
+    q2_rot.y = __fmaf_rn(q1f.y, sinf2.y, q2f.y * cosf2.y);
+    k1_rot.x = __fmaf_rn(k1f.x, cosf.x, -(k2f.x * sinf.x));
+    k1_rot.y = __fmaf_rn(k1f.y, cosf.y, -(k2f.y * sinf.y));
+    k2_rot.x = __fmaf_rn(k1f.x, sinf2.x, k2f.x * cosf2.x);
+    k2_rot.y = __fmaf_rn(k1f.y, sinf2.y, k2f.y * cosf2.y);
+    
+    q_out_h2[d] = __float22half2_rn(q1_rot);
+    q_out_h2[d + half_head_dim_h2] = __float22half2_rn(q2_rot);
+    k_out_h2[d] = __float22half2_rn(k1_rot);
+    k_out_h2[d + half_head_dim_h2] = __float22half2_rn(k2_rot);
   }
   
-  // V doesn't need RoPE, just copy with transpose using float4 vectorization
-  const int head_dim_f4 = head_dim / 8;  // 72/8 = 9
-  if (head_dim_f4 > 0) {
-    const float4* v_in_f4 = reinterpret_cast<const float4*>(v_in);
-    float4* v_out_f4 = reinterpret_cast<float4*>(v_out);
-    for (int d = threadIdx.x; d < head_dim_f4; d += blockDim.x) {
-      v_out_f4[d] = v_in_f4[d];
-    }
-    // Handle remainder (head_dim=72 is divisible by 8, so no remainder)
-    for (int d = head_dim_f4 * 8 + threadIdx.x; d < head_dim; d += blockDim.x) {
-      v_out[d] = v_in[d];
-    }
-  } else {
-    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
-      v_out[d] = v_in[d];
-    }
+  // --- Phase 2: V copy with float4 vectorization (no RoPE) ---
+  const int head_dim_f4 = head_dim / 8;
+  for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < v_total; idx += stride) {
+    int d = idx % head_dim_f4;
+    int temp = idx / head_dim_f4;
+    int token_idx = temp % num_tokens;
+    int head_idx = temp / num_tokens;
+    
+    const float4* v_in_f4 = reinterpret_cast<const float4*>(
+        qkv + token_idx * 3 * hidden_size + 2 * hidden_size + head_idx * head_dim);
+    float4* v_out_f4 = reinterpret_cast<float4*>(
+        v_trans + head_idx * num_tokens * head_dim + token_idx * head_dim);
+    
+    v_out_f4[d] = __ldg(&v_in_f4[d]);
   }
 }
 
@@ -755,10 +825,19 @@ void fused_split_rope_transpose_cu(
     int head_dim,
     cudaStream_t stream) {
   
-  // Launch with grid [num_heads, num_tokens], block [128]
-  // Each block handles one (head, token) pair with improved occupancy
-  dim3 grid(num_heads, num_tokens);
-  dim3 block(128);  // Increased from 64 for better SM utilization
+  // 1D grid-stride launch: every thread does useful work (no idle threads)
+  // Pre-compute constants on host to avoid redundant GPU computation
+  const int hidden_size = num_heads * head_dim;
+  const int half_head_dim = head_dim / 2;
+  const int half_head_dim_h2 = half_head_dim / 2;
+  const int head_dim_f4 = head_dim / 8;
+  const int rope_total = num_heads * num_tokens * half_head_dim_h2;
+  const int v_total = num_heads * num_tokens * head_dim_f4;
+  
+  // Use max of rope_total, v_total for grid sizing
+  const int max_total = rope_total > v_total ? rope_total : v_total;
+  dim3 block(256);
+  dim3 grid((max_total + 255) / 256);
   
   fused_split_rope_transpose_kernel<<<grid, block, 0, stream>>>(
       qkv.ptr<half>(),
@@ -769,7 +848,12 @@ void fused_split_rope_transpose_cu(
       v_trans.ptr<half>(),
       num_tokens,
       num_heads,
-      head_dim);
+      head_dim,
+      half_head_dim,
+      half_head_dim_h2,
+      hidden_size,
+      rope_total,
+      v_total);
 }
 
 // ============================================================================
@@ -779,7 +863,7 @@ void fused_split_rope_transpose_cu(
 
 /**
  * Transpose kernel: [num_heads, total_tokens, head_dim] -> [total_tokens, num_heads * head_dim]
- * Optimized with float4 vectorization (8 halfs per thread) for aligned head_dim
+ * Optimized with float4 vectorization and __ldg read-only cache.
  */
 __global__ void transpose_head_token_kernel(
     const half* __restrict__ input,   // [num_heads, total_tokens, head_dim]
@@ -796,6 +880,7 @@ __global__ void transpose_head_token_kernel(
   
   if (idx >= total_vecs) return;
   
+  // Read-coalesced decomposition: d_vec fastest, t middle, h slowest
   int d_vec = idx % head_dim_vec;
   int temp = idx / head_dim_vec;
   int t = temp % total_tokens;
@@ -806,19 +891,15 @@ __global__ void transpose_head_token_kernel(
   
   if (vec_size == 8) {
     *reinterpret_cast<float4*>(&output[output_off]) = 
-        *reinterpret_cast<const float4*>(&input[input_off]);
+        __ldg(reinterpret_cast<const float4*>(&input[input_off]));
   } else {
     *reinterpret_cast<half2*>(&output[output_off]) = 
-        *reinterpret_cast<const half2*>(&input[input_off]);
+        __ldg(reinterpret_cast<const half2*>(&input[input_off]));
   }
 }
 
 
 
-
-/**
- * Simple softmax kernel for attention scores
- */
 
 /**
  * Optimized vision softmax kernel with vectorized access and better parallelism
@@ -1018,6 +1099,126 @@ void vision_attention_pretransposed_cu(
   
   transpose_head_token_kernel<<<trans_grid, trans_block, 0, stream>>>(
       out_transposed.ptr<half>(), output.ptr<half>(), num_tokens, num_heads, head_dim);
+}
+
+// ============================================================================
+// Vision Rotary Embedding CUDA Kernel
+// ============================================================================
+
+/**
+ * Compute vision rotary position embeddings entirely on GPU.
+ * 
+ * For each token in spatial merge order, computes:
+ *   cos_cache[token, :] = cos(freq for h and w positions)
+ *   sin_cache[token, :] = sin(freq for h and w positions)
+ * 
+ * Layout: [h_freq(18), w_freq(18), h_freq(18), w_freq(18)] = 72 dims
+ * 
+ * Grid: (num_tokens)
+ * Block: (head_dim/2 = 36) or 64 threads (each handles one pair of cos/sin output positions)
+ */
+__global__ void vision_rotary_emb_kernel(
+    half* __restrict__ cos_cache,    // [num_tokens, head_dim]
+    half* __restrict__ sin_cache,    // [num_tokens, head_dim]
+    const int num_tokens,
+    const int grid_h,
+    const int grid_w,
+    const int grid_t,
+    const int merge_size,
+    const int head_dim,              // 72
+    const int quarter_head_dim,      // 18
+    const float theta                // 10000.0
+) {
+    const int token_idx = blockIdx.x;
+    if (token_idx >= num_tokens) return;
+    
+    const int tid = threadIdx.x;
+    if (tid >= quarter_head_dim) return;  // Only need 18 threads per token
+    
+    // Compute position IDs in spatial merge order
+    const int merged_h = grid_h / merge_size;
+    const int merged_w = grid_w / merge_size;
+    const int patches_per_frame = grid_h * grid_w;
+    const int in_frame_idx = token_idx % patches_per_frame;
+    
+    const int block_idx = in_frame_idx / (merge_size * merge_size);
+    const int in_block_idx = in_frame_idx % (merge_size * merge_size);
+    const int block_h_pos = block_idx / merged_w;
+    const int block_w_pos = block_idx % merged_w;
+    const int local_h = in_block_idx / merge_size;
+    const int local_w = in_block_idx % merge_size;
+    
+    const int h_pos = block_h_pos * merge_size + local_h;
+    const int w_pos = block_w_pos * merge_size + local_w;
+    
+    // Compute inverse frequency for this thread's dimension
+    const int half_head_dim = head_dim / 2;  // 36
+    const float inv_freq = 1.0f / powf(theta, static_cast<float>(2 * tid) / half_head_dim);
+    
+    // Compute frequencies
+    const float h_freq = static_cast<float>(h_pos) * inv_freq;
+    const float w_freq = static_cast<float>(w_pos) * inv_freq;
+    
+    // Compute cos/sin
+    float cos_h, sin_h, cos_w, sin_w;
+    sincosf(h_freq, &sin_h, &cos_h);
+    sincosf(w_freq, &sin_w, &cos_w);
+    
+    // Write to output: layout = [h_freq(18), w_freq(18), h_freq(18), w_freq(18)]
+    const int base = token_idx * head_dim;
+    // Use round-toward-zero to match CPU float_to_half() truncation behavior
+    const half cos_h_half = __float2half_rz(cos_h);
+    const half sin_h_half = __float2half_rz(sin_h);
+    const half cos_w_half = __float2half_rz(cos_w);
+    const half sin_w_half = __float2half_rz(sin_w);
+    
+    // [0:18] = height frequencies
+    cos_cache[base + tid] = cos_h_half;
+    sin_cache[base + tid] = sin_h_half;
+    
+    // [18:36] = width frequencies
+    cos_cache[base + quarter_head_dim + tid] = cos_w_half;
+    sin_cache[base + quarter_head_dim + tid] = sin_w_half;
+    
+    // [36:54] = height frequencies (repeat)
+    cos_cache[base + half_head_dim + tid] = cos_h_half;
+    sin_cache[base + half_head_dim + tid] = sin_h_half;
+    
+    // [54:72] = width frequencies (repeat)
+    cos_cache[base + half_head_dim + quarter_head_dim + tid] = cos_w_half;
+    sin_cache[base + half_head_dim + quarter_head_dim + tid] = sin_w_half;
+}
+
+void vision_rotary_emb_cu(
+    half* cos_cache,
+    half* sin_cache,
+    int num_tokens,
+    int grid_h,
+    int grid_w,
+    int grid_t,
+    int merge_size,
+    int head_dim,
+    float theta,
+    cudaStream_t stream) {
+  
+  int quarter_head_dim = head_dim / 4;  // 18
+  
+  // One block per token, quarter_head_dim threads per block (18)
+  // Round up to warp size for efficiency
+  dim3 block_size(32);  // Round up 18 to nearest warp size
+  dim3 grid_size(num_tokens);
+  
+  vision_rotary_emb_kernel<<<grid_size, block_size, 0, stream>>>(
+      cos_cache,
+      sin_cache,
+      num_tokens,
+      grid_h,
+      grid_w,
+      grid_t,
+      merge_size,
+      head_dim,
+      quarter_head_dim,
+      theta);
 }
 
 }  // namespace kernel

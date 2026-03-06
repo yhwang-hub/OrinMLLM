@@ -266,6 +266,41 @@ void vision_merger_mlp_cu(
     tensor::Tensor& intermediate,
     const kernel::CudaConfig* config);
 
+// ============================================================================
+// Vision Rotary Embedding (GPU-computed)
+// ============================================================================
+
+/**
+ * @brief Compute vision rotary position embeddings entirely on GPU
+ * 
+ * Replaces CPU computation + H2D copy with a single GPU kernel.
+ * Computes cos/sin for each token in spatial merge order.
+ * 
+ * Layout: [h_freq(18), w_freq(18), h_freq(18), w_freq(18)] = 72 dims
+ * 
+ * @param cos_cache Output cos cache [num_tokens, head_dim]
+ * @param sin_cache Output sin cache [num_tokens, head_dim]
+ * @param num_tokens Total tokens (grid_t * grid_h * grid_w)
+ * @param grid_h Grid height
+ * @param grid_w Grid width
+ * @param grid_t Grid temporal dimension
+ * @param merge_size Spatial merge size (2)
+ * @param head_dim Head dimension (72)
+ * @param theta Rotary embedding base frequency (10000.0)
+ * @param stream CUDA stream
+ */
+void vision_rotary_emb_cu(
+    half* cos_cache,
+    half* sin_cache,
+    int num_tokens,
+    int grid_h,
+    int grid_w,
+    int grid_t,
+    int merge_size,
+    int head_dim,
+    float theta,
+    cudaStream_t stream);
+
 }  // namespace kernel
 
 #endif  // KUIPER_OP_KERNELS_CUDA_VISION_ENCODER_KERNEL_CUH_

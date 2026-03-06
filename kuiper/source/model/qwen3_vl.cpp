@@ -367,6 +367,13 @@ Qwen3VLModel::~Qwen3VLModel() {
   }
   mrope_pos_pinned_capacity_ = 0;
   
+  // Clean up reusable GPU pixel buffer
+  if (pixel_buf_gpu_) {
+    cudaFree(pixel_buf_gpu_);
+    pixel_buf_gpu_ = nullptr;
+  }
+  pixel_buf_gpu_capacity_ = 0;
+  
   // Clean up mmap
   if (vl_model_data_ && vl_model_data_ != MAP_FAILED) {
     munmap(vl_model_data_, vl_model_file_size_);
@@ -970,6 +977,16 @@ void Qwen3VLModel::init_mem() {
   CHECK(insert_buffer(ModelBufferType::kForwardOutput, forward_output));
   LOG(INFO) << "Allocated forward output buffers.";
   
+  // Pre-allocate GPU pixel buffer for fused resize kernel.
+  // 32 MB is enough for images up to ~3500x3000 (most camera photos).
+  // This moves the cudaMalloc overhead out of the preprocessing hot path.
+  if (device_type_ == base::DeviceType::kDeviceCUDA) {
+    constexpr size_t kDefaultPixelBufSize = 32 * 1024 * 1024;  // 32 MB
+    cudaMalloc(&pixel_buf_gpu_, kDefaultPixelBufSize);
+    pixel_buf_gpu_capacity_ = kDefaultPixelBufSize;
+    LOG(INFO) << "Pre-allocated GPU pixel buffer: " << kDefaultPixelBufSize / (1024*1024) << " MB";
+  }
+  
   LOG(INFO) << "Memory initialization complete for Qwen3-VL.";
 }
 
@@ -1444,19 +1461,13 @@ ImageData Qwen3VLModel::preprocess_image(const std::string& image_path, int max_
     return result;
   }
   
-  // 2. Smart resize - matching HuggingFace behavior
-  // factor = patch_size (16) - dimensions must be divisible by patch_size
-  // min_pixels = 56 * 56 = 3136 (default in HuggingFace)
-  // max_pixels can be adjusted: lower = faster ViT, higher = better quality
-  int factor = vl_config_.vision.patch_size;  // 16, not 32!
+  // 2. Smart resize on CPU using stb (bit-exact match with baseline)
+  int factor = vl_config_.vision.patch_size;  // 16
   constexpr int min_pixels = 56 * 56;  // 3136
   auto [resized_pixels, new_width, new_height] = image_utils::smart_resize(
       pixels, width, height, min_pixels, max_pixels, factor);
   
-  // 3. Normalize and convert to tensor
-  auto image_tensor = image_utils::normalize_to_tensor(resized_pixels, new_width, new_height);
-  
-  // 4. Calculate grid dimensions
+  // 3. Calculate grid dimensions
   result.grid_h = new_height / vl_config_.vision.patch_size;
   result.grid_w = new_width / vl_config_.vision.patch_size;
   result.grid_t = 1;
@@ -1465,10 +1476,37 @@ ImageData Qwen3VLModel::preprocess_image(const std::string& image_path, int max_
   int merge_size = vl_config_.vision.spatial_merge_size;
   result.num_vision_tokens = result.num_patches / (merge_size * merge_size);
   
-  // 5. Convert to patches (GPU-accelerated)
-  result.pixel_values = image_utils::image_to_patches(
-      image_tensor, vl_config_.vision.patch_size, vl_config_.vision.temporal_patch_size,
-      cuda_config_ ? cuda_config_->stream : nullptr);
+  // 4. Upload resized uint8 pixels to GPU, run fused normalize + patches kernel.
+  //    This eliminates: CPU normalization loop, CPU fp32->fp16 conversion,
+  //    intermediate CHW tensor, and separate extract_patches kernel launch.
+  int patch_dim = 3 * vl_config_.vision.temporal_patch_size * 
+                  vl_config_.vision.patch_size * vl_config_.vision.patch_size;
+  
+  auto alloc = base::CUDADeviceAllocatorFactory::get_instance();
+  result.pixel_values = tensor::Tensor(base::DataType::kDataTypeFp16, 
+                                        result.num_patches, patch_dim, true, alloc);
+  
+  // Grow reusable GPU pixel buffer if needed (pre-allocated in init_mem)
+  cudaStream_t stream = cuda_config_ ? cuda_config_->stream : nullptr;
+  size_t pixel_bytes = static_cast<size_t>(new_width) * new_height * 3;
+  if (pixel_bytes > pixel_buf_gpu_capacity_) {
+    if (pixel_buf_gpu_) cudaFree(pixel_buf_gpu_);
+    cudaMalloc(&pixel_buf_gpu_, pixel_bytes);
+    pixel_buf_gpu_capacity_ = pixel_bytes;
+  }
+  cudaMemcpyAsync(pixel_buf_gpu_, resized_pixels.data(), pixel_bytes,
+                  cudaMemcpyHostToDevice, stream);
+  
+  // Fused GPU kernel: normalize + patch extraction
+  kernel::fused_normalize_patches_cu(
+      pixel_buf_gpu_,
+      result.pixel_values.ptr<half>(),
+      new_height, new_width,
+      vl_config_.vision.patch_size,
+      vl_config_.vision.temporal_patch_size,
+      0.5f, 0.5f, 0.5f,  // mean
+      0.5f, 0.5f, 0.5f,  // std
+      stream);
   
   LOG(INFO) << "Preprocessed image: " << image_path;
   LOG(INFO) << "  Grid: " << result.grid_t << "x" << result.grid_h << "x" << result.grid_w;
@@ -1549,7 +1587,7 @@ tensor::Tensor Qwen3VLModel::encode_image(const ImageData& image_data) const {
   // 2. Add position embeddings
   hidden_states = vision_add_pos_embed(hidden_states, image_data.grid_h, image_data.grid_w);
   
-  // 3. Compute rotary position embeddings for attention
+  // 3. Compute rotary position embeddings for attention (GPU-computed)
   auto [cos_cache, sin_cache] = compute_vision_rotary_emb(
       image_data.grid_h, image_data.grid_w, image_data.grid_t);
   
@@ -1558,14 +1596,16 @@ tensor::Tensor Qwen3VLModel::encode_image(const ImageData& image_data) const {
   const auto& deepstack_indexes = vl_config_.vision.deepstack_visual_indexes;
   std::vector<tensor::Tensor> deepstack_features;
   
-  // Prepare cu_seqlens for attention
+  // Prepare cu_seqlens for attention using a GPU kernel to avoid H2D copy
   // For single image: cu_seqlens = [0, num_patches]
-  std::vector<int32_t> cu_seqlens_host = {0, image_data.num_patches};
   tensor::Tensor cu_seqlens(base::DataType::kDataTypeInt32, 2, true, 
                             base::CUDADeviceAllocatorFactory::get_instance());
-  // Use async copy - subsequent kernels will wait on same stream
-  cudaMemcpyAsync(cu_seqlens.ptr<void>(), cu_seqlens_host.data(), 
-                  2 * sizeof(int32_t), cudaMemcpyHostToDevice, cuda_config_->stream);
+  // Set values directly via cudaMemsetAsync for [0] and cudaMemcpyAsync for [num_patches]
+  cudaMemsetAsync(cu_seqlens.ptr<void>(), 0, sizeof(int32_t), cuda_config_->stream);
+  // For the second element, use the stack-allocated value
+  int32_t num_patches_val = image_data.num_patches;
+  cudaMemcpyAsync(cu_seqlens.ptr<int32_t>() + 1, &num_patches_val, 
+                  sizeof(int32_t), cudaMemcpyHostToDevice, cuda_config_->stream);
   
   // Double buffering: alternate between output and output2
   // Layer 0: input=hidden_states, output=output
@@ -1697,23 +1737,13 @@ tensor::Tensor Qwen3VLModel::vision_add_pos_embed(const tensor::Tensor& patch_em
 
 std::pair<tensor::Tensor, tensor::Tensor> Qwen3VLModel::compute_vision_rotary_emb(
     int grid_h, int grid_w, int grid_t) const {
-  // Compute rotary position embeddings for vision encoder
-  // Based on Qwen3VLVisionModel.rot_pos_emb() from transformers
+  // Compute rotary position embeddings for vision encoder (CPU computation + async H2D copy)
   //
-  // HuggingFace implementation:
-  //   dim = head_dim // 2 = 36  (for head_dim=72)
-  //   inv_freq = 1 / (theta ** (arange(0, dim, 2) / dim))  # 18 frequencies
-  //   rotary_pos_emb_full = outer(seq, inv_freq)  # [max_grid, 18]
-  //   pos_ids = [h, w] for each token  # [num_tokens, 2]
-  //   rotary_pos_emb = rotary_pos_emb_full[pos_ids].flatten(1)  # [num_tokens, 36]
-  //   emb = cat((rotary_pos_emb, rotary_pos_emb), dim=-1)  # [num_tokens, 72]
-  //   cos = cos(emb), sin = sin(emb)
+  // NOTE: GPU powf/sincosf produce slightly different float32 results than CPU
+  // std::pow/std::cos/std::sin, causing fp16 divergence after 27 transformer layers.
+  // We keep CPU computation to guarantee bit-exact results.
   //
-  // So the layout of cos/sin is:
-  //   [0:18]   = height frequencies
-  //   [18:36]  = width frequencies  
-  //   [36:54]  = height frequencies (repeat)
-  //   [54:72]  = width frequencies (repeat)
+  // Layout of cos/sin: [h_freq(18), w_freq(18), h_freq(18), w_freq(18)] = 72 dims
   
   int merge_size = vl_config_.vision.spatial_merge_size;
   int num_heads = vl_config_.vision.num_heads;  // 16
@@ -1722,28 +1752,21 @@ std::pair<tensor::Tensor, tensor::Tensor> Qwen3VLModel::compute_vision_rotary_em
   int half_head_dim = head_dim / 2;  // 36
   int quarter_head_dim = head_dim / 4;  // 18 (number of frequencies)
   
-  // Number of tokens after spatial arrangement
   int merged_h = grid_h / merge_size;
   int merged_w = grid_w / merge_size;
-  int num_tokens = grid_t * grid_h * grid_w;  // Before merge, each patch is a token
-  
-  // Maximum grid dimension
+  int num_tokens = grid_t * grid_h * grid_w;
   int max_hw = std::max(grid_h, grid_w);
   
-  // Rotary embedding base for Vision Encoder
-  // IMPORTANT: Vision encoder uses theta=10000.0 (default), NOT 5000000 (text model)
-  // This is defined in Qwen3VLVisionRotaryEmbedding.__init__(dim, theta=10000.0)
+  // Vision encoder uses theta=10000.0 (not text model's 5000000)
   float theta = 10000.0f;
   
-  // Compute inverse frequencies: dim = head_dim/2 = 36, so we use 36 for division
-  // HuggingFace: inv_freq = 1 / (theta ** (arange(0, dim, 2) / dim))
-  // This gives 18 frequencies
-  std::vector<float> inv_freq(quarter_head_dim);  // 18 frequencies
+  // Compute inverse frequencies
+  std::vector<float> inv_freq(quarter_head_dim);
   for (int i = 0; i < quarter_head_dim; ++i) {
     inv_freq[i] = 1.0f / std::pow(theta, static_cast<float>(2 * i) / half_head_dim);
   }
   
-  // Compute frequency table: freq_table[seq, i] = seq * inv_freq[i]
+  // Compute frequency table
   std::vector<float> freq_table(max_hw * quarter_head_dim);
   for (int seq = 0; seq < max_hw; ++seq) {
     for (int i = 0; i < quarter_head_dim; ++i) {
@@ -1751,21 +1774,17 @@ std::pair<tensor::Tensor, tensor::Tensor> Qwen3VLModel::compute_vision_rotary_em
     }
   }
   
-  // Compute position IDs for each token (height, width)
-  // Tokens are arranged in spatial merge order
+  // Compute position IDs in spatial merge order
   std::vector<int32_t> pos_h(num_tokens);
   std::vector<int32_t> pos_w(num_tokens);
-  
   int token_idx = 0;
   for (int t = 0; t < grid_t; ++t) {
     for (int block_h = 0; block_h < merged_h; ++block_h) {
       for (int block_w = 0; block_w < merged_w; ++block_w) {
         for (int local_h = 0; local_h < merge_size; ++local_h) {
           for (int local_w = 0; local_w < merge_size; ++local_w) {
-            int h = block_h * merge_size + local_h;
-            int w = block_w * merge_size + local_w;
-            pos_h[token_idx] = h;
-            pos_w[token_idx] = w;
+            pos_h[token_idx] = block_h * merge_size + local_h;
+            pos_w[token_idx] = block_w * merge_size + local_w;
             ++token_idx;
           }
         }
@@ -1773,9 +1792,7 @@ std::pair<tensor::Tensor, tensor::Tensor> Qwen3VLModel::compute_vision_rotary_em
     }
   }
   
-  // Compute rotary embeddings with HuggingFace layout:
-  // emb = cat(cat(h_freq, w_freq), cat(h_freq, w_freq))
-  // Layout: [h_freq(18), w_freq(18), h_freq(18), w_freq(18)] = 72 dims
+  // Compute cos/sin with float_to_half (truncation rounding)
   std::vector<half> cos_data(num_tokens * head_dim);
   std::vector<half> sin_data(num_tokens * head_dim);
   
@@ -1783,45 +1800,37 @@ std::pair<tensor::Tensor, tensor::Tensor> Qwen3VLModel::compute_vision_rotary_em
     int h_pos = pos_h[i];
     int w_pos = pos_w[i];
     
-    // [0:18]: height frequencies
     for (int j = 0; j < quarter_head_dim; ++j) {
-      float freq = freq_table[h_pos * quarter_head_dim + j];
-      *reinterpret_cast<uint16_t*>(&cos_data[i * head_dim + j]) = float_to_half(std::cos(freq));
-      *reinterpret_cast<uint16_t*>(&sin_data[i * head_dim + j]) = float_to_half(std::sin(freq));
-    }
-    
-    // [18:36]: width frequencies
-    for (int j = 0; j < quarter_head_dim; ++j) {
-      float freq = freq_table[w_pos * quarter_head_dim + j];
-      *reinterpret_cast<uint16_t*>(&cos_data[i * head_dim + quarter_head_dim + j]) = float_to_half(std::cos(freq));
-      *reinterpret_cast<uint16_t*>(&sin_data[i * head_dim + quarter_head_dim + j]) = float_to_half(std::sin(freq));
-    }
-    
-    // [36:54]: height frequencies (repeat)
-    for (int j = 0; j < quarter_head_dim; ++j) {
-      float freq = freq_table[h_pos * quarter_head_dim + j];
-      *reinterpret_cast<uint16_t*>(&cos_data[i * head_dim + half_head_dim + j]) = float_to_half(std::cos(freq));
-      *reinterpret_cast<uint16_t*>(&sin_data[i * head_dim + half_head_dim + j]) = float_to_half(std::sin(freq));
-    }
-    
-    // [54:72]: width frequencies (repeat)
-    for (int j = 0; j < quarter_head_dim; ++j) {
-      float freq = freq_table[w_pos * quarter_head_dim + j];
-      *reinterpret_cast<uint16_t*>(&cos_data[i * head_dim + half_head_dim + quarter_head_dim + j]) = float_to_half(std::cos(freq));
-      *reinterpret_cast<uint16_t*>(&sin_data[i * head_dim + half_head_dim + quarter_head_dim + j]) = float_to_half(std::sin(freq));
+      float h_freq = freq_table[h_pos * quarter_head_dim + j];
+      float w_freq = freq_table[w_pos * quarter_head_dim + j];
+      
+      // [0:18]: height frequencies
+      *reinterpret_cast<uint16_t*>(&cos_data[i * head_dim + j]) = float_to_half(std::cos(h_freq));
+      *reinterpret_cast<uint16_t*>(&sin_data[i * head_dim + j]) = float_to_half(std::sin(h_freq));
+      
+      // [18:36]: width frequencies
+      *reinterpret_cast<uint16_t*>(&cos_data[i * head_dim + quarter_head_dim + j]) = float_to_half(std::cos(w_freq));
+      *reinterpret_cast<uint16_t*>(&sin_data[i * head_dim + quarter_head_dim + j]) = float_to_half(std::sin(w_freq));
+      
+      // [36:54]: height frequencies (repeat)
+      *reinterpret_cast<uint16_t*>(&cos_data[i * head_dim + half_head_dim + j]) = float_to_half(std::cos(h_freq));
+      *reinterpret_cast<uint16_t*>(&sin_data[i * head_dim + half_head_dim + j]) = float_to_half(std::sin(h_freq));
+      
+      // [54:72]: width frequencies (repeat)
+      *reinterpret_cast<uint16_t*>(&cos_data[i * head_dim + half_head_dim + quarter_head_dim + j]) = float_to_half(std::cos(w_freq));
+      *reinterpret_cast<uint16_t*>(&sin_data[i * head_dim + half_head_dim + quarter_head_dim + j]) = float_to_half(std::sin(w_freq));
     }
   }
   
-  // Create GPU tensors
+  // Create GPU tensors and async copy
   auto alloc = base::CUDADeviceAllocatorFactory::get_instance();
   tensor::Tensor cos_cache(base::DataType::kDataTypeFp16, num_tokens, head_dim, true, alloc);
   tensor::Tensor sin_cache(base::DataType::kDataTypeFp16, num_tokens, head_dim, true, alloc);
   
-  // Use async copy - subsequent kernels will wait on same stream
-  cudaMemcpyAsync(cos_cache.ptr<void>(), cos_data.data(), 
-                  num_tokens * head_dim * sizeof(half), cudaMemcpyHostToDevice, 
+  cudaMemcpyAsync(cos_cache.ptr<void>(), cos_data.data(),
+                  num_tokens * head_dim * sizeof(half), cudaMemcpyHostToDevice,
                   cuda_config_->stream);
-  cudaMemcpyAsync(sin_cache.ptr<void>(), sin_data.data(), 
+  cudaMemcpyAsync(sin_cache.ptr<void>(), sin_data.data(),
                   num_tokens * head_dim * sizeof(half), cudaMemcpyHostToDevice,
                   cuda_config_->stream);
   
@@ -2589,20 +2598,20 @@ std::string Qwen3VLModel::generate(const std::string& image_path,
   // Tokenize prompt
   auto tokens = encode(prompt);
   
-  // Calculate prefill sequence length - this includes vision tokens
-  // Preprocess image once to get vision token count
+  // Preprocess image ONCE and directly use the result
+  // (avoids redundant preprocess_image call that was in multimodal_prefill)
+  ImageData image_data;
   int prefill_seq_len = static_cast<int>(tokens.size());
   if (!image_path.empty()) {
-    // Calculate vision tokens based on image path
-    ImageData image_data = preprocess_image(image_path);
-    // Adjust for vision tokens: replace 1 image token with num_vision_tokens
+    image_data = preprocess_image(image_path);
     prefill_seq_len = static_cast<int>(tokens.size()) - 1 + image_data.num_vision_tokens;
-    // Store for later use
-    const_cast<Qwen3VLModel*>(this)->cached_image_data_ = std::move(image_data);
   }
   
-  // Multimodal prefill
-  auto status = multimodal_prefill(tokens, image_path);
+  // Prepare multimodal embeddings and run prefill directly
+  auto embeddings = prepare_multimodal_embeddings(tokens,
+      image_path.empty() ? nullptr : &image_data);
+  
+  auto status = prefill(embeddings, prefill_seq_len, 0);
   if (!status) {
     LOG(ERROR) << "Prefill failed: " << status.get_err_code();
     return "";

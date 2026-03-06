@@ -35,7 +35,7 @@ messages = [
         "content": [
             {
                 "type": "image",
-                "image": "/mnt/ssd/workspace/KuiperLLama_20260116_fp16/hf_infer/demo.jpeg",
+                "image": "/mnt/ssd/workspace/OrinMLLLM/hf_infer/demo.jpeg",
             },
             {"type": "text", "text": "Describe this image."},
         ],

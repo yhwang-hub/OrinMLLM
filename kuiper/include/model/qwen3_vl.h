@@ -437,6 +437,10 @@ private:
   // Cached image data for repeated use
   mutable ImageData cached_image_data_;
   
+  // Pre-allocated GPU pixel buffer for fused resize kernel (avoids cudaMalloc per image)
+  mutable unsigned char* pixel_buf_gpu_ = nullptr;
+  mutable size_t pixel_buf_gpu_capacity_ = 0;
+  
   // mmap for model file
   void* vl_model_data_ = nullptr;
   size_t vl_model_file_size_ = 0;

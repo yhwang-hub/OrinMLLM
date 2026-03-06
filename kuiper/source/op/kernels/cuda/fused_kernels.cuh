@@ -1,6 +1,7 @@
 #ifndef FUSED_KERNELS_CUH
 #define FUSED_KERNELS_CUH
 
+#include <cuda_fp16.h>
 #include <base/cuda_config.h>
 #include <tensor/tensor.h>
 
@@ -93,6 +94,62 @@ void extract_patches_cu(
     int width,
     int patch_size,
     int temporal_patch_size,
+    cudaStream_t stream
+);
+
+/**
+ * Fused normalize + patches kernel: directly converts uint8 HWC pixels
+ * to fp16 normalized patches in 2x2 block interleaved order.
+ * 
+ * Eliminates CPU normalization, fp32->fp16 conversion, intermediate H2D copy,
+ * and separate extract_patches kernel launch.
+ *
+ * @param pixels_gpu uint8 HWC pixels already on GPU [H, W, 3]
+ * @param patches_gpu Output fp16 patches [num_patches, patch_dim]
+ * @param height Image height (after smart_resize)
+ * @param width Image width (after smart_resize)
+ * @param patch_size Patch size (16)
+ * @param temporal_patch_size Temporal patch size (2)
+ * @param mean_r/g/b Normalization mean per channel
+ * @param std_r/g/b Normalization std per channel
+ * @param stream CUDA stream
+ */
+void fused_normalize_patches_cu(
+    const unsigned char* pixels_gpu,
+    half* patches_gpu,
+    int height,
+    int width,
+    int patch_size,
+    int temporal_patch_size,
+    float mean_r, float mean_g, float mean_b,
+    float std_r, float std_g, float std_b,
+    cudaStream_t stream
+);
+
+/**
+ * Fused resize + normalize + patches kernel: bicubic resize (Catmull-Rom)
+ * with anti-aliasing, normalize, and 2x2 block interleaved patch extraction
+ * in a single kernel.  Eliminates CPU stb resize entirely.
+ *
+ * @param src_pixels_gpu  uint8 HWC ORIGINAL (un-resized) pixels on GPU [src_H, src_W, 3]
+ * @param patches_gpu     Output fp16 patches [num_patches, patch_dim]
+ * @param src_h/src_w     Original image dimensions
+ * @param dst_h/dst_w     Target (resized) image dimensions
+ * @param patch_size      Patch size (16)
+ * @param temporal_patch_size  Temporal patch size (2)
+ * @param mean_r/g/b      Normalization mean per channel
+ * @param std_r/g/b       Normalization std per channel
+ * @param stream          CUDA stream
+ */
+void fused_resize_normalize_patches_cu(
+    const unsigned char* src_pixels_gpu,
+    half* patches_gpu,
+    int src_h, int src_w,
+    int dst_h, int dst_w,
+    int patch_size,
+    int temporal_patch_size,
+    float mean_r, float mean_g, float mean_b,
+    float std_r,  float std_g,  float std_b,
     cudaStream_t stream
 );
 
