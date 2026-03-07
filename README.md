@@ -184,7 +184,7 @@ python tools/export_qwen3-8B-fp16.py Qwen3-8B-fp16.bin --dtype fp16 --hf Qwen3-8
 
 **Demo:**
 
-https://github.com/yhwang-hub/assets/Qwen3-8B-fp16.mp4
+https://github.com/yhwang-hub/OrinMLLM/blob/main/screens/Qwen3-8B-fp16.mp4
 
 <video src="screens/Qwen3-8B-fp16.mp4" controls width="800"></video>
 
@@ -207,6 +207,7 @@ python tools/export_qwen3-8B-awq.py Qwen3-8B-awq.bin --hf Qwen3-8B-awq
 ```
 
 **Demo:**
+https://github.com/yhwang-hub/OrinMLLM/blob/main/screens/Qwen3-8B-awq.mp4
 
 <video src="screens/Qwen3-8B-awq.mp4" controls width="800"></video>
 
@@ -229,6 +230,7 @@ python tools/export_qwen3-8B-sq.py Qwen3-8B-sq.bin --hf Qwen3-8B-sq
 ```
 
 **Demo:**
+https://github.com/yhwang-hub/OrinMLLM/blob/main/screens/Qwen3-8B-sq.mp4
 
 <video src="screens/Qwen3-8B-sq.mp4" controls width="800"></video>
 
@@ -251,6 +253,7 @@ python tools/export_qwen3-VL-8B-fp16.py Qwen3-VL-8B-fp16.bin --hf Qwen3-VL-8B-In
 ```
 
 **Demo:**
+https://github.com/yhwang-hub/OrinMLLM/blob/main/screens/Qwen3-VL-8B-fp16.mp4
 
 <video src="screens/Qwen3-VL-8B-fp16.mp4" controls width="800"></video>
 
