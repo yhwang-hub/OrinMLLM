@@ -184,7 +184,9 @@ python tools/export_qwen3-8B-fp16.py Qwen3-8B-fp16.bin --dtype fp16 --hf Qwen3-8
 
 **Demo:**
 
-<video src="https://media.githubusercontent.com/media/yhwang-hub/OrinMLLM/refs/heads/main/screens/Qwen3-8B-fp16.mp4" controls width="800"></video>
+[![Qwen3-8B FP16 Demo](imgs/demos/Qwen3-8B-fp16.jpg)](https://github.com/yhwang-hub/OrinMLLM/raw/refs/heads/main/screens/Qwen3-8B-fp16.mp4)
+
+> Click the image above to download and play the demo video.
 
 ---
 
@@ -206,7 +208,9 @@ python tools/export_qwen3-8B-awq.py Qwen3-8B-awq.bin --hf Qwen3-8B-awq
 
 **Demo:**
 
-<video src="https://media.githubusercontent.com/media/yhwang-hub/OrinMLLM/refs/heads/main/screens/Qwen3-8B-awq.mp4" controls width="800"></video>
+[![Qwen3-8B AWQ Demo](imgs/demos/Qwen3-8B-awq.jpg)](https://github.com/yhwang-hub/OrinMLLM/raw/refs/heads/main/screens/Qwen3-8B-awq.mp4)
+
+> Click the image above to download and play the demo video.
 
 ---
 
@@ -228,7 +232,9 @@ python tools/export_qwen3-8B-sq.py Qwen3-8B-sq.bin --hf Qwen3-8B-sq
 
 **Demo:**
 
-<video src="https://media.githubusercontent.com/media/yhwang-hub/OrinMLLM/refs/heads/main/screens/Qwen3-8B-sq.mp4" controls width="800"></video>
+[![Qwen3-8B SmoothQuant Demo](imgs/demos/Qwen3-8B-sq.jpg)](https://github.com/yhwang-hub/OrinMLLM/raw/refs/heads/main/screens/Qwen3-8B-sq.mp4)
+
+> Click the image above to download and play the demo video.
 
 ---
 
@@ -250,7 +256,9 @@ python tools/export_qwen3-VL-8B-fp16.py Qwen3-VL-8B-fp16.bin --hf Qwen3-VL-8B-In
 
 **Demo:**
 
-<video src="https://media.githubusercontent.com/media/yhwang-hub/OrinMLLM/refs/heads/main/screens/Qwen3-VL-8B-fp16.mp4" controls width="800"></video>
+[![Qwen3-VL-8B FP16 Demo](imgs/demos/Qwen3-VL-8B-fp16.jpg)](https://github.com/yhwang-hub/OrinMLLM/raw/refs/heads/main/screens/Qwen3-VL-8B-fp16.mp4)
+
+> Click the image above to download and play the demo video.
 
 ---
 
