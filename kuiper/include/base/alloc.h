@@ -113,5 +113,6 @@ class CUDADeviceAllocatorFactory {
  private:
   static std::shared_ptr<CUDADeviceAllocator> instance;
 };
+
 }  // namespace base
 #endif  // KUIPER_INCLUDE_BASE_ALLOC_H_

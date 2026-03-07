@@ -233,6 +233,13 @@ void flash_attention2_decode_fp16_gpu_pos_cu(
     CudaConfig* config
 );
 
+/**
+ * Causal softmax for cuBLAS-based prefill attention (FP16)
+ * Applied to score matrix: [head_num × kv_len × seq_len] column-major per head
+ */
+void causal_softmax_fp16_cu(half* scores, int head_num, int seq_len, int kv_len,
+                             int start_pos, cudaStream_t stream);
+
 }  // namespace kernel
 
 #endif  // FLASH_ATTENTION_KERNEL_H

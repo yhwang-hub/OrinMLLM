@@ -96,7 +96,6 @@ void argmax_kernel_cu_prealloc(const float* input_ptr, size_t size,
   
   if (stream_) {
     argmax_kernel_fp32<<<1, 512, 0, stream_>>>(input_ptr, size, output_gpu);
-    // Async copy to pinned memory - truly asynchronous since output_pinned is page-locked
     cudaMemcpyAsync(output_pinned, output_gpu, sizeof(size_t), cudaMemcpyDeviceToHost, stream_);
   } else {
     argmax_kernel_fp32<<<1, 512>>>(input_ptr, size, output_gpu);

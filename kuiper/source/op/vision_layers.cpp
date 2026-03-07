@@ -1,6 +1,7 @@
 #include "op/vision_layers.h"
 #include "kernels/cuda/vision_encoder_kernel.cuh"
 #include "kernels/cuda/fused_kernels.cuh"
+#include "kernels/cuda/flash_attention_kernel.cuh"
 
 namespace op {
 
@@ -271,6 +272,60 @@ base::Status FusedMultimodalEmbedLayer::forward(const tensor::Tensor& text_embed
   kernel::fused_multimodal_embed_cu(text_embeds, visual_embeds, const_cast<tensor::Tensor&>(output),
                                     image_token_pos, num_vision_tokens,
                                     num_text_tokens, dim, stream);
+  return base::error::Success();
+}
+
+// ==================== FusedNormalizePatchesLayer ====================
+
+FusedNormalizePatchesLayer::FusedNormalizePatchesLayer(base::DeviceType device_type)
+    : Layer(device_type, LayerType::kLayerUnknown, "FusedNormalizePatches") {
+  reset_input_size(0);
+  reset_output_size(0);
+}
+
+base::Status FusedNormalizePatchesLayer::check() const {
+  return base::error::Success();
+}
+
+base::Status FusedNormalizePatchesLayer::forward() {
+  return base::error::InvalidArgument("Use forward(...) with parameters");
+}
+
+base::Status FusedNormalizePatchesLayer::forward(const unsigned char* pixels_gpu, half* patches_gpu,
+                                                  int32_t height, int32_t width,
+                                                  int32_t patch_size, int32_t temporal_patch_size,
+                                                  float mean_r, float mean_g, float mean_b,
+                                                  float std_r, float std_g, float std_b,
+                                                  cudaStream_t stream) {
+  kernel::fused_normalize_patches_cu(pixels_gpu, patches_gpu, height, width,
+                                      patch_size, temporal_patch_size,
+                                      mean_r, mean_g, mean_b,
+                                      std_r, std_g, std_b,
+                                      stream ? stream : (cuda_config_ ? cuda_config_->stream : nullptr));
+  return base::error::Success();
+}
+
+// ==================== CausalSoftmaxLayer ====================
+
+CausalSoftmaxLayer::CausalSoftmaxLayer(base::DeviceType device_type)
+    : Layer(device_type, LayerType::kLayerUnknown, "CausalSoftmax") {
+  reset_input_size(0);
+  reset_output_size(0);
+}
+
+base::Status CausalSoftmaxLayer::check() const {
+  return base::error::Success();
+}
+
+base::Status CausalSoftmaxLayer::forward() {
+  return base::error::InvalidArgument("Use forward(...) with parameters");
+}
+
+base::Status CausalSoftmaxLayer::forward(half* scores, int32_t head_num, int32_t seq_len,
+                                          int32_t kv_len, int32_t start_pos,
+                                          cudaStream_t stream) {
+  kernel::causal_softmax_fp16_cu(scores, head_num, seq_len, kv_len, start_pos,
+                                  stream ? stream : (cuda_config_ ? cuda_config_->stream : nullptr));
   return base::error::Success();
 }
 

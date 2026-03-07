@@ -384,13 +384,12 @@ int run_inference(const VLInferenceConfig& config) {
   
   int next_token = -1;
   for (int i = 1; i < config.max_tokens; ++i) {
-    // Get embedding for the last generated token
-    std::vector<int> last_token_vec = {generated.back()};
-    auto embed_out = model.embedding(last_token_vec);
+    // Embed directly into decode_input buffer (avoids D2D copy)
+    model.embedding_to_decode_input(generated.back());
     
-    // Decode step
+    // Decode step (no input copy needed - embedding already in place)
     int pos = prefill_seq_len + static_cast<int>(generated.size()) - 1;
-    status = model.decode_step(embed_out.input_embeddings, pos, next_token);
+    status = model.decode_step_optimized(pos, next_token);
     if (!status) {
       LOG(ERROR) << "Decode step failed at pos=" << pos;
       break;

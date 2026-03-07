@@ -190,6 +190,8 @@ struct VisionVLLayers {
   std::shared_ptr<op::SpatialMergeLayer> spatial_merge_layer_;
   std::shared_ptr<op::VisionMergerMLPLayer> vision_merger_mlp_layer_;
   std::shared_ptr<op::FusedMultimodalEmbedLayer> fused_multimodal_embed_layer_;
+  std::shared_ptr<op::FusedNormalizePatchesLayer> fused_normalize_patches_layer_;
+  std::shared_ptr<op::CausalSoftmaxLayer> causal_softmax_layer_;
 };
 
 /**
@@ -328,6 +330,19 @@ private:
   void create_nonparam_layers() override;
   void create_param_quant_layers() override;
   
+  // Sub-functions for create_nonparam_layers (split for readability)
+  void create_llm_nonparam_layers();
+  void create_vl_nonparam_layers();
+  void create_vision_nonparam_layers();
+  
+  // Sub-function for prepare_multimodal_embeddings (M-RoPE position generation)
+  void generate_mrope_positions(const std::vector<int>& tokens,
+                                int image_token_pos, int num_vision_tokens,
+                                int grid_h, int grid_w) const;
+  
+  // Sub-functions for prefill (split for readability)
+  void upload_mrope_positions_to_gpu() const;
+  
   // Vision encoder forward pass
   tensor::Tensor vision_patch_embed(const ImageData& image_data) const;
   tensor::Tensor vision_add_pos_embed(const tensor::Tensor& patch_embeds, 
@@ -373,7 +388,8 @@ private:
                              const tensor::Tensor& value_out,
                              int32_t seq_len, int32_t start_pos) const;
   void batched_attention_mha(int32_t layer_idx, const tensor::Tensor& query,
-                             tensor::Tensor& mha_out, int32_t seq_len, int32_t start_pos) const;
+                             tensor::Tensor& mha_out, int32_t seq_len, int32_t start_pos,
+                             half* score_buf, half** d_ptr_buf) const;
   void batched_feed_forward(int32_t layer_idx, const tensor::Tensor& input, int32_t seq_len) const;
   void batched_feed_forward_optimized(int32_t layer_idx, const tensor::Tensor& input,
                                       tensor::Tensor& ffn_norm_out,
@@ -481,32 +497,6 @@ std::tuple<std::vector<uint8_t>, int, int> smart_resize(
     int min_pixels = 200704,
     int max_pixels = 1003520,
     int factor = 32);
-
-/**
- * @brief Normalize and convert to tensor
- * Applies ImageNet normalization: (x/255 - mean) / std
- * mean = [0.485, 0.456, 0.406]
- * std = [0.229, 0.224, 0.225]
- * 
- * @param pixels RGB pixels (HWC, uint8)
- * @param width Image width
- * @param height Image height
- * @return FP16 tensor [3, height, width]
- */
-tensor::Tensor normalize_to_tensor(const std::vector<uint8_t>& pixels,
-                                    int width, int height);
-
-/**
- * @brief Convert image to patches for vision encoder
- * 
- * @param image_tensor Normalized image [3, H, W]
- * @param patch_size Patch size (16)
- * @param temporal_patch_size Temporal patch size (2, padded to 1 frame)
- * @return Patch tensor [num_patches, patch_dim]
- */
-tensor::Tensor image_to_patches(const tensor::Tensor& image_tensor,
-                                 int patch_size = 16,
-                                 int temporal_patch_size = 2);
 
 } // namespace image_utils
 

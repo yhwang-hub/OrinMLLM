@@ -32,9 +32,18 @@ struct CudaConfig {
   __half* fp16_output_workspace = nullptr;  // For FP16->FP32 output conversion
   size_t fp16_workspace_size = 0;           // Current allocated size (in elements)
   
+  // Pre-allocated cuBLAS workspace to avoid lazy allocation overhead
+  void* cublas_workspace = nullptr;
+  size_t cublas_workspace_size = 0;
+  
   CudaConfig() = default;
   
   ~CudaConfig() {
+    // Free cuBLAS workspace
+    if (cublas_workspace) {
+      cudaFree(cublas_workspace);
+      cublas_workspace = nullptr;
+    }
     // Free FP16 workspace buffers
     if (fp16_input_workspace) {
       cudaFree(fp16_input_workspace);

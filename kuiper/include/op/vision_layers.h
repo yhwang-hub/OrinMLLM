@@ -1,6 +1,7 @@
 #ifndef KUIPER_INCLUDE_OP_VISION_LAYERS_H_
 #define KUIPER_INCLUDE_OP_VISION_LAYERS_H_
 #include "layer.h"
+#include <cuda_fp16.h>
 
 namespace op {
 
@@ -176,6 +177,43 @@ class FusedMultimodalEmbedLayer : public Layer {
                        const tensor::Tensor& output,
                        int32_t image_token_pos, int32_t num_vision_tokens,
                        int32_t num_text_tokens, int32_t dim,
+                       cudaStream_t stream = nullptr);
+};
+
+/**
+ * @brief FusedNormalizePatchesLayer: Fused normalize + patch extraction from uint8 pixels
+ * Converts uint8 HWC pixels to fp16 normalized patches in 2x2 block interleaved order.
+ */
+class FusedNormalizePatchesLayer : public Layer {
+ public:
+  explicit FusedNormalizePatchesLayer(base::DeviceType device_type);
+
+  base::Status check() const override;
+  base::Status forward() override;
+
+  // Direct forward: fused normalize + patch extraction
+  base::Status forward(const unsigned char* pixels_gpu, half* patches_gpu,
+                       int32_t height, int32_t width,
+                       int32_t patch_size, int32_t temporal_patch_size,
+                       float mean_r, float mean_g, float mean_b,
+                       float std_r, float std_g, float std_b,
+                       cudaStream_t stream = nullptr);
+};
+
+/**
+ * @brief CausalSoftmaxLayer: Causal softmax for cuBLAS-based prefill attention (FP16)
+ * Applied to score matrix: [head_num × kv_len × seq_len] column-major per head
+ */
+class CausalSoftmaxLayer : public Layer {
+ public:
+  explicit CausalSoftmaxLayer(base::DeviceType device_type);
+
+  base::Status check() const override;
+  base::Status forward() override;
+
+  // Direct forward: causal softmax on attention scores
+  base::Status forward(half* scores, int32_t head_num, int32_t seq_len,
+                       int32_t kv_len, int32_t start_pos,
                        cudaStream_t stream = nullptr);
 };
 

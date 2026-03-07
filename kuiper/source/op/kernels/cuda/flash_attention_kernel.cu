@@ -1174,4 +1174,92 @@ void flash_attention_decode_fp16_gpu_pos_cu(
     );
 }
 
+// ============================================================================
+// Causal Softmax Kernel for cuBLAS-based Prefill Attention
+// ============================================================================
+
+/**
+ * Causal softmax applied to score matrix in column-major layout [kv_len, seq_len] per head.
+ * For each (head, query_pos), processes kv_len scores with causal mask.
+ * Grid: (head_num, seq_len), Block: 256 threads
+ * Score layout: scores[head * kv_len * seq_len + q * kv_len + k]
+ */
+__global__ void causal_softmax_fp16_kernel(
+    half* __restrict__ scores,
+    const int seq_len,
+    const int kv_len,
+    const int start_pos
+) {
+    const int head = blockIdx.x;
+    const int q_idx = blockIdx.y;
+    const int tid = threadIdx.x;
+    const int bd = blockDim.x;
+    
+    const int causal_len = start_pos + q_idx + 1;
+    half* row = scores + (int64_t)head * kv_len * seq_len + (int64_t)q_idx * kv_len;
+    
+    // Step 1: Find max (FP32, only within causal window)
+    float local_max = -FLT_MAX;
+    for (int k = tid; k < causal_len; k += bd) {
+        local_max = fmaxf(local_max, __half2float(row[k]));
+    }
+    // Warp reduce max
+    for (int offset = 16; offset > 0; offset >>= 1)
+        local_max = fmaxf(local_max, __shfl_xor_sync(0xffffffff, local_max, offset));
+    
+    // Cross-warp reduce (up to 8 warps for blockDim=256)
+    __shared__ float s_max[8];
+    int warp_id = tid >> 5;
+    int lane_id = tid & 31;
+    if (lane_id == 0) s_max[warp_id] = local_max;
+    __syncthreads();
+    if (tid == 0) {
+        float m = s_max[0];
+        for (int w = 1; w < (bd + 31) / 32; w++) m = fmaxf(m, s_max[w]);
+        s_max[0] = m;
+    }
+    __syncthreads();
+    float row_max = s_max[0];
+    
+    // Step 2: Compute exp(score - max) and sum
+    float local_sum = 0.0f;
+    for (int k = tid; k < causal_len; k += bd) {
+        float val = expf(__half2float(row[k]) - row_max);
+        row[k] = __float2half(val);
+        local_sum += val;
+    }
+    // Warp reduce sum
+    for (int offset = 16; offset > 0; offset >>= 1)
+        local_sum += __shfl_xor_sync(0xffffffff, local_sum, offset);
+    
+    __shared__ float s_sum[8];
+    if (lane_id == 0) s_sum[warp_id] = local_sum;
+    __syncthreads();
+    if (tid == 0) {
+        float s = 0.0f;
+        for (int w = 0; w < (bd + 31) / 32; w++) s += s_sum[w];
+        s_sum[0] = s;
+    }
+    __syncthreads();
+    float row_sum = s_sum[0];
+    
+    // Step 3: Normalize
+    float inv_sum = (row_sum > 0.0f) ? (1.0f / row_sum) : 0.0f;
+    for (int k = tid; k < causal_len; k += bd) {
+        row[k] = __float2half(__half2float(row[k]) * inv_sum);
+    }
+    
+    // Step 4: Zero out future positions (causal mask)
+    for (int k = causal_len + tid; k < kv_len; k += bd) {
+        row[k] = __float2half(0.0f);
+    }
+}
+
+void causal_softmax_fp16_cu(half* scores, int head_num, int seq_len, int kv_len,
+                             int start_pos, cudaStream_t stream) {
+    dim3 grid(head_num, seq_len);
+    dim3 block(256);
+    causal_softmax_fp16_kernel<<<grid, block, 0, stream>>>(scores, seq_len, kv_len, start_pos);
+}
+
 }  // namespace kernel

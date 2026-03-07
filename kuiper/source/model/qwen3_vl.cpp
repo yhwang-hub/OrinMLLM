@@ -87,36 +87,6 @@ inline uint16_t float_to_half(float value) {
   
   return h_sign | h_exp | h_frac;
 }
-
-inline float half_to_float(uint16_t h) {
-  uint32_t sign = (h >> 15) & 0x1;
-  uint32_t exp = (h >> 10) & 0x1f;
-  uint32_t frac = h & 0x3ff;
-  
-  uint32_t bits;
-  if (exp == 0) {
-    if (frac == 0) {
-      bits = sign << 31;
-    } else {
-      // Denormalized
-      exp = 1;
-      while ((frac & 0x400) == 0) {
-        frac <<= 1;
-        exp--;
-      }
-      frac &= 0x3ff;
-      bits = (sign << 31) | ((exp + 127 - 15) << 23) | (frac << 13);
-    }
-  } else if (exp == 31) {
-    bits = (sign << 31) | 0x7f800000 | (frac << 13);
-  } else {
-    bits = (sign << 31) | ((exp + 127 - 15) << 23) | (frac << 13);
-  }
-  
-  float result;
-  std::memcpy(&result, &bits, sizeof(result));
-  return result;
-}
 }  // namespace
 
 #include "op/matmul.h"
@@ -202,91 +172,6 @@ std::tuple<std::vector<uint8_t>, int, int> smart_resize(
       STBIR_RGB);
   
   return {resized, w_bar, h_bar};
-}
-
-tensor::Tensor normalize_to_tensor(const std::vector<uint8_t>& pixels,
-                                    int width, int height) {
-  // Qwen3-VL normalization constants (simple 0.5/0.5)
-  const float mean[3] = {0.5f, 0.5f, 0.5f};
-  const float std[3] = {0.5f, 0.5f, 0.5f};
-  
-  // Create FP16 tensor [3, height, width]
-  std::shared_ptr<base::DeviceAllocator> alloc = base::CUDADeviceAllocatorFactory::get_instance();
-  tensor::Tensor tensor(base::DataType::kDataTypeFp16, 3, height, width, true, alloc);
-  
-  // First create FP32 data on CPU
-  std::vector<float> normalized(3 * height * width);
-  
-  for (int c = 0; c < 3; ++c) {
-    for (int h = 0; h < height; ++h) {
-      for (int w = 0; w < width; ++w) {
-        int src_idx = (h * width + w) * 3 + c;  // HWC format
-        int dst_idx = c * height * width + h * width + w;  // CHW format
-        
-        float pixel = static_cast<float>(pixels[src_idx]) / 255.0f;
-        normalized[dst_idx] = (pixel - mean[c]) / std[c];
-      }
-    }
-  }
-  
-  // Convert to FP16 on CPU then copy to GPU
-  std::vector<uint16_t> fp16_data(normalized.size());
-  for (size_t i = 0; i < normalized.size(); ++i) {
-    // Use CPU-side float to half conversion
-    fp16_data[i] = float_to_half(normalized[i]);
-  }
-  
-  // Copy to GPU
-  cudaMemcpy(tensor.ptr<void>(), fp16_data.data(), 
-             fp16_data.size() * sizeof(uint16_t), cudaMemcpyHostToDevice);
-  
-  return tensor;
-}
-
-tensor::Tensor image_to_patches(const tensor::Tensor& image_tensor,
-                                 int patch_size, int temporal_patch_size,
-                                 cudaStream_t stream = nullptr) {
-  // Image tensor: [3, H, W]
-  // Output: [num_patches, patch_dim]
-  // where patch_dim = 3 * temporal_patch_size * patch_size * patch_size
-  // 
-  // IMPORTANT: The output patches are in 2x2 block interleaved order, matching HuggingFace!
-  // For spatial_merge_size=2, the patch order is:
-  //   block (0,0): patch 0=(0,0), patch 1=(0,1), patch 2=(1,0), patch 3=(1,1)
-  //   block (0,1): patch 4=(0,2), patch 5=(0,3), patch 6=(1,2), patch 7=(1,3)
-  //   ...
-  
-  int channels = image_tensor.get_dim(0);
-  int height = image_tensor.get_dim(1);
-  int width = image_tensor.get_dim(2);
-  
-  int grid_h = height / patch_size;
-  int grid_w = width / patch_size;
-  int num_patches = grid_h * grid_w;
-  
-  // For single image, temporal_patch_size is padded (repeat frame)
-  int patch_dim = channels * temporal_patch_size * patch_size * patch_size;
-  
-  std::shared_ptr<base::DeviceAllocator> alloc = base::CUDADeviceAllocatorFactory::get_instance();
-  tensor::Tensor patches(base::DataType::kDataTypeFp16, num_patches, patch_dim, true, alloc);
-  
-  // OPTIMIZED: Use GPU kernel to extract patches directly on GPU
-  // This eliminates the D2H copy, CPU processing, and H2D copy
-  kernel::extract_patches_cu(
-      image_tensor,
-      patches,
-      channels,
-      height,
-      width,
-      patch_size,
-      temporal_patch_size,
-      stream
-  );
-  
-  LOG(INFO) << "Extracted patches (GPU): [" << num_patches << ", " << patch_dim << "] from ["
-            << channels << ", " << height << ", " << width << "] (2x2 block interleaved order)";
-  
-  return patches;
 }
 
 } // namespace image_utils
@@ -406,6 +291,18 @@ base::Status Qwen3VLModel::init(base::DeviceType device_type) {
     cublasSetStream(cuda_config_->cublas_handle, cuda_config_->stream);
     cublasSetMathMode(cuda_config_->cublas_handle, CUBLAS_DEFAULT_MATH);
     
+    // Pre-allocate cuBLAS workspace to avoid lazy allocation overhead during GEMM calls
+    {
+      const size_t cublas_workspace_size = 32 * 1024 * 1024;  // 32 MB
+      void* cublas_workspace = nullptr;
+      cudaError_t alloc_err = cudaMalloc(&cublas_workspace, cublas_workspace_size);
+      if (alloc_err == cudaSuccess && cublas_workspace) {
+        cublasSetWorkspace(cuda_config_->cublas_handle, cublas_workspace, cublas_workspace_size);
+        cuda_config_->cublas_workspace = cublas_workspace;
+        cuda_config_->cublas_workspace_size = cublas_workspace_size;
+      }
+    }
+    
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
       return error::InternalError("CUDA handle creation failed.");
@@ -428,82 +325,40 @@ base::Status Qwen3VLModel::init(base::DeviceType device_type) {
   if (device_type == DeviceType::kDeviceCUDA) {
     LOG(INFO) << "Moving LLM layers to CUDA...";
     
-    // Helper lambda to set keep_fp16_weights for LayerParam layers
-    auto set_fp16_flag = [](const std::shared_ptr<op::Layer>& layer) {
-      if (auto layer_param = std::dynamic_pointer_cast<op::LayerParam>(layer)) {
-        layer_param->set_keep_fp16_weights(true);
+    // Helper: set FP16 flag, CUDA config, and move a single layer to GPU
+    auto move_layer = [this](const std::shared_ptr<op::Layer>& layer) {
+      if (auto lp = std::dynamic_pointer_cast<op::LayerParam>(layer)) {
+        lp->set_keep_fp16_weights(true);
       }
+      layer->set_cuda_config(cuda_config_);
+      layer->to_cuda();
     };
     
-    // Set CUDA config for all layers and move weights to GPU
-    LOG(INFO) << "  Moving " << qwen_layers_->rmsnorm_layers_.size() << " RMSNorm layers...";
-    for (auto& layer : qwen_layers_->rmsnorm_layers_) {
-      set_fp16_flag(layer);
-      layer->set_cuda_config(cuda_config_);
-      layer->to_cuda();
-    }
+    // Helper: move a vector of layers to GPU
+    auto move_layers = [&move_layer](const std::vector<std::shared_ptr<op::Layer>>& layers,
+                                     const char* name) {
+      LOG(INFO) << "  Moving " << layers.size() << " " << name << "...";
+      for (auto& layer : layers) { move_layer(layer); }
+    };
     
-    LOG(INFO) << "  Moving embedding layer...";
+    move_layers(qwen_layers_->rmsnorm_layers_, "RMSNorm layers");
+    
     if (qwen_layers_->embedding_layer_) {
-      set_fp16_flag(qwen_layers_->embedding_layer_);
-      qwen_layers_->embedding_layer_->set_cuda_config(cuda_config_);
-      qwen_layers_->embedding_layer_->to_cuda();
+      LOG(INFO) << "  Moving embedding layer...";
+      move_layer(qwen_layers_->embedding_layer_);
     }
     
-    LOG(INFO) << "  Moving Q projections...";
-    for (auto& layer : qwen_layers_->wq_layers_) {
-      set_fp16_flag(layer);
-      layer->set_cuda_config(cuda_config_);
-      layer->to_cuda();
-    }
+    move_layers(qwen_layers_->wq_layers_, "Q projections");
+    move_layers(qwen_layers_->wk_layers_, "K projections");
+    move_layers(qwen_layers_->wv_layers_, "V projections");
+    move_layers(qwen_layers_->wo_layers_, "O projections");
+    move_layers(qwen_layers_->w1_layers_, "W1 projections");
+    move_layers(qwen_layers_->w2_layers_, "W2 projections");
+    move_layers(qwen_layers_->w3_layers_, "W3 projections");
     
-    LOG(INFO) << "  Moving K projections...";
-    for (auto& layer : qwen_layers_->wk_layers_) {
-      set_fp16_flag(layer);
-      layer->set_cuda_config(cuda_config_);
-      layer->to_cuda();
-    }
-    
-    LOG(INFO) << "  Moving V projections...";
-    for (auto& layer : qwen_layers_->wv_layers_) {
-      set_fp16_flag(layer);
-      layer->set_cuda_config(cuda_config_);
-      layer->to_cuda();
-    }
-    
-    LOG(INFO) << "  Moving O projections...";
-    for (auto& layer : qwen_layers_->wo_layers_) {
-      set_fp16_flag(layer);
-      layer->set_cuda_config(cuda_config_);
-      layer->to_cuda();
-    }
-    
-    LOG(INFO) << "  Moving W1 projections...";
-    for (auto& layer : qwen_layers_->w1_layers_) {
-      set_fp16_flag(layer);
-      layer->set_cuda_config(cuda_config_);
-      layer->to_cuda();
-    }
-    
-    LOG(INFO) << "  Moving W2 projections...";
-    for (auto& layer : qwen_layers_->w2_layers_) {
-      set_fp16_flag(layer);
-      layer->set_cuda_config(cuda_config_);
-      layer->to_cuda();
-    }
-    
-    LOG(INFO) << "  Moving W3 projections...";
-    for (auto& layer : qwen_layers_->w3_layers_) {
-      set_fp16_flag(layer);
-      layer->set_cuda_config(cuda_config_);
-      layer->to_cuda();
-    }
-    
-    LOG(INFO) << "  Moving LM head...";
     if (qwen_layers_->cls_layer_) {
-      set_fp16_flag(qwen_layers_->cls_layer_);
-      qwen_layers_->cls_layer_->set_cuda_config(cuda_config_);
-      qwen_layers_->cls_layer_->to_cuda();
+      LOG(INFO) << "  Moving LM head...";
+      move_layer(qwen_layers_->cls_layer_);
     }
     
     cudaStreamSynchronize(cuda_config_->stream);
@@ -895,7 +750,7 @@ void Qwen3VLModel::init_mem() {
   CHECK(insert_buffer(ModelBufferType::kW3Output, w3_output));
   LOG(INFO) << "Allocated W1/W3 output buffers.";
   
-  // KV cache
+  // KV cache - uses cudaMalloc for optimal GPU performance.
   tensor::Tensor key_cache(activation_dtype, config_->layer_num_, config_->seq_len_,
                            config_->kv_dim_, true, alloc);
   tensor::Tensor value_cache(activation_dtype, config_->layer_num_, config_->seq_len_,
@@ -916,15 +771,12 @@ void Qwen3VLModel::init_mem() {
   tensor::Tensor pos_tensor(base::DataType::kDataTypeInt32, 1, true, alloc_cpu);
   CHECK(insert_buffer(ModelBufferType::kInputPos, pos_tensor));
   
-  // Position tensor on GPU for CUDA Graph path
+  // GPU position buffers for CUDA Graph (read by kernels during graph replay)
   tensor::Tensor pos_tensor_gpu(base::DataType::kDataTypeInt32, 1, true, alloc);
   CHECK(insert_buffer(ModelBufferType::kInputPosGPU, pos_tensor_gpu));
-  LOG(INFO) << "Allocated input position buffer on GPU (for M-RoPE text_pos).";
   
-  // KV cache position on GPU (different from M-RoPE position for VL models)
   tensor::Tensor kv_cache_pos_gpu(base::DataType::kDataTypeInt32, 1, true, alloc);
   CHECK(insert_buffer(ModelBufferType::kKVCachePosGPU, kv_cache_pos_gpu));
-  LOG(INFO) << "Allocated KV cache position buffer on GPU.";
   
   // Temporary K/V buffers with fixed addresses for CUDA Graph optimization
   tensor::Tensor temp_key(activation_dtype, config_->kv_dim_, true, alloc);
@@ -933,30 +785,19 @@ void Qwen3VLModel::init_mem() {
   CHECK(insert_buffer(ModelBufferType::kTempValue, temp_value));
   LOG(INFO) << "Allocated temporary K/V buffers for CUDA Graph.";
   
-  // Pinned memory buffers for efficient async Host-Device transfers
+  // Pinned buffers for async H2D pos transfers and D2H argmax
   if (device_type_ == base::DeviceType::kDeviceCUDA) {
-    std::shared_ptr<base::DeviceAllocator> alloc_pinned = 
-        base::CPUPinnedAllocatorFactory::get_instance();
+    auto alloc_pinned = base::CPUPinnedAllocatorFactory::get_instance();
     
-    // Pinned pos buffer for async H2D transfer (for M-RoPE text_pos)
     tensor::Tensor pos_pinned(base::DataType::kDataTypeInt32, 1, true, alloc_pinned);
-    CHECK(insert_buffer(ModelBufferType::kInputPosPinned, pos_pinned));
-    LOG(INFO) << "Allocated pinned input position buffer.";
-    
-    // Pinned KV cache pos buffer for async H2D transfer
     tensor::Tensor kv_cache_pos_pinned(base::DataType::kDataTypeInt32, 1, true, alloc_pinned);
+    CHECK(insert_buffer(ModelBufferType::kInputPosPinned, pos_pinned));
     CHECK(insert_buffer(ModelBufferType::kKVCachePosPinned, kv_cache_pos_pinned));
-    LOG(INFO) << "Allocated pinned KV cache position buffer.";
-
-    // Pre-allocated argmax output buffer on GPU
-    tensor::Tensor argmax_output(base::DataType::kDataTypeInt32, 2, true, alloc);
-    CHECK(insert_buffer(ModelBufferType::kArgmaxOutput, argmax_output));
-    LOG(INFO) << "Allocated argmax output buffer on GPU.";
     
-    // Pinned argmax result buffer for async D2H transfer
-    tensor::Tensor argmax_pinned(base::DataType::kDataTypeInt32, 2, true, alloc_pinned);
-    CHECK(insert_buffer(ModelBufferType::kArgmaxOutputPinned, argmax_pinned));
-    LOG(INFO) << "Allocated pinned argmax output buffer.";
+    tensor::Tensor argmax_output(base::DataType::kDataTypeInt32, 2, true, alloc);
+    tensor::Tensor argmax_output_pinned(base::DataType::kDataTypeInt32, 2, true, alloc_pinned);
+    CHECK(insert_buffer(ModelBufferType::kArgmaxOutput, argmax_output));
+    CHECK(insert_buffer(ModelBufferType::kArgmaxOutputPinned, argmax_output_pinned));
   }
   
   // Attention scores (FP32 for numerical stability)
@@ -1000,7 +841,12 @@ void Qwen3VLModel::create_param_layers() {
 }
 
 void Qwen3VLModel::create_nonparam_layers() {
-  // Create non-parameter layers
+  create_llm_nonparam_layers();
+  create_vl_nonparam_layers();
+  create_vision_nonparam_layers();
+}
+
+void Qwen3VLModel::create_llm_nonparam_layers() {
   qwen_layers_->rope_layer_ = std::make_shared<op::RoPELayer>(
       device_type_, config_->dim_, config_->kv_dim_, config_->head_size_);
   qwen_layers_->rope_layer_->set_cuda_config(cuda_config_);
@@ -1017,7 +863,6 @@ void Qwen3VLModel::create_nonparam_layers() {
       device_type_, config_->hidden_dim_);
   qwen_layers_->swiglu_layer_->set_cuda_config(cuda_config_);
 
-  // Create new layers for unified kernel calls
   qwen_layers_->flash_attention_decode_layer_ =
       std::make_shared<op::FlashAttentionDecodeLayer>(device_type_);
   qwen_layers_->flash_attention_decode_layer_->set_cuda_config(cuda_config_);
@@ -1042,7 +887,6 @@ void Qwen3VLModel::create_nonparam_layers() {
   qwen_layers_->batched_rope_layer_ = std::make_shared<op::BatchedRoPELayer>(device_type_);
   qwen_layers_->batched_rope_layer_->set_cuda_config(cuda_config_);
   
-  // Create batched add/swiglu layers for prefill (support any-dim tensors)
   qwen_layers_->batched_add_layer_ = std::make_shared<op::BatchedAddLayer>(device_type_);
   qwen_layers_->batched_add_layer_->set_cuda_config(cuda_config_);
   
@@ -1051,7 +895,9 @@ void Qwen3VLModel::create_nonparam_layers() {
   
   qwen_layers_->sin_cos_cache_layer_ = std::make_shared<op::SinCosCacheLayer>(device_type_);
   qwen_layers_->sin_cos_cache_layer_->set_cuda_config(cuda_config_);
-  
+}
+
+void Qwen3VLModel::create_vl_nonparam_layers() {
   // VL model specific layers for M-RoPE and vision
   qwen_layers_->mrope_layer_ = std::make_shared<op::MRoPELayer>(device_type_);
   qwen_layers_->mrope_layer_->set_cuda_config(cuda_config_);
@@ -1073,7 +919,9 @@ void Qwen3VLModel::create_nonparam_layers() {
   
   qwen_layers_->flash_attention_decode_gpu_pos_layer_ = std::make_shared<op::FlashAttentionDecodeGpuPosLayer>(device_type_);
   qwen_layers_->flash_attention_decode_gpu_pos_layer_->set_cuda_config(cuda_config_);
-  
+}
+
+void Qwen3VLModel::create_vision_nonparam_layers() {
   // Vision-specific layers (stored in vision_vl_layers_)
   vision_vl_layers_.extract_patches_layer_ = std::make_shared<op::ExtractPatchesLayer>(device_type_);
   vision_vl_layers_.extract_patches_layer_->set_cuda_config(cuda_config_);
@@ -1104,6 +952,12 @@ void Qwen3VLModel::create_nonparam_layers() {
   
   vision_vl_layers_.fused_multimodal_embed_layer_ = std::make_shared<op::FusedMultimodalEmbedLayer>(device_type_);
   vision_vl_layers_.fused_multimodal_embed_layer_->set_cuda_config(cuda_config_);
+  
+  vision_vl_layers_.fused_normalize_patches_layer_ = std::make_shared<op::FusedNormalizePatchesLayer>(device_type_);
+  vision_vl_layers_.fused_normalize_patches_layer_->set_cuda_config(cuda_config_);
+  
+  vision_vl_layers_.causal_softmax_layer_ = std::make_shared<op::CausalSoftmaxLayer>(device_type_);
+  vision_vl_layers_.causal_softmax_layer_->set_cuda_config(cuda_config_);
 }
 
 void Qwen3VLModel::create_param_quant_layers() {
@@ -1497,8 +1351,8 @@ ImageData Qwen3VLModel::preprocess_image(const std::string& image_path, int max_
   cudaMemcpyAsync(pixel_buf_gpu_, resized_pixels.data(), pixel_bytes,
                   cudaMemcpyHostToDevice, stream);
   
-  // Fused GPU kernel: normalize + patch extraction
-  kernel::fused_normalize_patches_cu(
+  // Fused GPU kernel: normalize + patch extraction (via layer->forward)
+  vision_vl_layers_.fused_normalize_patches_layer_->forward(
       pixel_buf_gpu_,
       result.pixel_values.ptr<half>(),
       new_height, new_width,
@@ -2075,65 +1929,10 @@ tensor::Tensor Qwen3VLModel::prepare_multimodal_embeddings(
   );
   
   // ========== Generate M-RoPE 3D positions ==========
-  // For visual tokens: (t=0, h=row_idx, w=col_idx) with 2D spatial positions
-  // For text tokens: (t=pos, h=pos, w=pos) using sequential position
-  //
-  // The key insight from HuggingFace Qwen3-VL implementation:
-  // - Visual tokens have spatial positions from their grid location
-  // - Text tokens before/after visuals have sequential positions
-  // - All positions share the same continuous sequence to maintain causality
-  
-  mrope_pos_t_.resize(new_seq_len);
-  mrope_pos_h_.resize(new_seq_len);
-  mrope_pos_w_.resize(new_seq_len);
-  
   int merged_grid_h = image_data->grid_h / vl_config_.vision.spatial_merge_size;
   int merged_grid_w = image_data->grid_w / vl_config_.vision.spatial_merge_size;
-  
-  // Track text position - starts at 0 for tokens before image
-  int text_pos = 0;
-  
-  // Text tokens before image
-  for (int i = 0; i < image_token_pos; ++i) {
-    mrope_pos_t_[i] = text_pos;
-    mrope_pos_h_[i] = text_pos;
-    mrope_pos_w_[i] = text_pos;
-    text_pos++;
-  }
-  
-  // Visual tokens - use 2D spatial positions
-  // Following HuggingFace: for images, t=same for all, h/w vary by grid position
-  // The t-position for visual tokens is the current text_pos (preserved for continuity)
-  int visual_base_t = text_pos;
-  for (int v = 0; v < num_vision_tokens; ++v) {
-    int row = v / merged_grid_w;
-    int col = v % merged_grid_w;
-    mrope_pos_t_[image_token_pos + v] = visual_base_t;  // All visual tokens share same t
-    mrope_pos_h_[image_token_pos + v] = visual_base_t + row;  // h varies by row
-    mrope_pos_w_[image_token_pos + v] = visual_base_t + col;  // w varies by col
-  }
-  
-  // After visual tokens, text continues from max visual position
-  // max visual position = visual_base_t + max(grid_h, grid_w) - 1
-  int max_visual_extent = std::max(merged_grid_h, merged_grid_w);
-  text_pos = visual_base_t + max_visual_extent;
-  
-  // Text tokens after image
-  int after_image_start = image_token_pos + num_vision_tokens;
-  for (int i = after_image_start; i < new_seq_len; ++i) {
-    mrope_pos_t_[i] = text_pos;
-    mrope_pos_h_[i] = text_pos;
-    mrope_pos_w_[i] = text_pos;
-    text_pos++;
-  }
-  
-  // Store the max position for decode phase
-  mrope_max_text_pos_ = text_pos - 1;  // Last position used
-  
-  LOG(INFO) << "M-RoPE positions generated: "
-            << "visual_base_t=" << visual_base_t
-            << ", merged_grid=" << merged_grid_h << "x" << merged_grid_w
-            << ", max_text_pos=" << mrope_max_text_pos_;
+  generate_mrope_positions(tokens, image_token_pos, num_vision_tokens,
+                           merged_grid_h, merged_grid_w);
   
   // End timing embedding assembly
   cudaStreamSynchronize(cuda_config_->stream);
@@ -2148,6 +1947,105 @@ tensor::Tensor Qwen3VLModel::prepare_multimodal_embeddings(
             << ", deepstack features=" << deepstack_features_.size();
   
   return multimodal_embeds;
+}
+
+// ============================================================================
+// M-RoPE Position Generation
+// ============================================================================
+
+void Qwen3VLModel::generate_mrope_positions(
+    const std::vector<int>& tokens,
+    int image_token_pos, int num_vision_tokens,
+    int grid_h, int grid_w) const {
+  // For visual tokens: (t=0, h=row_idx, w=col_idx) with 2D spatial positions
+  // For text tokens: (t=pos, h=pos, w=pos) using sequential position
+  //
+  // HuggingFace Qwen3-VL convention:
+  // - Visual tokens have spatial positions from their grid location
+  // - Text tokens before/after visuals have sequential positions
+  // - All positions share the same continuous sequence to maintain causality
+  
+  int new_seq_len = static_cast<int>(tokens.size()) - 1 + num_vision_tokens;
+  mrope_pos_t_.resize(new_seq_len);
+  mrope_pos_h_.resize(new_seq_len);
+  mrope_pos_w_.resize(new_seq_len);
+  
+  // Text tokens before image
+  int text_pos = 0;
+  for (int i = 0; i < image_token_pos; ++i) {
+    mrope_pos_t_[i] = text_pos;
+    mrope_pos_h_[i] = text_pos;
+    mrope_pos_w_[i] = text_pos;
+    text_pos++;
+  }
+  
+  // Visual tokens - use 2D spatial positions
+  int visual_base_t = text_pos;
+  for (int v = 0; v < num_vision_tokens; ++v) {
+    int row = v / grid_w;
+    int col = v % grid_w;
+    mrope_pos_t_[image_token_pos + v] = visual_base_t;
+    mrope_pos_h_[image_token_pos + v] = visual_base_t + row;
+    mrope_pos_w_[image_token_pos + v] = visual_base_t + col;
+  }
+  
+  // Text tokens after image (continue from max visual position)
+  int max_visual_extent = std::max(grid_h, grid_w);
+  text_pos = visual_base_t + max_visual_extent;
+  
+  int after_image_start = image_token_pos + num_vision_tokens;
+  for (int i = after_image_start; i < new_seq_len; ++i) {
+    mrope_pos_t_[i] = text_pos;
+    mrope_pos_h_[i] = text_pos;
+    mrope_pos_w_[i] = text_pos;
+    text_pos++;
+  }
+  
+  mrope_max_text_pos_ = text_pos - 1;
+  
+  LOG(INFO) << "M-RoPE positions generated: "
+            << "visual_base_t=" << visual_base_t
+            << ", merged_grid=" << grid_h << "x" << grid_w
+            << ", max_text_pos=" << mrope_max_text_pos_;
+}
+
+// ============================================================================
+// M-RoPE GPU Upload
+// ============================================================================
+
+void Qwen3VLModel::upload_mrope_positions_to_gpu() const {
+  size_t total_positions = mrope_pos_t_.size();
+  if (total_positions == 0) return;
+  
+  // Grow GPU allocation if needed (contiguous: [t, h, w])
+  if (total_positions > mrope_pos_gpu_capacity_) {
+    if (mrope_pos_gpu_) cudaFree(mrope_pos_gpu_);
+    
+    cudaMalloc(&mrope_pos_gpu_, 3 * total_positions * sizeof(int32_t));
+    mrope_pos_t_gpu_ = mrope_pos_gpu_;
+    mrope_pos_h_gpu_ = mrope_pos_gpu_ + total_positions;
+    mrope_pos_w_gpu_ = mrope_pos_gpu_ + 2 * total_positions;
+    mrope_pos_gpu_capacity_ = total_positions;
+    
+    if (total_positions > mrope_pos_pinned_capacity_) {
+      if (mrope_pos_pinned_) cudaFreeHost(mrope_pos_pinned_);
+      cudaMallocHost(&mrope_pos_pinned_, 3 * total_positions * sizeof(int32_t));
+      mrope_pos_pinned_capacity_ = total_positions;
+    }
+  }
+  
+  // Pack positions into contiguous pinned memory
+  int32_t* pinned_t = mrope_pos_pinned_;
+  int32_t* pinned_h = mrope_pos_pinned_ + total_positions;
+  int32_t* pinned_w = mrope_pos_pinned_ + 2 * total_positions;
+  memcpy(pinned_t, mrope_pos_t_.data(), total_positions * sizeof(int32_t));
+  memcpy(pinned_h, mrope_pos_h_.data(), total_positions * sizeof(int32_t));
+  memcpy(pinned_w, mrope_pos_w_.data(), total_positions * sizeof(int32_t));
+  
+  // Single async H2D transfer for all 3 arrays
+  cudaMemcpyAsync(mrope_pos_gpu_, mrope_pos_pinned_,
+                  3 * total_positions * sizeof(int32_t), cudaMemcpyHostToDevice,
+                  cuda_config_->stream);
 }
 
 // ============================================================================
@@ -2191,43 +2089,8 @@ base::Status Qwen3VLModel::prefill(const tensor::Tensor& input_embeddings,
     LOG(INFO) << "  Deepstack features: " << deepstack_features_.size();
   }
   
-  // OPTIMIZED: Upload M-RoPE position arrays using single contiguous transfer
-  // Instead of 3 separate cudaMemcpyAsync + sync, use pinned memory + single transfer
-  size_t total_positions = mrope_pos_t_.size();
-  if (total_positions > 0 && total_positions > mrope_pos_gpu_capacity_) {
-    // Free old GPU allocation
-    if (mrope_pos_gpu_) cudaFree(mrope_pos_gpu_);
-    
-    // Allocate contiguous GPU memory for all 3 arrays
-    cudaMalloc(&mrope_pos_gpu_, 3 * total_positions * sizeof(int32_t));
-    mrope_pos_t_gpu_ = mrope_pos_gpu_;
-    mrope_pos_h_gpu_ = mrope_pos_gpu_ + total_positions;
-    mrope_pos_w_gpu_ = mrope_pos_gpu_ + 2 * total_positions;
-    mrope_pos_gpu_capacity_ = total_positions;
-    
-    // Allocate/resize pinned memory for async transfer
-    if (total_positions > mrope_pos_pinned_capacity_) {
-      if (mrope_pos_pinned_) cudaFreeHost(mrope_pos_pinned_);
-      cudaMallocHost(&mrope_pos_pinned_, 3 * total_positions * sizeof(int32_t));
-      mrope_pos_pinned_capacity_ = total_positions;
-    }
-  }
-  
-  if (total_positions > 0) {
-    // Pack positions into contiguous pinned memory
-    int32_t* pinned_t = mrope_pos_pinned_;
-    int32_t* pinned_h = mrope_pos_pinned_ + total_positions;
-    int32_t* pinned_w = mrope_pos_pinned_ + 2 * total_positions;
-    memcpy(pinned_t, mrope_pos_t_.data(), total_positions * sizeof(int32_t));
-    memcpy(pinned_h, mrope_pos_h_.data(), total_positions * sizeof(int32_t));
-    memcpy(pinned_w, mrope_pos_w_.data(), total_positions * sizeof(int32_t));
-    
-    // Single async H2D transfer for all 3 arrays
-    cudaMemcpyAsync(mrope_pos_gpu_, mrope_pos_pinned_,
-                    3 * total_positions * sizeof(int32_t), cudaMemcpyHostToDevice,
-                    cuda_config_->stream);
-    // Note: No sync needed here as subsequent kernels on the same stream will wait
-  }
+  // Upload M-RoPE positions to GPU (pinned memory + single async H2D transfer)
+  upload_mrope_positions_to_gpu();
   
   auto alloc = base::CUDADeviceAllocatorFactory::get_instance();
   base::DataType activation_dtype = base::DataType::kDataTypeFp16;
@@ -2263,6 +2126,16 @@ base::Status Qwen3VLModel::prefill(const tensor::Tensor& input_embeddings,
   tensor::Tensor w3_out(activation_dtype, seq_len, hidden_dim, true, alloc);
   tensor::Tensor w2_out(activation_dtype, seq_len, dim, true, alloc);
   
+  // Pre-allocate cuBLAS attention buffers
+  // Score buffer: [head_num, kv_len, seq_len] in FP16, column-major per head
+  int kv_len = start_pos + seq_len;
+  int64_t score_buf_size = (int64_t)config_->head_num_ * kv_len * seq_len;
+  half* score_buf = nullptr;
+  cudaMalloc(&score_buf, score_buf_size * sizeof(half));
+  // Pointer arrays for cublasHgemmBatched: A[head_num] + B[head_num] + C[head_num]
+  half** d_ptr_buf = nullptr;
+  cudaMalloc(&d_ptr_buf, 3 * config_->head_num_ * sizeof(half*));
+  
   // OPTIMIZED: No copy needed - use input_embeddings directly as first layer input
   // Double-buffering pointers
   tensor::Tensor* hidden_buffers[2] = {&hidden_buf0, &hidden_buf1};
@@ -2271,6 +2144,7 @@ base::Status Qwen3VLModel::prefill(const tensor::Tensor& input_embeddings,
   // Layer 0: input=input_embeddings (const, used directly), output=hidden_buf0
   // Layer 1+: alternates between hidden_buf0 and hidden_buf1
   tensor::Tensor* final_hidden = nullptr;
+  
   for (int32_t layer_idx = 0; layer_idx < config_->layer_num_; ++layer_idx) {
     // Determine input and output buffers for this layer
     const tensor::Tensor* layer_input;
@@ -2293,8 +2167,9 @@ base::Status Qwen3VLModel::prefill(const tensor::Tensor& input_embeddings,
     batched_attention_qkv(layer_idx, rms_out, query_out, key_out, value_out, 
                           seq_len, start_pos);
     
-    // 3. Batched Multi-head attention using Flash Attention
-    batched_attention_mha(layer_idx, query_out, mha_out, seq_len, start_pos);
+    // 3. Batched Multi-head attention using cuBLAS GEMM
+    batched_attention_mha(layer_idx, query_out, mha_out, seq_len, start_pos,
+                          score_buf, d_ptr_buf);
     
     // 4. Residual add: layer_output = layer_input + mha_out (via batched_add_layer_)
     STATUS_CHECK(qwen_layers_->batched_add_layer_->forward(*layer_input, mha_out, *layer_output));
@@ -2319,6 +2194,10 @@ base::Status Qwen3VLModel::prefill(const tensor::Tensor& input_embeddings,
     
     final_hidden = layer_output;
   }
+  
+  // Free cuBLAS attention buffers
+  if (score_buf) cudaFree(score_buf);
+  if (d_ptr_buf) cudaFree(d_ptr_buf);
   
   // OPTIMIZED: Use pointer slice to access last token directly, avoiding D2D copy
   // The final hidden state is in final_hidden buffer, we can pass its last token slice
@@ -2367,12 +2246,12 @@ base::Status Qwen3VLModel::decode_step(const tensor::Tensor& input,
     
     // Get fixed-address buffers for CUDA Graph
     tensor::Tensor decode_input = get_buffer(ModelBufferType::kDecodeInput);
-    tensor::Tensor pos_tensor_gpu = get_buffer(ModelBufferType::kInputPosGPU);      // For M-RoPE (text_pos)
-    tensor::Tensor kv_cache_pos_gpu = get_buffer(ModelBufferType::kKVCachePosGPU);  // For KV cache (original pos)
+    tensor::Tensor pos_tensor_gpu = get_buffer(ModelBufferType::kInputPosGPU);
+    tensor::Tensor kv_cache_pos_gpu = get_buffer(ModelBufferType::kKVCachePosGPU);
     tensor::Tensor pos_pinned = get_buffer(ModelBufferType::kInputPosPinned);
     tensor::Tensor kv_cache_pos_pinned = get_buffer(ModelBufferType::kKVCachePosPinned);
     tensor::Tensor argmax_output = get_buffer(ModelBufferType::kArgmaxOutput);
-    tensor::Tensor argmax_pinned = get_buffer(ModelBufferType::kArgmaxPinned);
+    tensor::Tensor argmax_pinned = get_buffer(ModelBufferType::kArgmaxOutputPinned);
     
     size_t elem_size = sizeof(uint16_t);  // FP16
     
@@ -2385,16 +2264,14 @@ base::Status Qwen3VLModel::decode_step(const tensor::Tensor& input,
     // text_pos = mrope_max_text_pos_ + (pos - prefill_seq_len_) + 1
     int32_t text_pos = mrope_max_text_pos_ + (pos - prefill_seq_len_) + 1;
     
-    // Update M-RoPE position using pinned memory for async H2D transfer
+    // Update positions using pinned memory + H2D copy
     *const_cast<int32_t*>(pos_pinned.ptr<int32_t>()) = text_pos;
-    cudaMemcpyAsync(const_cast<int32_t*>(pos_tensor_gpu.ptr<int32_t>()), 
-                    pos_pinned.ptr<int32_t>(), sizeof(int32_t), 
+    cudaMemcpyAsync(const_cast<int32_t*>(pos_tensor_gpu.ptr<int32_t>()),
+                    pos_pinned.ptr<int32_t>(), sizeof(int32_t),
                     cudaMemcpyHostToDevice, cuda_config_->stream);
-    
-    // Update KV cache position using pinned memory for async H2D transfer
     *const_cast<int32_t*>(kv_cache_pos_pinned.ptr<int32_t>()) = pos;
-    cudaMemcpyAsync(const_cast<int32_t*>(kv_cache_pos_gpu.ptr<int32_t>()), 
-                    kv_cache_pos_pinned.ptr<int32_t>(), sizeof(int32_t), 
+    cudaMemcpyAsync(const_cast<int32_t*>(kv_cache_pos_gpu.ptr<int32_t>()),
+                    kv_cache_pos_pinned.ptr<int32_t>(), sizeof(int32_t),
                     cudaMemcpyHostToDevice, cuda_config_->stream);
     
     bool need_capture = graph_ctx->needs_recapture || !graph->is_valid();
@@ -2435,7 +2312,8 @@ base::Status Qwen3VLModel::decode_step(const tensor::Tensor& input,
               reinterpret_cast<size_t*>(const_cast<int32_t*>(argmax_pinned.ptr<int32_t>())),
               cuda_config_->stream);
           cudaStreamSynchronize(cuda_config_->stream);
-          next = static_cast<int32_t>(*reinterpret_cast<size_t*>(const_cast<int32_t*>(argmax_pinned.ptr<int32_t>())));
+          next = static_cast<int32_t>(*reinterpret_cast<size_t*>(
+              const_cast<int32_t*>(argmax_pinned.ptr<int32_t>())));
         } else {
           cudaStreamSynchronize(cuda_config_->stream);
           tensor::Tensor pos_tensor_cpu = get_buffer(ModelBufferType::kInputPos);
@@ -2498,23 +2376,21 @@ base::Status Qwen3VLModel::decode_step_optimized(int32_t pos, int& next) const {
     tensor::Tensor pos_pinned = get_buffer(ModelBufferType::kInputPosPinned);
     tensor::Tensor kv_cache_pos_pinned = get_buffer(ModelBufferType::kKVCachePosPinned);
     tensor::Tensor argmax_output = get_buffer(ModelBufferType::kArgmaxOutput);
-    tensor::Tensor argmax_pinned = get_buffer(ModelBufferType::kArgmaxPinned);
+    tensor::Tensor argmax_pinned = get_buffer(ModelBufferType::kArgmaxOutputPinned);
     
     // NOTE: No D2D copy needed - embedding is already in decode_input buffer
     
     // Calculate text position for M-RoPE
     int32_t text_pos = mrope_max_text_pos_ + (pos - prefill_seq_len_) + 1;
     
-    // Update M-RoPE position using pinned memory for async H2D transfer
+    // Update positions using pinned memory + H2D copy
     *const_cast<int32_t*>(pos_pinned.ptr<int32_t>()) = text_pos;
-    cudaMemcpyAsync(const_cast<int32_t*>(pos_tensor_gpu.ptr<int32_t>()), 
-                    pos_pinned.ptr<int32_t>(), sizeof(int32_t), 
+    cudaMemcpyAsync(const_cast<int32_t*>(pos_tensor_gpu.ptr<int32_t>()),
+                    pos_pinned.ptr<int32_t>(), sizeof(int32_t),
                     cudaMemcpyHostToDevice, cuda_config_->stream);
-    
-    // Update KV cache position using pinned memory for async H2D transfer
     *const_cast<int32_t*>(kv_cache_pos_pinned.ptr<int32_t>()) = pos;
-    cudaMemcpyAsync(const_cast<int32_t*>(kv_cache_pos_gpu.ptr<int32_t>()), 
-                    kv_cache_pos_pinned.ptr<int32_t>(), sizeof(int32_t), 
+    cudaMemcpyAsync(const_cast<int32_t*>(kv_cache_pos_gpu.ptr<int32_t>()),
+                    kv_cache_pos_pinned.ptr<int32_t>(), sizeof(int32_t),
                     cudaMemcpyHostToDevice, cuda_config_->stream);
     
     bool need_capture = graph_ctx->needs_recapture || !graph->is_valid();
@@ -2551,7 +2427,8 @@ base::Status Qwen3VLModel::decode_step_optimized(int32_t pos, int& next) const {
               reinterpret_cast<size_t*>(const_cast<int32_t*>(argmax_pinned.ptr<int32_t>())),
               cuda_config_->stream);
           cudaStreamSynchronize(cuda_config_->stream);
-          next = static_cast<int32_t>(*reinterpret_cast<size_t*>(const_cast<int32_t*>(argmax_pinned.ptr<int32_t>())));
+          next = static_cast<int32_t>(*reinterpret_cast<size_t*>(
+              const_cast<int32_t*>(argmax_pinned.ptr<int32_t>())));
         } else {
           cudaStreamSynchronize(cuda_config_->stream);
           tensor::Tensor pos_tensor_cpu = get_buffer(ModelBufferType::kInputPos);
@@ -2712,6 +2589,11 @@ void Qwen3VLModel::embedding_to_decode_input(int token_id) const {
     input_tokens.reshape({1});
   }
   
+  // Embedding layer expects 2D output [token_size, dim], ensure correct shape
+  if (decode_input.dims_size() != 2 || decode_input.get_dim(0) != 1) {
+    decode_input.reshape({1, config_->dim_});
+  }
+  
   input_tokens.index<int32_t>(0) = token_id;
   
   auto input_token_num = tensor::Tensor(base::DataType::kDataTypeInt32, 1);
@@ -2721,6 +2603,9 @@ void Qwen3VLModel::embedding_to_decode_input(int token_id) const {
     STATUS_CHECK(qwen_layers_->embedding_layer_->forward(
         input_tokens, input_token_num, decode_input));
   }
+  
+  // Restore 1D shape for subsequent decode operations
+  decode_input.reshape({config_->dim_});
 }
 
 void Qwen3VLModel::enable_cuda_graph(bool enable) {
@@ -2871,41 +2756,105 @@ void Qwen3VLModel::batched_attention_qkv(int32_t layer_idx, const tensor::Tensor
 
 void Qwen3VLModel::batched_attention_mha(int32_t layer_idx, const tensor::Tensor& query,
                                           tensor::Tensor& mha_out, 
-                                          int32_t seq_len, int32_t start_pos) const {
+                                          int32_t seq_len, int32_t start_pos,
+                                          half* score_buf, half** d_ptr_buf) const {
   CHECK(qwen_layers_ != nullptr);
   
   tensor::Tensor key_cache = get_buffer(ModelBufferType::kKeyCache);
   tensor::Tensor val_cache = get_buffer(ModelBufferType::kValueCache);
   
-  // Flash Attention outputs to query buffer (which is no longer needed after QKV)
-  // This avoids an extra copy since we can directly use query as attention output
-  qwen_layers_->flash_attention_prefill_layer_->forward(
-      start_pos, seq_len,
-      config_->head_num_, config_->kv_head_num_,
-      config_->head_size_, config_->kv_mul_, layer_idx,
-      config_->seq_len_, config_->kv_dim_,
-      query, const_cast<tensor::Tensor&>(query), key_cache, val_cache);
+  const int head_num = config_->head_num_;
+  const int kv_mul = config_->kv_mul_;
+  const int head_size = config_->head_size_;
+  const int dim = config_->dim_;
+  const int kv_dim = config_->kv_dim_;
+  const int max_seq_len = config_->seq_len_;
+  const int kv_len = start_pos + seq_len;
+  const int64_t layer_offset = (int64_t)layer_idx * max_seq_len * kv_dim;
   
-  // WO projection directly to mha_out (final output)
+  half* Q = const_cast<half*>(query.ptr<half>());
+  half* K = const_cast<half*>(key_cache.ptr<half>()) + layer_offset;
+  half* V = const_cast<half*>(val_cache.ptr<half>()) + layer_offset;
+  
+  const float scale_f = 1.0f / sqrtf((float)head_size);
+  const half alpha_scale = __float2half(scale_f);
+  const half alpha_one = __float2half(1.0f);
+  const half beta_zero = __float2half(0.0f);
+  
+  // Use stack arrays to avoid heap allocation (max 32 heads)
+  const half* h_ptrs[3 * 32];  // A, B, C for up to 32 heads
+  half* h_C_ptrs[32];
+  
+  // ============================================================
+  // Step 1: Q·K^T via cublasHgemmBatched (uses tensor cores)
+  // ============================================================
+  for (int h = 0; h < head_num; h++) {
+    h_ptrs[h]              = K + (h / kv_mul) * head_size;   // A = K (GQA mapped)
+    h_ptrs[head_num + h]   = Q + h * head_size;              // B = Q
+    h_C_ptrs[h]            = score_buf + (int64_t)h * kv_len * seq_len;  // C = Score
+  }
+  
+  // Single H2D copy for all pointer arrays
+  cudaMemcpyAsync(d_ptr_buf, h_ptrs, 2 * head_num * sizeof(half*),
+                  cudaMemcpyHostToDevice, cuda_config_->stream);
+  cudaMemcpyAsync(d_ptr_buf + 2 * head_num, h_C_ptrs, head_num * sizeof(half*),
+                  cudaMemcpyHostToDevice, cuda_config_->stream);
+  
+  cublasHgemmBatched(cuda_config_->cublas_handle,
+                     CUBLAS_OP_T, CUBLAS_OP_N,
+                     kv_len, seq_len, head_size,
+                     &alpha_scale,
+                     (const half**)d_ptr_buf, kv_dim,
+                     (const half**)(d_ptr_buf + head_num), dim,
+                     &beta_zero,
+                     d_ptr_buf + 2 * head_num, kv_len,
+                     head_num);
+  
+  // ============================================================
+  // Step 2: Causal softmax on scores (via layer->forward)
+  // ============================================================
+  vision_vl_layers_.causal_softmax_layer_->forward(score_buf, head_num, seq_len, kv_len,
+                                                    start_pos, cuda_config_->stream);
+  
+  // ============================================================
+  // Step 3: Attn·V via cublasHgemmBatched (uses tensor cores)
+  // ============================================================
+  for (int h = 0; h < head_num; h++) {
+    h_ptrs[h]              = V + (h / kv_mul) * head_size;   // A = V (GQA mapped)
+    h_ptrs[head_num + h]   = score_buf + (int64_t)h * kv_len * seq_len;  // B = Attn
+    h_C_ptrs[h]            = Q + h * head_size;              // C = O (reuse query buf)
+  }
+  
+  cudaMemcpyAsync(d_ptr_buf, h_ptrs, 2 * head_num * sizeof(half*),
+                  cudaMemcpyHostToDevice, cuda_config_->stream);
+  cudaMemcpyAsync(d_ptr_buf + 2 * head_num, h_C_ptrs, head_num * sizeof(half*),
+                  cudaMemcpyHostToDevice, cuda_config_->stream);
+  
+  cublasHgemmBatched(cuda_config_->cublas_handle,
+                     CUBLAS_OP_N, CUBLAS_OP_N,
+                     head_size, seq_len, kv_len,
+                     &alpha_one,
+                     (const half**)d_ptr_buf, kv_dim,
+                     (const half**)(d_ptr_buf + head_num), kv_len,
+                     &beta_zero,
+                     d_ptr_buf + 2 * head_num, dim,
+                     head_num);
+  
+  // ============================================================
+  // Step 4: WO projection (output in mha_out)
+  // ============================================================
   const auto& wo_layer = qwen_layers_->wo_layers_.at(layer_idx);
   auto wo_matmul = std::dynamic_pointer_cast<op::MatmulLayer>(wo_layer);
   CHECK_NE(wo_matmul, nullptr) << "WO layer is not a MatmulLayer";
   
-  const half alpha = __float2half(1.0f);
-  const half beta = __float2half(0.0f);
-  
-  // WO: [seq_len, dim] = attention_out @ WO^T
-  // Input: query (now contains attention output), Output: mha_out
   cublasHgemm(cuda_config_->cublas_handle,
               CUBLAS_OP_T, CUBLAS_OP_N,
-              config_->dim_, seq_len, config_->dim_,
-              &alpha,
-              wo_matmul->get_weight(0).ptr<half>(), config_->dim_,
-              query.ptr<half>(), config_->dim_,
-              &beta,
-              mha_out.ptr<half>(), config_->dim_);
-  
-  // No copy needed - mha_out now contains the final result
+              dim, seq_len, dim,
+              &alpha_one,
+              wo_matmul->get_weight(0).ptr<half>(), dim,
+              Q, dim,
+              &beta_zero,
+              mha_out.ptr<half>(), dim);
 }
 
 void Qwen3VLModel::batched_feed_forward(int32_t layer_idx, const tensor::Tensor& input, 
