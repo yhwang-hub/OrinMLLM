@@ -322,13 +322,14 @@ class Timer {
  * - decode_throughput: decode 吞吐量（会随上下文变长而下降）
  */
 struct PerfStats {
-  int32_t prompt_len = 0;           // prompt长度
-  int32_t prefill_tokens = 0;       // 实际prefill的token数
+  int32_t prompt_len = 0;           // prompt长度（完整prompt的token数）
+  int32_t prefill_tokens = 0;       // 实际经过forward pass的prefill token数
   int32_t decode_steps = 0;         // decode步数
   double prefill_time_ms = 0.0;     // prefill时间(ms)
   double decode_time_ms = 0.0;      // decode时间(ms)
   int32_t kv_reuse_len = 0;         // KV cache复用长度
   int32_t total_context_len = 0;    // 总上下文长度（用于计算 attention 范围）
+  int32_t prev_output_tokens = 0;   // 上一轮对话输出的token数（多轮对话中计入prefill统计）
   
   // 累计统计
   int64_t total_prefill_tokens = 0;
@@ -337,8 +338,21 @@ struct PerfStats {
   double total_decode_time_ms = 0.0;
   int32_t request_count = 0;
   
+  /**
+   * @brief 有效prefill token数（包含上一轮输出token）
+   * 
+   * 多轮对话中，当前轮的prompt包含上一轮的输出token。
+   * 虽然这些token的KV cache可以复用，但从端到端角度看，
+   * 它们也是本轮需要"处理"的prompt的一部分。
+   * 有效prefill token数 = 实际prefill token数 + 上一轮输出token数
+   */
+  int32_t effective_prefill_tokens() const {
+    return prefill_tokens + prev_output_tokens;
+  }
+  
   double prefill_throughput() const {
-    return prefill_time_ms > 0 ? (prefill_tokens * 1000.0 / prefill_time_ms) : 0;
+    int32_t eff = effective_prefill_tokens();
+    return prefill_time_ms > 0 ? (eff * 1000.0 / prefill_time_ms) : 0;
   }
   
   double decode_throughput() const {
@@ -374,7 +388,7 @@ struct PerfStats {
   }
   
   void accumulate() {
-    total_prefill_tokens += prefill_tokens;
+    total_prefill_tokens += effective_prefill_tokens();
     total_decode_tokens += decode_steps;
     total_prefill_time_ms += prefill_time_ms;
     total_decode_time_ms += decode_time_ms;
@@ -382,6 +396,7 @@ struct PerfStats {
   }
   
   void print(bool verbose = true) const {
+    int32_t eff_prefill = effective_prefill_tokens();
     if (verbose) {
       LOG(INFO) << "\n=== Performance Statistics ===";
       LOG(INFO) << "Prompt length: " << prompt_len << " tokens";
@@ -389,9 +404,16 @@ struct PerfStats {
         LOG(INFO) << "KV cache reuse: " << kv_reuse_len << " tokens (" 
                   << (kv_reuse_len * 100 / prompt_len) << "%)";
       }
-      LOG(INFO) << "Prefill: " << prefill_tokens << " tokens, " 
-                << prefill_time_ms << " ms, " 
-                << prefill_throughput() << " tokens/s";
+      if (prev_output_tokens > 0) {
+        LOG(INFO) << "Prefill: " << eff_prefill << " tokens"
+                  << " (new: " << prefill_tokens << " + prev_output: " << prev_output_tokens << "), "
+                  << prefill_time_ms << " ms, " 
+                  << prefill_throughput() << " tokens/s";
+      } else {
+        LOG(INFO) << "Prefill: " << eff_prefill << " tokens, " 
+                  << prefill_time_ms << " ms, " 
+                  << prefill_throughput() << " tokens/s";
+      }
       if (kv_reuse_len > 0) {
         LOG(INFO) << "  (avg attention range: " << (int)avg_attention_len() 
                   << ", normalized throughput: " << normalized_prefill_throughput() << " tokens/s)";
@@ -404,8 +426,11 @@ struct PerfStats {
       LOG(INFO) << "===============================";
     } else {
       // 紧凑格式（用于stream模式）
-      std::cerr << "\n[Prefill: " << prefill_tokens << " tokens, " 
+      std::cerr << "\n[Prefill: " << eff_prefill << " tokens, " 
                 << prefill_throughput() << " tokens/s";
+      if (prev_output_tokens > 0) {
+        std::cerr << " (new: " << prefill_tokens << "+prev: " << prev_output_tokens << ")";
+      }
       if (kv_reuse_len > 0) {
         std::cerr << " (KV reuse: " << kv_reuse_len << ", attn: " << (int)avg_attention_len() << ")";
       }
@@ -1117,6 +1142,7 @@ std::string generate_response(
     }
     
     stats.prefill_tokens = total_len - start_pos;
+    stats.total_context_len = total_len;
     
     if (!config.stream_output && stats.kv_reuse_len > 0 && !used_radix_cache) {
         LOG(INFO) << "KV cache reuse: " << stats.kv_reuse_len << "/" << total_len 
@@ -1275,6 +1301,7 @@ void run_interactive(
     
     MultiTurnConversation conv;
     PerfStats cumulative_stats;
+    int32_t prev_decode_steps = 0;  // 上一轮对话的decode输出token数
     
     LOG(INFO) << "\n=== Interactive Multi-Turn Dialog (" << model_config.model_name << ") ===";
     LOG(INFO) << "Type your message and press Enter.";
@@ -1286,11 +1313,12 @@ void run_interactive(
     }
     LOG(INFO) << "================================================\n";
     
-    auto clear_kv_cache_fn = [&model, cache_manager]() {
+    auto clear_kv_cache_fn = [&model, cache_manager, &prev_decode_steps]() {
         model.clear_kv_cache();
         if (cache_manager) {
             cache_manager->clear();
         }
+        prev_decode_steps = 0;  // 清空KV cache时重置上一轮输出计数
     };
     
     while (true) {
@@ -1307,11 +1335,16 @@ void run_interactive(
             if (cache_manager) {
                 cache_manager->clear();
             }
+            prev_decode_steps = 0;  // 截断历史时重置上一轮输出计数
         }
         
         PerfStats stats;
         std::string response = generate_response(model, conv, user_input, config, stats,
                                                  cache_manager, model_config);
+        
+        // 多轮对话：将上一轮输出token数计入本轮prefill统计
+        // 因为上一轮输出的token包含在本轮的prompt中，是需要"处理"的一部分
+        stats.prev_output_tokens = prev_decode_steps;
         
         if (!response.empty()) {
             std::string display_response = model_config.post_process(response);
@@ -1366,8 +1399,11 @@ void run_interactive(
             
             stats.print(!config.stream_output);
             
+            // 更新上一轮decode输出token数（用于下一轮的prefill统计）
+            prev_decode_steps = stats.decode_steps;
+            
             stats.accumulate();
-            cumulative_stats.total_prefill_tokens += stats.prefill_tokens;
+            cumulative_stats.total_prefill_tokens += stats.effective_prefill_tokens();
             cumulative_stats.total_decode_tokens += stats.decode_steps;
             cumulative_stats.total_prefill_time_ms += stats.prefill_time_ms;
             cumulative_stats.total_decode_time_ms += stats.decode_time_ms;
