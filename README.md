@@ -18,13 +18,6 @@ OrinMLLM is an inference framework purpose-built for deploying large language mo
 
 ---
 
-## Architecture
-
-The diagram below illustrates the layered architecture of OrinMLLM, from the user-facing application layer down to the hardware execution layer.
-
-![OrinMLLM Architecture](imgs/architecture.png)
-
----
 
 ## Supported Models
 
@@ -157,7 +150,7 @@ make -j8
 
 ### Download Models
 
-Before running inference, download the desired model from [ModelScope](https://modelscope.cn). For example, to download **Qwen3-8B**:
+Before running inference, download the desired model from ModelScope. For example, to download **Qwen3-8B**:
 
 ```bash
 mkdir -p Qwen3-8B
@@ -182,12 +175,6 @@ python tools/export_qwen3-8B-fp16.py Qwen3-8B-fp16.bin --dtype fp16 --hf Qwen3-8
     --stream --max-tokens 1024 --prefix-cache --interactive
 ```
 
-**Demo:**
-
-[![Qwen3-8B FP16 Demo](imgs/demos/Qwen3-8B-fp16.jpg)](https://github.com/yhwang-hub/OrinMLLM/raw/refs/heads/main/screens/Qwen3-8B-fp16.mp4)
-
-> Click the image above to download and play the demo video.
-
 ---
 
 ### 2. Qwen3-8B AWQ
@@ -205,12 +192,6 @@ python tools/export_qwen3-8B-awq.py Qwen3-8B-awq.bin --hf Qwen3-8B-awq
     Qwen3-8B/tokenizer.json \
     --stream --max-tokens 1024 --prefix-cache --interactive
 ```
-
-**Demo:**
-
-[![Qwen3-8B AWQ Demo](imgs/demos/Qwen3-8B-awq.jpg)](https://github.com/yhwang-hub/OrinMLLM/raw/refs/heads/main/screens/Qwen3-8B-awq.mp4)
-
-> Click the image above to download and play the demo video.
 
 ---
 
@@ -230,12 +211,6 @@ python tools/export_qwen3-8B-sq.py Qwen3-8B-sq.bin --hf Qwen3-8B-sq
     --stream --max-tokens 1024 --prefix-cache --interactive
 ```
 
-**Demo:**
-
-[![Qwen3-8B SmoothQuant Demo](imgs/demos/Qwen3-8B-sq.jpg)](https://github.com/yhwang-hub/OrinMLLM/raw/refs/heads/main/screens/Qwen3-8B-sq.mp4)
-
-> Click the image above to download and play the demo video.
-
 ---
 
 ### 4. Qwen3-VL-8B FP16 (Vision-Language)
@@ -253,12 +228,6 @@ python tools/export_qwen3-VL-8B-fp16.py Qwen3-VL-8B-fp16.bin --hf Qwen3-VL-8B-In
     --prompt "Describe this image." \
     --cuda-graph --stream --max-pixel 500000
 ```
-
-**Demo:**
-
-[![Qwen3-VL-8B FP16 Demo](imgs/demos/Qwen3-VL-8B-fp16.jpg)](https://github.com/yhwang-hub/OrinMLLM/raw/refs/heads/main/screens/Qwen3-VL-8B-fp16.mp4)
-
-> Click the image above to download and play the demo video.
 
 ---
 
