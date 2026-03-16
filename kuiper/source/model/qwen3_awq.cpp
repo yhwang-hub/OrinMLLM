@@ -5,6 +5,7 @@
 #include <op/rmsnorm.h>
 #include <op/embedding.h>
 #include <op/awq_matmul.h>
+#include "../op/kernels/cuda/awq_gemm_fast.cuh"
 
 namespace model {
 
@@ -213,6 +214,42 @@ void Qwen3AWQModel::batched_qkv_projection(int32_t layer_idx, const tensor::Tens
   CHECK_NE(key_awq, nullptr) << "Key layer is not an AWQMatmulLayer";
   CHECK_NE(value_awq, nullptr) << "Value layer is not an AWQMatmulLayer";
 
+  int32_t batch_size = rms_out.size() / query_awq->in_features();
+
+  // M=1 decode: fused QKV kernel (single launch for all 3 projections)
+  if (batch_size == 1 &&
+      !query_awq->get_qweight_t().is_empty() &&
+      !key_awq->get_qweight_t().is_empty() &&
+      !value_awq->get_qweight_t().is_empty()) {
+    cudaStream_t stream = nullptr;
+    if (query_awq->cuda_config()) {
+      stream = query_awq->cuda_config()->stream;
+    }
+    kernel::awq_fused_qkv_cu(
+        reinterpret_cast<const half*>(rms_out.ptr<uint16_t>()),
+        query_awq->get_qweight_t().ptr<int32_t>(),
+        query_awq->get_qzeros().ptr<int32_t>(),
+        reinterpret_cast<const half*>(query_awq->get_scales().ptr<uint16_t>()),
+        reinterpret_cast<half*>(const_cast<uint16_t*>(query_out.ptr<uint16_t>())),
+        query_awq->out_features(),
+        key_awq->get_qweight_t().ptr<int32_t>(),
+        key_awq->get_qzeros().ptr<int32_t>(),
+        reinterpret_cast<const half*>(key_awq->get_scales().ptr<uint16_t>()),
+        reinterpret_cast<half*>(const_cast<uint16_t*>(key_out.ptr<uint16_t>())),
+        key_awq->out_features(),
+        value_awq->get_qweight_t().ptr<int32_t>(),
+        value_awq->get_qzeros().ptr<int32_t>(),
+        reinterpret_cast<const half*>(value_awq->get_scales().ptr<uint16_t>()),
+        reinterpret_cast<half*>(const_cast<uint16_t*>(value_out.ptr<uint16_t>())),
+        value_awq->out_features(),
+        query_awq->in_features(),
+        query_awq->group_size(),
+        stream
+    );
+    return;
+  }
+
+  // Fallback: separate Q, K, V projections
   STATUS_CHECK(query_awq->forward(rms_out, query_out));
   STATUS_CHECK(key_awq->forward(rms_out, key_out));
   STATUS_CHECK(value_awq->forward(rms_out, value_out));
@@ -238,6 +275,36 @@ void Qwen3AWQModel::gate_up_swiglu(int32_t layer_idx,
   const auto& w1_layer = layers->w1_layers_.at(layer_idx);
   const auto& w3_layer = layers->w3_layers_.at(layer_idx);
 
+  auto w1_awq = std::dynamic_pointer_cast<op::AWQMatmulLayer>(w1_layer);
+  auto w3_awq = std::dynamic_pointer_cast<op::AWQMatmulLayer>(w3_layer);
+
+  int32_t batch_size = input.size() / w1_awq->in_features();
+
+  // M=1 decode: use fused AWQ gate+up+swiglu kernel
+  if (batch_size == 1 && w1_awq && w3_awq &&
+      !w1_awq->get_qweight_t().is_empty() && !w3_awq->get_qweight_t().is_empty()) {
+    cudaStream_t stream = nullptr;
+    if (w1_awq->cuda_config()) {
+      stream = w1_awq->cuda_config()->stream;
+    }
+    kernel::awq_fused_gate_up_swiglu_cu(
+        reinterpret_cast<const half*>(input.ptr<uint16_t>()),
+        w1_awq->get_qweight_t().ptr<int32_t>(),
+        w1_awq->get_qzeros().ptr<int32_t>(),
+        reinterpret_cast<const half*>(w1_awq->get_scales().ptr<uint16_t>()),
+        w3_awq->get_qweight_t().ptr<int32_t>(),
+        w3_awq->get_qzeros().ptr<int32_t>(),
+        reinterpret_cast<const half*>(w3_awq->get_scales().ptr<uint16_t>()),
+        reinterpret_cast<half*>(const_cast<uint16_t*>(output.ptr<uint16_t>())),
+        w1_awq->in_features(),
+        w1_awq->out_features(),
+        w1_awq->group_size(),
+        stream
+    );
+    return;
+  }
+
+  // Fallback: separate W1 + W3 + SwiGLU
   tensor::Tensor w3_output = get_buffer(ModelBufferType::kW3Output);
   STATUS_CHECK(w1_layer->forward(input, output));
   STATUS_CHECK(w3_layer->forward(input, w3_output));

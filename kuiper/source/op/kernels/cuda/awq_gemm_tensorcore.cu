@@ -54,16 +54,25 @@ void awq_gemm_tensorcore_cu(
     int out_features,
     int group_size,
     int split_k_iters,
-    cudaStream_t stream
+    cudaStream_t stream,
+    const int32_t* qweight_t
 ) {
     ensure_initialized();
     
     if (M == 1) {
-        // Decode: use fast fused GEMV kernel (exploits INT4 bandwidth advantage)
-        awq_gemm_fast_cu(
-            input, qweight, qzeros, scales, output,
-            M, in_features, out_features, group_size, stream
-        );
+        if (qweight_t) {
+            // Coalesced GEMV with transposed qweight layout
+            awq_gemv_coalesced_cu(
+                input, qweight_t, qzeros, scales, output,
+                in_features, out_features, group_size, stream
+            );
+        } else {
+            // Fallback: original non-coalesced GEMV
+            awq_gemm_fast_cu(
+                input, qweight, qzeros, scales, output,
+                M, in_features, out_features, group_size, stream
+            );
+        }
     } else {
         // Prefill: use Tensor Core MMA kernel with fused LOP3 dequant
         awq_gemm_vllm_cu(

@@ -1214,27 +1214,28 @@ std::string generate_response(
     if (!model_config.should_skip(next)) {
         generated_tokens.push_back(next);
         if (config.stream_output) {
-            std::string decoded = static_cast<model::Model&>(model).decode(generated_tokens);
-            std::string new_text = decoded.substr(prev_decoded_text.length());
-            if (!new_text.empty()) {
-                printf("%s", new_text.c_str());
+            std::string token_text = static_cast<model::Model&>(model).decode(next);
+            if (!token_text.empty()) {
+                printf("%s", token_text.c_str());
                 fflush(stdout);
             }
-            prev_decoded_text = decoded;
         }
     }
     
     conv.append_token(next);
+    
+    // P1-2: Hoist allocations out of decode loop
+    std::vector<int32_t> single_token(1);
+    tensor::Tensor pos_tensor = model.get_buffer(model::ModelBufferType::kInputPos);
     
     while (decode_steps < config.max_tokens) {
         if (model.is_sentence_ending(next)) {
             break;
         }
         
-        std::vector<int32_t> single_token = {next};
+        single_token[0] = next;
         const auto& token_embedding = model.embedding(single_token);
         
-        tensor::Tensor pos_tensor = model.get_buffer(model::ModelBufferType::kInputPos);
         pos_tensor.index<int32_t>(0) = pos;
         tensor::Tensor input = model.fill_input(pos_tensor, token_embedding, false);
         
@@ -1250,13 +1251,13 @@ std::string generate_response(
         if (!model_config.should_skip(next)) {
             generated_tokens.push_back(next);
             if (config.stream_output) {
-                std::string decoded = static_cast<model::Model&>(model).decode(generated_tokens);
-                std::string new_text = decoded.substr(prev_decoded_text.length());
-                if (!new_text.empty()) {
-                    printf("%s", new_text.c_str());
+                // P2-2: Incremental tokenizer decode - only decode latest token
+                // instead of re-decoding entire generated sequence each step
+                std::string token_text = static_cast<model::Model&>(model).decode(next);
+                if (!token_text.empty()) {
+                    printf("%s", token_text.c_str());
                     fflush(stdout);
                 }
-                prev_decoded_text = decoded;
             }
         }
         
@@ -1611,14 +1612,17 @@ void run_benchmark(
         int32_t pos = target_input;
         int actual_decode_steps = 0;
         
+        // P1-2: Hoist allocations out of decode loop
+        std::vector<int32_t> single_token(1);
+        tensor::Tensor pos_tensor = model.get_buffer(model::ModelBufferType::kInputPos);
+        
         Timer decode_timer;
         decode_timer.start();
         
         for (int step = 0; step < decode_tokens; ++step) {
-            std::vector<int32_t> single_token = {next};
+            single_token[0] = next;
             const auto& token_embedding = model.embedding(single_token);
             
-            tensor::Tensor pos_tensor = model.get_buffer(model::ModelBufferType::kInputPos);
             pos_tensor.index<int32_t>(0) = pos;
             tensor::Tensor input = model.fill_input(pos_tensor, token_embedding, false);
             

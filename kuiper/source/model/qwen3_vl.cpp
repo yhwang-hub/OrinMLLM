@@ -759,7 +759,6 @@ void Qwen3VLModel::init_mem() {
   CHECK(insert_buffer(ModelBufferType::kValueCache, value_cache));
   LOG(INFO) << "Allocated KV cache buffers.";
   
-  // Query output
   tensor::Tensor query(activation_dtype, config_->dim_, true, alloc);
   CHECK(insert_buffer(ModelBufferType::kQuery, query));
   
@@ -979,16 +978,21 @@ void Qwen3VLModel::attention_rms(int32_t layer_idx, const tensor::Tensor& input)
 void Qwen3VLModel::attention_qkv(int32_t layer_idx, const tensor::Tensor& pos_tensor) const {
   CHECK(qwen_layers_ != nullptr);
   
-  tensor::Tensor query = this->get_buffer(ModelBufferType::kQuery);
   int32_t pos = pos_tensor.index<int32_t>(0);
   auto [key, val] = slice_kv_cache(layer_idx, pos);
 
   auto rmsnorm_output = get_buffer(ModelBufferType::kOutputRMSNorm);
-
-  // Query
+  tensor::Tensor query = this->get_buffer(ModelBufferType::kQuery);
+  
+  // Separate Q, K, V projections
   const auto& query_layer = qwen_layers_->wq_layers_.at(layer_idx);
-  CHECK_NE(query_layer, nullptr) << "The query layer is null";
   STATUS_CHECK(query_layer->forward(rmsnorm_output, query));
+
+  const auto& key_layer = qwen_layers_->wk_layers_.at(layer_idx);
+  STATUS_CHECK(key_layer->forward(rmsnorm_output, key));
+
+  const auto& value_layer = qwen_layers_->wv_layers_.at(layer_idx);
+  STATUS_CHECK(value_layer->forward(rmsnorm_output, val));
 
   // Query norm (Qwen3 specific)
   auto query_norm = qwen_layers_->rmsnorm_layers_.at(layer_idx + 2 * config_->layer_num_ + 1);
@@ -996,21 +1000,11 @@ void Qwen3VLModel::attention_qkv(int32_t layer_idx, const tensor::Tensor& pos_te
   query_norm->forward(query, query);
   query.reshape({(int32_t)query.size()});
 
-  // Key
-  const auto& key_layer = qwen_layers_->wk_layers_.at(layer_idx);
-  CHECK_NE(key_layer, nullptr) << "The key layer is null";
-  STATUS_CHECK(key_layer->forward(rmsnorm_output, key));
-
   // Key norm (Qwen3 specific)
   auto key_norm = qwen_layers_->rmsnorm_layers_.at(layer_idx + 3 * config_->layer_num_ + 1);
   key.reshape({(int32_t)key.size() / config_->head_size_, config_->head_size_});
   key_norm->forward(key, key);
   key.reshape({(int32_t)key.size()});
-
-  // Value
-  const auto& value_layer = qwen_layers_->wv_layers_.at(layer_idx);
-  CHECK_NE(value_layer, nullptr) << "The value layer is null";
-  STATUS_CHECK(value_layer->forward(rmsnorm_output, val));
 
   // M-RoPE: Use 3D position encoding for multimodal inputs
   // Check if we have M-RoPE positions computed (during prefill)
@@ -1108,32 +1102,27 @@ void Qwen3VLModel::attention_qkv_with_graph(int32_t layer_idx,
   
   auto rmsnorm_output = get_buffer(ModelBufferType::kOutputRMSNorm);
   
-  // Query
+  // Separate Q, K, V projections
   const auto& query_layer = qwen_layers_->wq_layers_.at(layer_idx);
-  CHECK_NE(query_layer, nullptr);
   STATUS_CHECK(query_layer->forward(rmsnorm_output, query));
+
+  const auto& key_layer = qwen_layers_->wk_layers_.at(layer_idx);
+  STATUS_CHECK(key_layer->forward(rmsnorm_output, temp_key));
+
+  const auto& value_layer = qwen_layers_->wv_layers_.at(layer_idx);
+  STATUS_CHECK(value_layer->forward(rmsnorm_output, temp_value));
 
   // Query norm (Qwen3 specific)
   auto query_norm = qwen_layers_->rmsnorm_layers_.at(layer_idx + 2 * config_->layer_num_ + 1);
   query.reshape({(int32_t)query.size() / config_->head_size_, config_->head_size_});
   query_norm->forward(query, query);
   query.reshape({(int32_t)query.size()});
-
-  // Key -> temp_key (fixed address)
-  const auto& key_layer = qwen_layers_->wk_layers_.at(layer_idx);
-  CHECK_NE(key_layer, nullptr);
-  STATUS_CHECK(key_layer->forward(rmsnorm_output, temp_key));
   
   // Key norm (Qwen3 specific)
   auto key_norm = qwen_layers_->rmsnorm_layers_.at(layer_idx + 3 * config_->layer_num_ + 1);
   temp_key.reshape({(int32_t)temp_key.size() / config_->head_size_, config_->head_size_});
   key_norm->forward(temp_key, temp_key);
   temp_key.reshape({(int32_t)temp_key.size()});
-  
-  // Value -> temp_value (fixed address)
-  const auto& value_layer = qwen_layers_->wv_layers_.at(layer_idx);
-  CHECK_NE(value_layer, nullptr);
-  STATUS_CHECK(value_layer->forward(rmsnorm_output, temp_value));
 
   // M-RoPE with GPU pos for CUDA Graph compatibility (decode phase uses same pos for t/h/w)
   const auto& section = vl_config_.text.mrope_section;
@@ -2645,49 +2634,47 @@ void Qwen3VLModel::batched_attention_qkv(int32_t layer_idx, const tensor::Tensor
   size_t elem_size = (activation_dtype == base::DataType::kDataTypeFp16) 
       ? sizeof(uint16_t) : sizeof(float);
   
-  // Batched Q projection
-  const auto& wq_layer = qwen_layers_->wq_layers_.at(layer_idx);
-  auto wq_matmul = std::dynamic_pointer_cast<op::MatmulLayer>(wq_layer);
-  CHECK_NE(wq_matmul, nullptr) << "WQ layer is not a MatmulLayer";
-  
   // Use cuBLAS for batched matrix multiplication
   const half alpha = __float2half(1.0f);
   const half beta = __float2half(0.0f);
+  
+  const half* q_weight_ptr;
+  const half* k_weight_ptr;
+  const half* v_weight_ptr;
+  
+  auto wq_matmul = std::dynamic_pointer_cast<op::MatmulLayer>(qwen_layers_->wq_layers_.at(layer_idx));
+  auto wk_matmul = std::dynamic_pointer_cast<op::MatmulLayer>(qwen_layers_->wk_layers_.at(layer_idx));
+  auto wv_matmul = std::dynamic_pointer_cast<op::MatmulLayer>(qwen_layers_->wv_layers_.at(layer_idx));
+  q_weight_ptr = wq_matmul->get_weight(0).ptr<half>();
+  k_weight_ptr = wk_matmul->get_weight(0).ptr<half>();
+  v_weight_ptr = wv_matmul->get_weight(0).ptr<half>();
   
   // Q: [seq_len, dim] = [seq_len, dim] @ [dim, dim]^T
   cublasHgemm(cuda_config_->cublas_handle,
               CUBLAS_OP_T, CUBLAS_OP_N,
               config_->dim_, seq_len, config_->dim_,
               &alpha,
-              wq_matmul->get_weight(0).ptr<half>(), config_->dim_,
+              q_weight_ptr, config_->dim_,
               rms_out.ptr<half>(), config_->dim_,
               &beta,
               const_cast<half*>(query_out.ptr<half>()), config_->dim_);
   
   // K: [seq_len, kv_dim] = [seq_len, dim] @ [dim, kv_dim]^T
-  const auto& wk_layer = qwen_layers_->wk_layers_.at(layer_idx);
-  auto wk_matmul = std::dynamic_pointer_cast<op::MatmulLayer>(wk_layer);
-  CHECK_NE(wk_matmul, nullptr) << "WK layer is not a MatmulLayer";
-  
   cublasHgemm(cuda_config_->cublas_handle,
               CUBLAS_OP_T, CUBLAS_OP_N,
               config_->kv_dim_, seq_len, config_->dim_,
               &alpha,
-              wk_matmul->get_weight(0).ptr<half>(), config_->dim_,
+              k_weight_ptr, config_->dim_,
               rms_out.ptr<half>(), config_->dim_,
               &beta,
               const_cast<half*>(key_out.ptr<half>()), config_->kv_dim_);
   
   // V: [seq_len, kv_dim] = [seq_len, dim] @ [dim, kv_dim]^T
-  const auto& wv_layer = qwen_layers_->wv_layers_.at(layer_idx);
-  auto wv_matmul = std::dynamic_pointer_cast<op::MatmulLayer>(wv_layer);
-  CHECK_NE(wv_matmul, nullptr) << "WV layer is not a MatmulLayer";
-  
   cublasHgemm(cuda_config_->cublas_handle,
               CUBLAS_OP_T, CUBLAS_OP_N,
               config_->kv_dim_, seq_len, config_->dim_,
               &alpha,
-              wv_matmul->get_weight(0).ptr<half>(), config_->dim_,
+              v_weight_ptr, config_->dim_,
               rms_out.ptr<half>(), config_->dim_,
               &beta,
               const_cast<half*>(value_out.ptr<half>()), config_->kv_dim_);

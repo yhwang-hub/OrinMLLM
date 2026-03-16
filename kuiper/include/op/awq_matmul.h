@@ -50,6 +50,7 @@ class AWQMatmulLayer : public Layer {
   const tensor::Tensor& get_qweight() const { return qweight_; }
   const tensor::Tensor& get_qzeros() const { return qzeros_; }
   const tensor::Tensor& get_scales() const { return scales_; }
+  const tensor::Tensor& get_qweight_t() const { return qweight_t_; }
 
  private:
   int32_t in_features_ = 0;
@@ -57,9 +58,10 @@ class AWQMatmulLayer : public Layer {
   int32_t group_size_ = 128;
   
   // AWQ quantized weights
-  tensor::Tensor qweight_;  // [in_features, out_features/8] INT32
-  tensor::Tensor qzeros_;   // [in_features/group_size, out_features/8] INT32
-  tensor::Tensor scales_;   // [in_features/group_size, out_features] FP16
+  tensor::Tensor qweight_;    // [in_features, out_features/8] INT32 (original layout for prefill)
+  tensor::Tensor qweight_t_;  // [out_features/8, in_features] INT32 (transposed layout for decode)
+  tensor::Tensor qzeros_;     // [in_features/group_size, out_features/8] INT32
+  tensor::Tensor scales_;     // [in_features/group_size, out_features] FP16
 };
 
 }  // namespace op

@@ -281,6 +281,128 @@ void Qwen3SQModel::gate_up_swiglu(int32_t layer_idx,
   STATUS_CHECK(layers->swiglu_layer_->forward(output, w3_output, output));
 }
 
+// ==================== P0-1: Decode QKV with Shared SQ Quantization ====================
+//
+// Override attention_qkv to quantize rmsnorm_output once and reuse for Q, K, V.
+// Saves 6 kernel launches per layer (2 redundant quantize passes × 3 = 6).
+// For 36 layers: 216 fewer kernel launches per decode step.
+
+void Qwen3SQModel::attention_qkv(int32_t layer_idx, const tensor::Tensor& pos_tensor) const {
+  CHECK(qwen_layers_ != nullptr);
+  tensor::Tensor query = this->get_buffer(ModelBufferType::kQuery);
+  int32_t pos = pos_tensor.index<int32_t>(0);
+  auto [key, val] = slice_kv_cache(layer_idx, pos);
+  auto rmsnorm_output = get_buffer(ModelBufferType::kOutputRMSNorm);
+
+  const auto& query_layer = qwen_layers_->wq_layers_.at(layer_idx);
+  const auto& key_layer = qwen_layers_->wk_layers_.at(layer_idx);
+  const auto& value_layer = qwen_layers_->wv_layers_.at(layer_idx);
+
+  auto query_sq = std::dynamic_pointer_cast<op::SQMatmulLayer>(query_layer);
+  auto key_sq = std::dynamic_pointer_cast<op::SQMatmulLayer>(key_layer);
+  auto value_sq = std::dynamic_pointer_cast<op::SQMatmulLayer>(value_layer);
+
+  cudaStream_t stream = cuda_config_ ? cuda_config_->stream : nullptr;
+
+  // Shared quantization: quantize rmsnorm_output once, reuse for Q, K, V
+  op::SQMatmulLayer::quantize_input(rmsnorm_output, stream);
+  STATUS_CHECK(op::SQMatmulLayer::forward_preq(query, *query_sq, stream));
+  STATUS_CHECK(op::SQMatmulLayer::forward_preq(key, *key_sq, stream));
+  STATUS_CHECK(op::SQMatmulLayer::forward_preq(val, *value_sq, stream));
+
+  // query norm (Qwen3 specific: per-head RMSNorm)
+  auto query_norm = qwen_layers_->rmsnorm_layers_.at(layer_idx + 2 * config_->layer_num_ + 1);
+  query.reshape({(int32_t)query.size() / config_->head_size_, config_->head_size_});
+  query_norm->forward(query, query);
+  query.reshape({(int32_t)query.size()});
+
+  // key norm
+  auto key_norm = qwen_layers_->rmsnorm_layers_.at(layer_idx + 3 * config_->layer_num_ + 1);
+  key.reshape({(int32_t)key.size() / config_->head_size_, config_->head_size_});
+  key_norm->forward(key, key);
+  key.reshape({(int32_t)key.size()});
+
+  // rope
+  CHECK_NE(qwen_layers_->rope_layer_, nullptr);
+  STATUS_CHECK(qwen_layers_->rope_layer_->forward(
+      query, key, pos_tensor, get_buffer(ModelBufferType::kSinCache),
+      get_buffer(ModelBufferType::kCosCache), tensor::Tensor{}));
+}
+
+void Qwen3SQModel::attention_qkv_with_graph(int32_t layer_idx, const tensor::Tensor& pos_tensor) const {
+  CHECK(qwen_layers_ != nullptr);
+  CHECK(cuda_config_ != nullptr);
+
+  tensor::Tensor query = this->get_buffer(ModelBufferType::kQuery);
+  tensor::Tensor temp_key = this->get_buffer(ModelBufferType::kTempKey);
+  tensor::Tensor temp_value = this->get_buffer(ModelBufferType::kTempValue);
+  auto rmsnorm_output = get_buffer(ModelBufferType::kOutputRMSNorm);
+
+  const auto& query_layer = qwen_layers_->wq_layers_.at(layer_idx);
+  const auto& key_layer = qwen_layers_->wk_layers_.at(layer_idx);
+  const auto& value_layer = qwen_layers_->wv_layers_.at(layer_idx);
+
+  auto query_sq = std::dynamic_pointer_cast<op::SQMatmulLayer>(query_layer);
+  auto key_sq = std::dynamic_pointer_cast<op::SQMatmulLayer>(key_layer);
+  auto value_sq = std::dynamic_pointer_cast<op::SQMatmulLayer>(value_layer);
+
+  cudaStream_t stream = cuda_config_->stream;
+
+  // Shared quantization: quantize rmsnorm_output once, reuse for Q, K, V
+  op::SQMatmulLayer::quantize_input(rmsnorm_output, stream);
+  STATUS_CHECK(op::SQMatmulLayer::forward_preq(query, *query_sq, stream));
+  STATUS_CHECK(op::SQMatmulLayer::forward_preq(temp_key, *key_sq, stream));
+  STATUS_CHECK(op::SQMatmulLayer::forward_preq(temp_value, *value_sq, stream));
+
+  // Query norm
+  auto query_norm = qwen_layers_->rmsnorm_layers_.at(layer_idx + 2 * config_->layer_num_ + 1);
+  query.reshape({(int32_t)query.size() / config_->head_size_, config_->head_size_});
+  query_norm->forward(query, query);
+  query.reshape({(int32_t)query.size()});
+
+  // Key norm
+  auto key_norm = qwen_layers_->rmsnorm_layers_.at(layer_idx + 3 * config_->layer_num_ + 1);
+  temp_key.reshape({(int32_t)temp_key.size() / config_->head_size_, config_->head_size_});
+  key_norm->forward(temp_key, temp_key);
+  temp_key.reshape({(int32_t)temp_key.size()});
+
+  // RoPE (GPU pos version for CUDA Graph compatibility)
+  auto rope_layer = qwen_layers_->rope_gpu_pos_layer_;
+  rope_layer->set_use_gpu_pos(true);
+  rope_layer->set_use_fp16(query.data_type() == base::DataType::kDataTypeFp16);
+  rope_layer->set_input(0, query);
+  rope_layer->set_input(1, temp_key);
+  rope_layer->set_input(2, pos_tensor);
+  rope_layer->set_input(3, get_buffer(ModelBufferType::kSinCache));
+  rope_layer->set_input(4, get_buffer(ModelBufferType::kCosCache));
+  rope_layer->set_cuda_config(cuda_config_);
+  STATUS_CHECK(rope_layer->forward());
+
+  // KV cache copy
+  tensor::Tensor key_cache = get_buffer(ModelBufferType::kKeyCache);
+  tensor::Tensor val_cache = get_buffer(ModelBufferType::kValueCache);
+
+  auto key_cache_layer = qwen_layers_->kv_cache_key_layer_;
+  key_cache_layer->set_layer_index(layer_idx);
+  key_cache_layer->set_use_gpu_pos(true);
+  key_cache_layer->set_use_fp16(key_cache.data_type() == base::DataType::kDataTypeFp16);
+  key_cache_layer->set_input(0, temp_key);
+  key_cache_layer->set_input(1, key_cache);
+  key_cache_layer->set_input(2, pos_tensor);
+  key_cache_layer->set_cuda_config(cuda_config_);
+  STATUS_CHECK(key_cache_layer->forward());
+
+  auto value_cache_layer = qwen_layers_->kv_cache_value_layer_;
+  value_cache_layer->set_layer_index(layer_idx);
+  value_cache_layer->set_use_gpu_pos(true);
+  value_cache_layer->set_use_fp16(val_cache.data_type() == base::DataType::kDataTypeFp16);
+  value_cache_layer->set_input(0, temp_value);
+  value_cache_layer->set_input(1, val_cache);
+  value_cache_layer->set_input(2, pos_tensor);
+  value_cache_layer->set_cuda_config(cuda_config_);
+  STATUS_CHECK(value_cache_layer->forward());
+}
+
 }  // namespace model
 
 #endif

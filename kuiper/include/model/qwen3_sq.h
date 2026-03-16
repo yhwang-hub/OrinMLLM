@@ -34,6 +34,11 @@ class Qwen3SQModel : public Qwen3Model {
                        const tensor::Tensor& input,
                        const tensor::Tensor& output) const override;
 
+  // P0-1: Override decode QKV to use shared SQ quantization
+  // Quantize rmsnorm_output once, reuse for Q/K/V projections
+  void attention_qkv(int32_t layer_idx, const tensor::Tensor& pos_tensor) const override;
+  void attention_qkv_with_graph(int32_t layer_idx, const tensor::Tensor& pos_tensor) const override;
+
  private:
   void create_param_layers_sq();
 };

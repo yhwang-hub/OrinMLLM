@@ -5,6 +5,7 @@
 #include "op/awq_matmul.h"
 #include "base/alloc.h"
 #include "kernels/cuda/awq_gemm_tensorcore.cuh"
+#include "kernels/cuda/awq_gemm_fast.cuh"
 #include <glog/logging.h>
 #include <cuda_runtime.h>
 
@@ -93,6 +94,21 @@ void AWQMatmulLayer::to_cuda() {
                scales_.byte_size(), cudaMemcpyHostToDevice);
     scales_ = std::move(cuda_scales);
   }
+
+  // Create transposed qweight for coalesced decode access: [K, N/8] → [N/8, K]
+  if (!qweight_.is_empty()) {
+    int32_t packed_out = out_features_ / 8;
+    int32_t total = in_features_ * packed_out;
+    qweight_t_ = tensor::Tensor(base::DataType::kDataTypeInt32, total, true, cuda_alloc);
+    kernel::awq_transpose_qweight_cu(
+        qweight_.ptr<int32_t>(),
+        qweight_t_.ptr<int32_t>(),
+        in_features_,
+        packed_out,
+        nullptr  // default stream
+    );
+    cudaDeviceSynchronize();
+  }
 }
 
 base::Status AWQMatmulLayer::forward(const tensor::Tensor& input, const tensor::Tensor& output) {
@@ -121,7 +137,8 @@ base::Status AWQMatmulLayer::forward(const tensor::Tensor& input, const tensor::
         out_features_,
         group_size_,
         split_k_iters,
-        stream
+        stream,
+        qweight_t_.is_empty() ? nullptr : qweight_t_.ptr<int32_t>()
     );
   } else {
     return base::error::InternalError("AWQ only supports CUDA device");
@@ -167,7 +184,8 @@ base::Status AWQMatmulLayer::forward() {
         out_features_,
         group_size_,
         split_k_iters,
-        stream
+        stream,
+        qweight_t_.is_empty() ? nullptr : qweight_t_.ptr<int32_t>()
     );
   } else {
     return base::error::InternalError("AWQ only supports CUDA device");

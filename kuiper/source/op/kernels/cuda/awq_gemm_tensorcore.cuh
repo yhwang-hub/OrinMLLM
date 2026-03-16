@@ -46,7 +46,8 @@ void awq_gemm_tensorcore_cu(
     int out_features,
     int group_size,
     int split_k_iters,
-    cudaStream_t stream
+    cudaStream_t stream,
+    const int32_t* qweight_t = nullptr  // Transposed [N/8, K] for coalesced decode
 );
 
 }  // namespace kernel

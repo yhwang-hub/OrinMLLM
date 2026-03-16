@@ -379,6 +379,86 @@ void sq_fused_ffn_gemv_kernel(
 }
 
 // ======================== Workspace Management ==============================
+// P0-2: Fused absmax + quantize kernel (single block)
+// Replaces 3 separate kernels (cudaMemset + absmax + quantize_and_alpha) with 1.
+// For small K (≤16384), a single block of 256 threads handles the entire vector.
+// Uses in-block tree reduction (no atomicMax, no inter-block sync needed).
+//
+__global__ void sq_fused_quantize_kernel(
+    const half* __restrict__ input_fp16,
+    int8_t* __restrict__ output_int8,
+    float weight_scale,
+    float* __restrict__ d_alpha,
+    int total_elements)
+{
+    extern __shared__ float sdata[];
+    const int tid = threadIdx.x;
+
+    // Phase 1: Compute absmax with vectorized loads
+    float local_max = 0.0f;
+    for (int gid = tid * 4; gid < total_elements; gid += blockDim.x * 4) {
+        if (gid + 3 < total_elements) {
+            const half2* h2 = reinterpret_cast<const half2*>(input_fp16 + gid);
+            half2 v0 = __ldg(h2);
+            half2 v1 = __ldg(h2 + 1);
+            float2 f0 = __half22float2(v0);
+            float2 f1 = __half22float2(v1);
+            local_max = fmaxf(local_max, fmaxf(fmaxf(fabsf(f0.x), fabsf(f0.y)),
+                                                fmaxf(fabsf(f1.x), fabsf(f1.y))));
+        } else {
+            for (int i = gid; i < total_elements && i < gid + 4; ++i) {
+                local_max = fmaxf(local_max, fabsf(__half2float(input_fp16[i])));
+            }
+        }
+    }
+
+    sdata[tid] = local_max;
+    __syncthreads();
+
+    // In-block tree reduction for absmax
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] = fmaxf(sdata[tid], sdata[tid + s]);
+        }
+        __syncthreads();
+    }
+
+    // All threads read finalized absmax from shared memory
+    float absmax = sdata[0];
+    float inv_scale = (absmax > 1e-6f) ? 127.0f / absmax : 0.0f;
+
+    // Thread 0 computes and stores alpha
+    if (tid == 0) {
+        float input_scale = (absmax > 1e-6f) ? absmax / 127.0f : 0.0f;
+        *d_alpha = input_scale * weight_scale;
+    }
+
+    // Phase 2: Quantize FP16 → INT8 with vectorized loads/stores
+    for (int idx = tid * 4; idx < total_elements; idx += blockDim.x * 4) {
+        if (idx + 3 < total_elements) {
+            const half2* h2 = reinterpret_cast<const half2*>(input_fp16 + idx);
+            half2 v0 = __ldg(h2);
+            half2 v1 = __ldg(h2 + 1);
+            float2 f0 = __half22float2(v0);
+            float2 f1 = __half22float2(v1);
+
+            int i0 = max(-128, min(127, __float2int_rn(f0.x * inv_scale)));
+            int i1 = max(-128, min(127, __float2int_rn(f0.y * inv_scale)));
+            int i2 = max(-128, min(127, __float2int_rn(f1.x * inv_scale)));
+            int i3 = max(-128, min(127, __float2int_rn(f1.y * inv_scale)));
+
+            int32_t packed = (i0 & 0xFF) | ((i1 & 0xFF) << 8) |
+                             ((i2 & 0xFF) << 16) | ((i3 & 0xFF) << 24);
+            *reinterpret_cast<int32_t*>(output_int8 + idx) = packed;
+        } else {
+            for (int i = idx; i < total_elements && i < idx + 4; ++i) {
+                float val = __half2float(input_fp16[i]) * inv_scale;
+                output_int8[i] = static_cast<int8_t>(max(-128, min(127, __float2int_rn(val))));
+            }
+        }
+    }
+}
+
 struct SQWorkspace {
     int8_t* input_int8 = nullptr;
     int*    max_int    = nullptr;
@@ -402,11 +482,9 @@ static SQWorkspace g_workspace;
 
 // ========================= M=1 GEMV Dispatch ===============================
 //
-// Correct 3-kernel pipeline (no inter-block race conditions):
-//   1. cudaMemsetAsync (reset absmax)
-//   2. sq_absmax_kernel (parallel block reduction → atomicMax)
-//   3. sq_quantize_and_alpha_kernel (reads finalized absmax, quantizes + alpha)
-//   4. sq_gemv_int8_kernel (__dp4a GEMV with 128-bit loads)
+// Optimized 2-kernel pipeline (P0-2: fused absmax+quantize):
+//   1. sq_fused_quantize_kernel (single-block absmax + quantize + alpha)
+//   2. sq_gemv_int8_kernel (__dp4a GEMV with 128-bit loads)
 //
 static void sq_gemv_m1(
     const half* input_fp16,
@@ -419,22 +497,12 @@ static void sq_gemv_m1(
 {
     g_workspace.ensure(static_cast<size_t>(K));
 
-    constexpr int kThreads = 256;
-    int quant_blocks = (K + kThreads * 4 - 1) / (kThreads * 4);
-
-    // Reset absmax accumulator
-    cudaMemsetAsync(g_workspace.max_int, 0, sizeof(int), stream);
-
-    // Phase 1: AbsMax reduction
-    sq_absmax_kernel<<<quant_blocks, kThreads, kThreads * sizeof(float), stream>>>(
-        input_fp16, g_workspace.max_int, K);
-
-    // Phase 2: Quantize FP16→INT8 + compute alpha = input_scale * weight_scale
-    sq_quantize_and_alpha_kernel<<<quant_blocks, kThreads, 0, stream>>>(
-        input_fp16, g_workspace.input_int8, g_workspace.max_int,
+    // Fused absmax + quantize (1 kernel instead of memset + absmax + quantize = 3)
+    sq_fused_quantize_kernel<<<1, 256, 256 * sizeof(float), stream>>>(
+        input_fp16, g_workspace.input_int8,
         weight_scale, g_workspace.alpha, K);
 
-    // Phase 3: INT8 GEMV with __dp4a
+    // INT8 GEMV with __dp4a
     int gemv_blocks = (N + 7) / 8;
     sq_gemv_int8_kernel<<<gemv_blocks, 256, 0, stream>>>(
         g_workspace.input_int8, qweight, output_fp16,
@@ -554,13 +622,11 @@ void sq_gemm_cu(
 // ======================= Fused SQ FFN Entry =================================
 //
 // For decode (M=1): quantize input once, then do fused W1+W3 GEMV + SwiGLU.
-// Saves 6 kernel launches compared to separate w1 + w3 SQ GEMM calls.
+// P0-2: Uses fused quantize kernel (1 kernel instead of 3).
 //
 // Pipeline:
-//   1. cudaMemsetAsync (reset absmax)
-//   2. sq_absmax_kernel (absmax reduction)
-//   3. sq_quantize_and_alpha_kernel (quantize + input_scale, weight_scale=1.0)
-//   4. sq_fused_ffn_gemv_kernel (W1+W3 GEMV + SwiGLU with per-layer weight_scales)
+//   1. sq_fused_quantize_kernel (absmax + quantize + input_scale)
+//   2. sq_fused_ffn_gemv_kernel (W1+W3 GEMV + SwiGLU with per-layer weight_scales)
 //
 void sq_fused_ffn_cu(
     const half* input_fp16,
@@ -574,33 +640,20 @@ void sq_fused_ffn_cu(
     cudaStream_t stream)
 {
     const int K = in_features;
-
-    // Ensure workspace for input quantization
     g_workspace.ensure(static_cast<size_t>(K));
 
-    constexpr int kThreads = 256;
-    int quant_blocks = (K + kThreads * 4 - 1) / (kThreads * 4);
-
-    // Reset absmax accumulator
-    cudaMemsetAsync(g_workspace.max_int, 0, sizeof(int), stream);
-
-    // Phase 1: AbsMax reduction
-    sq_absmax_kernel<<<quant_blocks, kThreads, kThreads * sizeof(float), stream>>>(
-        input_fp16, g_workspace.max_int, K);
-
-    // Phase 2: Quantize + compute input_scale
-    // Using weight_scale=1.0 so alpha = input_scale * 1.0 = input_scale
-    sq_quantize_and_alpha_kernel<<<quant_blocks, kThreads, 0, stream>>>(
-        input_fp16, g_workspace.input_int8, g_workspace.max_int,
+    // Fused absmax + quantize (weight_scale=1.0 → alpha = input_scale)
+    sq_fused_quantize_kernel<<<1, 256, 256 * sizeof(float), stream>>>(
+        input_fp16, g_workspace.input_int8,
         1.0f, g_workspace.alpha, K);
 
-    // Phase 3: Fused W1+W3 GEMV + SwiGLU
+    // Fused W1+W3 GEMV + SwiGLU
     int ffn_blocks = (hidden_dim + 7) / 8;
     sq_fused_ffn_gemv_kernel<<<ffn_blocks, 256, 0, stream>>>(
         g_workspace.input_int8, w1_int8, w3_int8, output_fp16,
-        g_workspace.alpha,      // d_input_scale = absmax/127
-        w1_weight_scale,        // host-side W1 scale
-        w3_weight_scale,        // host-side W3 scale
+        g_workspace.alpha,
+        w1_weight_scale,
+        w3_weight_scale,
         K, hidden_dim);
 }
 
@@ -608,9 +661,7 @@ void sq_fused_ffn_cu(
 //
 // Quantize input once, then reuse for multiple GEMV calls with different weights.
 // Designed for QKV projections where all 3 use the same input (rms_out).
-//
-// Saves 2 × (memset + absmax + quantize) = 6 kernel launches per layer.
-// For 36 layers: 216 fewer kernel launches per decode step.
+// P0-2: Uses fused quantize kernel (1 kernel instead of 3).
 //
 // After sq_quantize_input_cu():
 //   g_workspace.input_int8 = quantized input [K]
@@ -623,19 +674,9 @@ void sq_quantize_input_cu(
 {
     g_workspace.ensure(static_cast<size_t>(K));
 
-    constexpr int kThreads = 256;
-    int blocks = (K + kThreads * 4 - 1) / (kThreads * 4);
-
-    // Reset absmax accumulator
-    cudaMemsetAsync(g_workspace.max_int, 0, sizeof(int), stream);
-
-    // AbsMax reduction
-    sq_absmax_kernel<<<blocks, kThreads, kThreads * sizeof(float), stream>>>(
-        input_fp16, g_workspace.max_int, K);
-
-    // Quantize + compute input_scale (weight_scale=1.0 → alpha = input_scale)
-    sq_quantize_and_alpha_kernel<<<blocks, kThreads, 0, stream>>>(
-        input_fp16, g_workspace.input_int8, g_workspace.max_int,
+    // Fused absmax + quantize (weight_scale=1.0 → alpha = input_scale)
+    sq_fused_quantize_kernel<<<1, 256, 256 * sizeof(float), stream>>>(
+        input_fp16, g_workspace.input_int8,
         1.0f, g_workspace.alpha, K);
 }
 
