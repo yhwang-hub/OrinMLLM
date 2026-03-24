@@ -12,6 +12,10 @@
 2. [qwen3.cpp 中 Fused FFN 的使用方式与源码分析](#2-qwen3cpp-中-fused-ffn-的使用方式)
 3. [Fused FFN 加速原理：数学与源码双重分析](#3-fused-ffn-加速原理)
 4. [算子融合的底层限制与不可融合场景](#4-算子融合的底层限制)
+5. [适配 Fused FFN 过程中的难点、关键点与解决方案](#5-适配-fused-ffn-过程中的难点关键点与解决方案)
+6. [`fused_gate_up_swiglu_kernel_fp16_v2` 详解](#6-fused_gate_up_swiglu_kernel_fp16_v2-详解)
+7. [qwen3_awq.cpp 与 qwen3_sq.cpp 工程中 Decode 阶段 Fused FFN 的支持](#7-qwen3_awqcpp-与-qwen3_sqcpp-工程中-decode-阶段-fused-ffn-的支持)
+8. [qwen3_vl.cpp 工程中 Decode 阶段 Fused FFN 的支持](#8-qwen3_vlcpp-工程中-decode-阶段-fused-ffn-的支持)
 
 ---
 
@@ -1866,7 +1870,7 @@ Kernel #1: fused_gate_up_swiglu_kernel_fp16_v2(x, W1, W3, output)
 | **精度策略** | FP32 累加 | FP32 累加 | 相同，保证数值精度 |
 | **SiLU 融合** | 独立 kernel 计算 | 归约后立即在寄存器中计算 | 零额外内存访问 |
 
-### 6.9 Fused Kernel 完整数据流
+### 6.9 Fused Kernel 完整数据流（FP16 FusedFFNLayer）
 
 ```
                                ┌─── float4 加载 ──→ half2 拆解 ──→ float2 转换
@@ -1912,3 +1916,646 @@ output[row] = __float2half( SiLU(sum_gate) × sum_up )
 | Block Size | 256 threads | 256 threads | 8 warps × 32 = 256 threads |
 | 每 Block 行数 | 1 | 1 | 8 (WARPS_PER_BLOCK) |
 | Shared Memory | ~2KB (CUB) | ~2KB (CUB) | 0 |
+
+---
+
+## 7. qwen3_awq.cpp 与 qwen3_sq.cpp 工程中 Decode 阶段 Fused FFN 的支持
+
+### 7.1 继承与虚函数分派架构
+
+OrinMLLM 通过 **虚函数多态** 实现不同量化后端对 Fused FFN 的支持。继承层次如下：
+
+```
+QwenBaseModel                    ← 定义 decode 循环 + feed_forward_fused() + virtual gate_up_swiglu()
+    └─ Qwen3Model                ← Qwen3 特有的 QKV norm
+         ├─ Qwen3AWQModel        ← override gate_up_swiglu(): AWQ INT4 fused kernel
+         └─ Qwen3SQModel         ← override gate_up_swiglu(): SQ INT8 fused kernel
+```
+
+Decode 阶段的调用链：
+
+```
+QwenBaseModel::decode()
+  └→ for each layer:
+       └→ feed_forward_fused(layer_idx, decode_input)    [基类实现]
+            ├→ add_layer->forward(...)                    // 残差加
+            ├→ ffn_rmsnorm->forward(...)                  // FFN RMSNorm
+            ├→ gate_up_swiglu(layer_idx, input, output)   // ★ 虚调用！
+            │     ├→ [AWQ] Qwen3AWQModel::gate_up_swiglu  // AWQ 子类实现
+            │     ├→ [SQ]  Qwen3SQModel::gate_up_swiglu   // SQ 子类实现
+            │     └→ [FP16] QwenBaseModel::gate_up_swiglu  // 基类 FP16 实现
+            ├→ w2_layer->forward(...)                      // W2 Down Projection
+            └→ add_layer->forward(...)                     // 残差加
+```
+
+`gate_up_swiglu()` 是一个 `virtual` 方法，基类提供 FP16 实现，AWQ 和 SQ 子类各自 override 提供量化版本。这使得 `feed_forward_fused()` 无需了解底层量化细节，只需调用 `gate_up_swiglu()` 即可。
+
+### 7.2 Qwen3AWQModel 的 Fused FFN 实现
+
+#### 7.2.1 源码分析（`qwen3_awq.cpp` 第 271-315 行）
+
+```cpp
+void Qwen3AWQModel::gate_up_swiglu(int32_t layer_idx,
+                                    const tensor::Tensor& input,
+                                    const tensor::Tensor& output) const {
+  auto w1_awq = std::dynamic_pointer_cast<op::AWQMatmulLayer>(w1_layer);
+  auto w3_awq = std::dynamic_pointer_cast<op::AWQMatmulLayer>(w3_layer);
+
+  int32_t batch_size = input.size() / w1_awq->in_features();
+
+  // M=1 decode: use fused AWQ gate+up+swiglu kernel
+  if (batch_size == 1 && w1_awq && w3_awq &&
+      !w1_awq->get_qweight_t().is_empty() && !w3_awq->get_qweight_t().is_empty()) {
+    kernel::awq_fused_gate_up_swiglu_cu(
+        input, w1_qweight_t, w1_qzeros, w1_scales,
+               w3_qweight_t, w3_qzeros, w3_scales,
+        output, K, N, group_size, stream);
+    return;
+  }
+
+  // Fallback: separate W1 + W3 + SwiGLU
+  w1_layer->forward(input, output);
+  w3_layer->forward(input, w3_output);
+  swiglu_layer_->forward(output, w3_output, output);
+}
+```
+
+**调度条件**：
+1. `batch_size == 1`：仅 decode（M=1）使用 fused kernel
+2. 权重已完成转置（`qweight_t` 非空）：需要预先执行 `[K, N/8] → [N/8, K]` 转置以实现合并访存
+3. W1 和 W3 均为 AWQ 量化层
+
+**Fallback 路径**：当 M>1（prefill）或转置未就绪时，退回到标准 3-kernel 路径（W1 GEMV + W3 GEMV + SwiGLU）。
+
+#### 7.2.2 AWQ Fused Kernel 推理流程详解
+
+AWQ Fused FFN 仅需 **1 次 kernel launch**，在单个 kernel 内完成：
+1. Phase 1：W1（Gate）GEMV with AWQ INT4 → FP16 dequant
+2. Phase 2：W3（Up）GEMV with AWQ INT4 → FP16 dequant（复用 L2 Cache 中的 X）
+3. Phase 3：SiLU(gate) × up → 输出
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│            awq_fused_gate_up_swiglu_kernel (单次 launch)                │
+│                                                                         │
+│  输入:                                                                  │
+│    X[K]          ─ FP16 输入向量                                        │
+│    W1_t[N/8, K]  ─ W1 转置后的 INT4 packed 权重                         │
+│    W1_z[K/G,N/8] ─ W1 zero-points (INT4 packed)                       │
+│    W1_s[K/G, N]  ─ W1 scales (FP16)                                   │
+│    W3_t[N/8, K]  ─ W3 转置后的 INT4 packed 权重                         │
+│    W3_z[K/G,N/8] ─ W3 zero-points                                     │
+│    W3_s[K/G, N]  ─ W3 scales                                          │
+│                                                                         │
+│  Phase 1:  gate_acc[8] = Σ_k dequant(W1[n,k]) × X[k]                  │
+│            = Σ_k (scale × (w_int4 - zero)) × X[k]                     │
+│                                                                         │
+│  Phase 2:  up_acc[8] = Σ_k dequant(W3[n,k]) × X[k]                   │
+│                                                                         │
+│  Phase 3:  Y[n] = SiLU(gate_acc[n]) × up_acc[n]                       │
+│                                                                         │
+│  输出:                                                                  │
+│    Y[N] ─ FP16 输出向量                                                 │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 7.2.3 AWQ Fused Kernel 的 Grid / Block / Thread 映射
+
+**启动配置**（`awq_gemm_fast.cu` 第 557 行）：
+
+```cuda
+const int num_blocks = (hidden_dim + 63) / 64;
+awq_fused_gate_up_swiglu_kernel<<<num_blocks, 256, 0, stream>>>(...);
+```
+
+对于 Qwen3-8B（$N = \text{hidden\_dim} = 11008$）：
+
+| 参数 | 值 | 说明 |
+|------|-----|------|
+| Grid | $\lceil 11008 / 64 \rceil = 172$ blocks | 每个 block 处理 64 个输出通道 |
+| Block | 256 threads（8 warps × 32 lanes） | `__launch_bounds__(256, 2)` |
+| Shared Memory | 0 bytes | 使用 Warp Shuffle 归约 |
+
+**线程到输出的映射**：
+
+```
+┌──────────────────────── GPU Grid: 172 blocks ────────────────────────┐
+│                                                                      │
+│  Block 0                    Block 1                    Block 171     │
+│  ┌────────────────────┐    ┌────────────────────┐    ┌────────────┐  │
+│  │ 8 warps            │    │ 8 warps            │    │ 8 warps    │  │
+│  │ packed_out 0-7     │    │ packed_out 8-15    │    │ packed_out │  │
+│  │ → output[0..63]    │    │ → output[64..127]  │    │ 最后一批   │  │
+│  └────────────────────┘    └────────────────────┘    └────────────┘  │
+└──────────────────────────────────────────────────────────────────────┘
+
+┌──────────────── Block b (256 threads = 8 warps) ──────────────────┐
+│                                                                    │
+│  Warp 0 (tid 0-31)                                                │
+│    packed_out_idx = b*8 + 0                                       │
+│    → 计算 output[packed_out_idx*8 .. packed_out_idx*8+7]          │
+│    → 即 8 个连续通道的 gate_acc[8] + up_acc[8]                     │
+│                                                                    │
+│  Warp 1 (tid 32-63)                                               │
+│    packed_out_idx = b*8 + 1                                       │
+│    → 计算下一组 8 个通道                                            │
+│  ...                                                               │
+│  Warp 7 (tid 224-255)                                             │
+│    packed_out_idx = b*8 + 7                                       │
+│    → 计算最后一组 8 个通道                                          │
+│                                                                    │
+│  Block 合计: 8 warps × 8 通道/warp = 64 输出通道                    │
+└────────────────────────────────────────────────────────────────────┘
+
+┌──────────── Warp w (32 lanes) 处理 8 个输出通道 ──────────────────┐
+│                                                                    │
+│  每个 lane 持有 8 个 FP32 累加器: gate_acc[0..7] + up_acc[0..7]    │
+│                                                                    │
+│  Phase 1 (Gate = W1 * X):                                         │
+│    for each group g:                                               │
+│      ① LOP3 提取 zeros    → 4×half2 (z0z1, z2z3, z4z5, z6z7)     │
+│      ② 加载 scales        → 4×half2                               │
+│      ③ 预计算 neg_sz      = -(scale × zero)                       │
+│      for k = lane_id*4; k < group_size; k += 128:                 │
+│        ④ uint4 加载 4 个 packed int32 (合并访存, 16B/lane)         │
+│        ⑤ half2 加载 4 个 X 值                                     │
+│        ⑥ 对每个 packed int32:                                     │
+│           LOP3 提取 → 4×half2（8 个 INT4 权重）                    │
+│           FMA: dq = scale × w_fp16 + neg_sz                       │
+│           乘 X 并累加到 gate_acc[0..7]                             │
+│                                                                    │
+│  Phase 2 (Up = W3 * X):  结构与 Phase 1 完全相同                   │
+│    X 数据已在 L2 Cache 中，读取延迟 ~200 cycles（vs DRAM ~500）     │
+│                                                                    │
+│  Warp Shuffle 归约: 32 lanes → lane 0                              │
+│  Phase 3 (SiLU + output): 仅 lane 0 执行                          │
+│    Y[out_base..out_base+7] = SiLU(gate_acc) × up_acc              │
+│    通过 uint4 一次写出 8 个 half (16B)                              │
+└────────────────────────────────────────────────────────────────────┘
+```
+
+#### 7.2.4 AWQ Fused Kernel 的关键技术：LOP3 INT4→FP16 解包
+
+AWQ 权重以 INT4 格式打包在 INT32 中（每个 INT32 存 8 个 4-bit 权重）。解包使用 **LOP3 位操作指令**，在单个 GPU 时钟周期内完成掩码+合并：
+
+```
+INT32 packed 权重位布局（AWQ 特有的交错顺序）：
+┌─────────────────────────────────────────────────────────┐
+│ bits[0:3]  = elem 0  │ bits[16:19] = elem 1            │
+│ bits[4:7]  = elem 2  │ bits[20:23] = elem 3            │
+│ bits[8:11] = elem 4  │ bits[24:27] = elem 5            │
+│ bits[12:15]= elem 6  │ bits[28:31] = elem 7            │
+└─────────────────────────────────────────────────────────┘
+                    │
+                    ▼ LOP3 提取
+┌─────────────────────────────────────────────────────────┐
+│ out[0] = half2{elem0, elem1}  ← BOTTOM_MASK 0x000f000f │
+│ out[1] = half2{elem2, elem3}  ← TOP_MASK    0x00f000f0 │
+│ out[2] = half2{elem4, elem5}  ← (>>8) + BOTTOM_MASK    │
+│ out[3] = half2{elem6, elem7}  ← (>>8) + TOP_MASK       │
+└─────────────────────────────────────────────────────────┘
+```
+
+LOP3 指令 `d = (a & mask) | magic` 同时完成：
+- **掩码提取**：从 INT32 中提取 4-bit nibble
+- **FP16 编码**：与 magic number（0x6400 = FP16 的 1024.0）OR 操作，直接构造出 FP16 位模式
+
+之后通过 `sub.f16x2`（减 1024.0）或 `fma.rn.f16x2`（乘 1/16 加 -64）还原出 [0, 15] 范围的 FP16 整数值。
+
+**与标量解包的对比**：
+
+| 方式 | 指令数（8 个元素） | 说明 |
+|------|-------------------|------|
+| 标量 shift+mask+cast | 24 条（3×8） | 每个元素需要移位、掩码、int→float 转换 |
+| **LOP3 half2 批量** | **8 条**（4×LOP3 + 4×convert） | 每条处理 2 个元素 |
+
+LOP3 方案节省 **67% 的指令数**，对 decode 阶段 ALU 吞吐的提升显著。
+
+#### 7.2.5 AWQ Fused Kernel 内的向量化合并访存
+
+AWQ Fused Kernel 使用 **转置后** 的权重布局 `[N/8, K]`，使得同一 warp 的 32 个 lane 在 K 维度上连续读取：
+
+```
+原始布局 qweight[K, N/8]:
+  32 lanes 读取不同 k 位置 → stride = N/8 × 4 bytes → 分散访存
+
+转置布局 qweight_t[N/8, K]:
+  each warp 固定 packed_out_idx, 32 lanes 读取连续 k 位置
+  lane i 读取 warp_qweight[k + lane_id*4]
+  → 32 lanes × 16B(uint4) = 512B 连续访问 → 4 个 128B cache line → 完全合并
+```
+
+每个 lane 通过 `uint4` 一次加载 4 个连续 `int32_t`（16 bytes = 32 个 INT4 权重），配合 `uint2` 加载 4 个连续 `half`（8 bytes 输入），实现了最大化的带宽利用率。
+
+#### 7.2.6 AWQ Fused Kernel 的 Kernel Launch 时序对比
+
+```
+标准路径（3 kernel launches）:
+时间线 ─────────────────────────────────────────────────────────────────►
+CPU: [Launch W1 AWQ GEMV]─idle─[Launch W3 AWQ GEMV]─idle─[Launch SwiGLU]─idle─
+       │                          │                         │
+GPU:   └──[W1 dequant+GEMV]──┘   └──[W3 dequant+GEMV]──┘  └──[SwiGLU]──┘
+Launch overhead: 3 × 5-15μs = 15-45μs
+
+AWQ Fused 路径（1 kernel launch）:
+时间线 ─────────────────────────────────────────────────────────────────►
+CPU: [Launch Fused]─idle──────────────────────────────────────────────────
+       │
+GPU:   └──────[Phase1: W1 GEMV]──[Phase2: W3 GEMV]──[Phase3: SwiGLU]──┘
+Launch overhead: 1 × 5-15μs = 5-15μs
+```
+
+**注意**：AWQ Fused Kernel 中 Phase 1 和 Phase 2 在同一 warp 内部是 **串行执行** 的（先遍历所有 group 计算 gate，再遍历所有 group 计算 up），但 Phase 2 读取 X 时可以命中 L2 Cache，节省了 DRAM 带宽。
+
+### 7.3 Qwen3SQModel 的 Fused FFN 实现
+
+#### 7.3.1 源码分析（`qwen3_sq.cpp` 第 249-281 行）
+
+```cpp
+void Qwen3SQModel::gate_up_swiglu(int32_t layer_idx,
+                                   const tensor::Tensor& input,
+                                   const tensor::Tensor& output) const {
+  auto w1_sq = std::dynamic_pointer_cast<op::SQMatmulLayer>(w1_layer);
+  auto w3_sq = std::dynamic_pointer_cast<op::SQMatmulLayer>(w3_layer);
+
+  if (w1_sq && w3_sq) {
+    int batch_size = input.size() / w1_sq->in_features();
+    if (batch_size == 1) {
+      // Fused path: quantize once + W1·x + W3·x + SwiGLU in 2 kernels
+      STATUS_CHECK(op::SQMatmulLayer::fused_ffn_forward(
+          input, output, *w1_sq, *w3_sq, stream));
+      return;
+    }
+  }
+
+  // Fallback: separate SQ GEMM calls for W1, W3 + SwiGLU
+  w1_layer->forward(input, output);
+  w3_layer->forward(input, w3_output);
+  swiglu_layer_->forward(output, w3_output, output);
+}
+```
+
+**与 AWQ 的关键区别**：SQ 模型的 Fused FFN 需要 **2 次 kernel launch**（而非 AWQ 的 1 次），因为 SmoothQuant 需要先将 FP16 输入量化为 INT8。
+
+#### 7.3.2 SQ Fused FFN 推理流程详解
+
+SQ Fused FFN 通过 `sq_fused_ffn_cu()` 调度 2 个 kernel：
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                   sq_fused_ffn_cu (2 次 kernel launch)                   │
+│                                                                         │
+│  Kernel 1: sq_fused_quantize_kernel                                     │
+│    ┌──────────────────────────────────────────────────────────────┐      │
+│    │ Phase A: 计算 absmax = max(|x[0]|, |x[1]|, ..., |x[K-1]|) │      │
+│    │   → 树形归约 (shared memory)                                 │      │
+│    │ Phase B: input_scale = absmax / 127                          │      │
+│    │ Phase C: x_int8[i] = round(x_fp16[i] / input_scale)        │      │
+│    │   → 向量化 half2→int8 量化                                   │      │
+│    │ 输出: x_int8[K], input_scale (device 指针)                   │      │
+│    └──────────────────────────────────────────────────────────────┘      │
+│                           │                                              │
+│                           ▼                                              │
+│  Kernel 2: sq_fused_ffn_gemv_kernel                                      │
+│    ┌──────────────────────────────────────────────────────────────┐      │
+│    │ alpha_w1 = input_scale × w1_weight_scale                     │      │
+│    │ alpha_w3 = input_scale × w3_weight_scale                     │      │
+│    │                                                              │      │
+│    │ 对每行 row:                                                  │      │
+│    │   gate_int32 = Σ_k x_int8[k] × w1_int8[row,k]  (__dp4a)   │      │
+│    │   up_int32   = Σ_k x_int8[k] × w3_int8[row,k]  (__dp4a)   │      │
+│    │   gate_fp32  = alpha_w1 × gate_int32                        │      │
+│    │   up_fp32    = alpha_w3 × up_int32                          │      │
+│    │   Y[row]     = SiLU(gate_fp32) × up_fp32                   │      │
+│    └──────────────────────────────────────────────────────────────┘      │
+│                                                                         │
+│  输出: Y[hidden_dim] (FP16)                                             │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 7.3.3 SQ Fused FFN 的 Grid / Block / Thread 映射
+
+**Kernel 1: `sq_fused_quantize_kernel`**（Absmax + Quantize 融合）
+
+```cuda
+sq_fused_quantize_kernel<<<1, 256, 256 * sizeof(float), stream>>>(
+    input_fp16, g_workspace.input_int8,
+    1.0f, g_workspace.alpha, K);
+```
+
+| 参数 | 值 | 说明 |
+|------|-----|------|
+| Grid | **1 block** | 单 block 处理整个输入向量 |
+| Block | 256 threads | |
+| Shared Memory | $256 \times 4 = 1024$ bytes | 用于 absmax 树形归约 |
+
+```
+┌────────── sq_fused_quantize_kernel (1 block, 256 threads) ──────────┐
+│                                                                      │
+│  Phase A: Absmax 计算                                                │
+│    每个线程以步长 256×4 遍历输入，向量化加载 half2×2 (4 元素/次)       │
+│    thread i: local_max = max(|x[i*4]|, |x[i*4+1]|, ...) 跨越全 K   │
+│      → shared memory 树形归约 (8 步: 128→64→32→16→8→4→2→1)          │
+│      → sdata[0] = absmax                                            │
+│                                                                      │
+│  Phase B: 计算 scale（仅 thread 0）                                  │
+│    inv_scale = 127 / absmax                                          │
+│    input_scale = absmax / 127                                        │
+│    *d_alpha = input_scale × weight_scale                             │
+│                                                                      │
+│  Phase C: 向量化量化                                                  │
+│    每个线程每次量化 4 个元素: half2→float2→round→clamp→pack int8×4    │
+│    输出 int32（4 个 int8 packed）一次写入                              │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+**Kernel 2: `sq_fused_ffn_gemv_kernel`**（W1+W3 GEMV + SwiGLU 融合）
+
+```cuda
+int ffn_blocks = (hidden_dim + 7) / 8;
+sq_fused_ffn_gemv_kernel<<<ffn_blocks, 256, 0, stream>>>(...);
+```
+
+| 参数 | 值（Qwen3-8B） | 说明 |
+|------|----------------|------|
+| Grid | $\lceil 11008 / 8 \rceil = 1376$ blocks | 每 block 处理 8 个输出通道 |
+| Block | 256 threads（8 warps × 32 lanes） | `__launch_bounds__(256, 4)` |
+| Shared Memory | 0 bytes | Warp Shuffle 归约 |
+
+```
+┌──────────────────── GPU Grid: 1376 blocks ──────────────────────────┐
+│                                                                      │
+│  Block 0                Block 1               Block 1375             │
+│  ┌──────────────┐      ┌──────────────┐      ┌──────────────┐        │
+│  │ 8 warps      │      │ 8 warps      │      │ 8 warps      │        │
+│  │ rows 0-7     │      │ rows 8-15    │      │ rows 11000+  │        │
+│  └──────────────┘      └──────────────┘      └──────────────┘        │
+└──────────────────────────────────────────────────────────────────────┘
+
+┌──────────── Block b (256 threads = 8 warps) ─────────────────────┐
+│                                                                    │
+│  Warp 0 (lane 0-31) → row = b*8 + 0                              │
+│    INT32 累加器: acc_gate = 0, acc_up = 0                          │
+│                                                                    │
+│    主循环 (num_vec16 = K/16 次):                                   │
+│      lane i: int4 加载 (128-bit = 16 个 int8)                     │
+│        x = __ldg(input_i16 + i)     ← 16 个 int8 输入             │
+│        g = __ldg(w1_i16 + i)        ← 16 个 int8 W1 权重          │
+│        u = __ldg(w3_i16 + i)        ← 16 个 int8 W3 权重          │
+│                                                                    │
+│      __dp4a × 4: acc_gate += Σ(x[4j:4j+3] · g[4j:4j+3])         │
+│      __dp4a × 4: acc_up   += Σ(x[4j:4j+3] · u[4j:4j+3])         │
+│                                                                    │
+│    Warp Shuffle 归约 → lane 0                                      │
+│    lane 0:                                                         │
+│      gate = alpha_w1 × float(acc_gate)                             │
+│      up   = alpha_w3 × float(acc_up)                               │
+│      output[row] = __float2half(SiLU(gate) × up)                  │
+│                                                                    │
+│  Warp 1-7: 并行处理 rows b*8+1 .. b*8+7                           │
+└────────────────────────────────────────────────────────────────────┘
+```
+
+#### 7.3.4 SQ Fused Kernel 的关键技术：`__dp4a` INT8 点积
+
+`__dp4a(a, b, c)` 是 NVIDIA GPU 的 INT8 dot-product-accumulate 指令，单条指令计算 4 个 INT8 元素的点积并累加到 INT32：
+
+$$c' = c + \sum_{i=0}^{3} a_i \times b_i$$
+
+其中 $a_i, b_i$ 是 INT8（$a, b$ 的第 $i$ 个字节），$c, c'$ 是 INT32。
+
+在本 kernel 中，每次循环迭代加载 `int4`（128-bit = 16 个 int8），需要 4 次 `__dp4a` 覆盖全部 16 个元素：
+
+```
+int4 x  = {x.x, x.y, x.z, x.w}      ← 4 × int32 = 16 × int8
+int4 g  = {g.x, g.y, g.z, g.w}      ← 4 × int32 = 16 × int8
+
+acc = __dp4a(x.x, g.x, acc)   ← int8[0:3] · int8[0:3]
+acc = __dp4a(x.y, g.y, acc)   ← int8[4:7] · int8[4:7]
+acc = __dp4a(x.z, g.z, acc)   ← int8[8:11] · int8[8:11]
+acc = __dp4a(x.w, g.w, acc)   ← int8[12:15] · int8[12:15]
+```
+
+**同时做 gate + up 双点积**：每次加载的 `x` 值被两组 `__dp4a` 共享（一组用 `g` 权重，一组用 `u` 权重），$x$ 在寄存器中被复用。
+
+#### 7.3.5 SQ Fused FFN 的 Kernel Launch 对比
+
+```
+标准 SQ 路径（10 kernel launches）:
+  W1: [memset] [absmax] [quantize] [gemv]  = 4 kernels
+  W3: [memset] [absmax] [quantize] [gemv]  = 4 kernels
+  SwiGLU:                                   = 1 kernel
+  共 9 kernel launches + 中间 buffer 读写     （无 fused quantize 优化时为 9）
+
+SQ Fused 路径（2 kernel launches）:
+  [fused_quantize: absmax+quantize]  = 1 kernel  (量化一次，W1+W3 共享)
+  [fused_ffn_gemv: W1+W3+SwiGLU]    = 1 kernel
+  共 2 kernel launches
+
+节省: 7 kernel launches, 消除 2 次重复量化 + 中间 buffer
+```
+
+### 7.4 AWQ vs SQ Fused FFN 对比总览
+
+```
+┌────────────────────────────────── 对比图 ──────────────────────────────────┐
+│                                                                            │
+│  ◆ AWQ Fused FFN (1 kernel launch)                                        │
+│                                                                            │
+│  X[K] (FP16) ──→ awq_fused_gate_up_swiglu_kernel ──→ Y[N] (FP16)         │
+│                  ┌─── Phase 1: W1 dequant+GEMV ───┐                       │
+│                  │    LOP3(INT4→FP16) + FMA        │                       │
+│                  ├─── Phase 2: W3 dequant+GEMV ───┤                       │
+│                  │    LOP3(INT4→FP16) + FMA        │                       │
+│                  ├─── Phase 3: SiLU × up ──────────┤                       │
+│                  └─────────────────────────────────┘                       │
+│                                                                            │
+│  ◆ SQ Fused FFN (2 kernel launches)                                       │
+│                                                                            │
+│  X[K] (FP16)                                                               │
+│    │                                                                        │
+│    ▼ Kernel 1: sq_fused_quantize_kernel                                    │
+│  X_int8[K] + input_scale                                                   │
+│    │                                                                        │
+│    ▼ Kernel 2: sq_fused_ffn_gemv_kernel                                    │
+│  Y[N] (FP16)                                                               │
+│     ┌─── W1 INT8 GEMV (__dp4a) ───┐                                       │
+│     ├─── W3 INT8 GEMV (__dp4a) ───┤                                       │
+│     ├─── dequant (× alpha)────────┤                                       │
+│     └─── SiLU × up ──────────────┘                                        │
+└────────────────────────────────────────────────────────────────────────────┘
+```
+
+| 特性 | AWQ Fused | SQ Fused |
+|------|-----------|----------|
+| 权重精度 | INT4 (packed in INT32) | INT8 |
+| 输入精度 | FP16（直接使用） | FP16 → INT8（需要量化） |
+| Kernel Launch 数 | **1** | **2** |
+| 解包方式 | LOP3 位操作 | 不需要（INT8 直连） |
+| 点积指令 | `__hfma2`（FP16 FMA） | `__dp4a`（INT8 dot product） |
+| 累加器精度 | FP32（从 half2 提取后累加） | INT32 → FP32（最后转换） |
+| 向量化加载 | `uint4`（16B = 4×int32 = 32 个 INT4） | `int4`（16B = 16 个 INT8） |
+| 每 warp 输出 | 8 个通道（AWQ packed INT32） | 1 个通道（逐行） |
+| Group 量化 | 是（per-group scale + zero） | 否（per-tensor scale） |
+| SiLU 计算 | FP32 | FP32 |
+
+---
+
+## 8. qwen3_vl.cpp 工程中 Decode 阶段 Fused FFN 的支持
+
+### 8.1 架构特点：独立 Decode 循环
+
+Qwen3VLModel（Vision-Language 模型）**不继承 QwenBaseModel**，而是直接继承 `Model`，拥有独立的 decode 循环。因此它**不使用 `feed_forward_fused()` 虚函数分派机制**，而是在自己的 `feed_forward()` 方法中内联实现了 Fused FFN 逻辑。
+
+```
+Model
+  └─ Qwen3VLModel              ← 独立继承，自带 decode 循环
+       ├─ decode_step()         ← 普通 decode
+       ├─ decode_step_optimized()  ← 优化 decode（零拷贝）
+       └─ feed_forward()        ← 内部判断是否走 fused 路径
+```
+
+### 8.2 Decode 循环中的调用链
+
+VL 模型的 decode 有两条路径（CUDA Graph 捕获路径和普通路径），它们都调用相同的 layer 循环：
+
+```cpp
+// qwen3_vl.cpp 第 2370-2380 行 (decode_step)
+// 第 2430-2440 行 (decode_step_optimized 的 graph 捕获)
+// 第 2478-2485 行 (decode_step_optimized 的 normal 路径)
+for (int32_t layer_idx = 0; layer_idx < config_->layer_num_; ++layer_idx) {
+    attention_rms(layer_idx, decode_input);
+    attention_qkv(layer_idx, pos_tensor);         // VL: M-RoPE
+    attention_mha(layer_idx, pos_tensor);
+    feed_forward(layer_idx, decode_input);         // ← 直接调用，非虚分派
+}
+cls_logits(decode_input);
+```
+
+### 8.3 feed_forward() 的 Fused FFN 实现
+
+```cpp
+// qwen3_vl.cpp 第 1248-1310 行
+void Qwen3VLModel::feed_forward(int32_t layer_idx, const tensor::Tensor& input) const {
+  // ① 残差加: input += attn_output
+  qwen_layers_->add_layer_->forward(input, get_buffer(kAttnOutput), input);
+
+  // ② FFN RMSNorm
+  tensor::Tensor ffn_norm_output = get_buffer(kFFNRMSNorm);
+  ffn_rmsnorm->forward(input, ffn_norm_output);
+
+  // ③ Fused Gate+Up+SwiGLU 判断
+  tensor::Tensor w1_output = get_buffer(kW1Output);
+  auto w1_matmul = std::dynamic_pointer_cast<op::MatmulLayer>(w1_layer);
+  auto w3_matmul = std::dynamic_pointer_cast<op::MatmulLayer>(w3_layer);
+
+  if (w1_matmul && w3_matmul &&
+      ffn_norm_output.data_type() == base::DataType::kDataTypeFp16) {
+    // ★ Fused 路径：FP16 FusedFFNLayer (1 kernel launch)
+    const auto& w1_weight = w1_matmul->get_weight(0);
+    const auto& w3_weight = w3_matmul->get_weight(0);
+
+    auto fused_ffn = qwen_layers_->fused_ffn_layer_;
+    fused_ffn->set_use_fp16(true);            // VL 模型始终 FP16
+    fused_ffn->set_input(0, ffn_norm_output);
+    fused_ffn->set_input(1, w1_weight);
+    fused_ffn->set_input(2, w3_weight);
+    fused_ffn->set_output(0, w1_output);
+    fused_ffn->set_cuda_config(cuda_config_);
+    STATUS_CHECK(fused_ffn->forward());        // 调用 FP16 fused kernel
+  } else {
+    // Fallback 路径：W1 + W3 + SwiGLU (3 kernel launches)
+    w1_layer->forward(ffn_norm_output, w1_output);
+    w3_layer->forward(ffn_norm_output, w3_output);
+    swiglu_layer_->forward(w1_output, w3_output, w1_output);
+  }
+
+  // ④ W2 Down Projection
+  w2_layer->forward(w1_output, w2_output);
+
+  // ⑤ 残差加: input += w2_output
+  qwen_layers_->add_layer_->forward(input, w2_output, input);
+}
+```
+
+### 8.4 VL 模型与基类的 Fused FFN 差异
+
+| 特性 | QwenBaseModel (AWQ/SQ) | Qwen3VLModel |
+|------|------------------------|--------------|
+| Fused FFN 分派方式 | 虚函数 `gate_up_swiglu()` | `feed_forward()` 内联判断 |
+| 是否有 `feed_forward_fused()` | 有（独立方法） | 无（合并在 `feed_forward()` 内） |
+| `use_fused_ffn_` 开关 | 有（命令行 `--no-fused-ffn`） | 无（始终尝试 fused） |
+| 支持的量化格式 | FP16 / AWQ INT4 / SQ INT8 | **仅 FP16** |
+| Fused 条件 | `batch_size == 1` + 权重类型检查 | `data_type == FP16` + MatmulLayer 类型检查 |
+| FusedFFNLayer 创建 | `create_nonparam_layers()` | `create_nonparam_layers()` 同样创建 |
+| CUDA Graph 兼容 | 是 | 是（在 graph 捕获中同样调用 `feed_forward()`） |
+
+### 8.5 VL 模型 Fused FFN 的特殊考虑
+
+#### 8.5.1 始终 FP16
+
+VL 模型目前仅支持 FP16 精度（非量化），因此：
+- `fused_ffn->set_use_fp16(true)` 是硬编码的
+- 不需要 AWQ/SQ 的量化分支
+- 底层调用的是 `fused_gate_up_swiglu_kernel_cu_fp16()`，即本报告第 6 节详解的 warp-level FP16 fused kernel
+
+#### 8.5.2 Decode vs Prefill 的统一路径
+
+VL 模型的 `feed_forward()` **同时服务于 decode 和 prefill**：
+- **Decode（M=1）**：走 fused 路径（`fused_ffn->forward()`），GEMV 模式
+- **Prefill（M>1）**：由于 `fused_ffn_layer_` 内部仅支持 GEMV，当输入维度 > hidden_dim 时会自动检查或走 fallback
+
+但实际上 VL 模型的 prefill 使用的是 `batched_feed_forward_optimized()` 而非 `feed_forward()`，所以 `feed_forward()` 实际上只在 decode 阶段被调用。
+
+#### 8.5.3 CUDA Graph 集成
+
+VL 模型在 CUDA Graph 捕获期间也调用 `feed_forward()`：
+
+```cpp
+// decode_step 和 decode_step_optimized 的 graph 捕获路径:
+if (graph->begin_capture(cuda_config_->stream)) {
+    for (int32_t layer_idx = 0; layer_idx < config_->layer_num_; ++layer_idx) {
+        attention_rms(layer_idx, decode_input);
+        attention_qkv_with_graph(layer_idx, pos_tensor_gpu, kv_cache_pos_gpu);
+        attention_mha_with_graph(layer_idx, pos_tensor_gpu, kv_cache_pos_gpu);
+        feed_forward(layer_idx, decode_input);  // ← 在 graph 捕获中同样走 fused
+    }
+    cls_logits(decode_input);
+    graph->end_capture(cuda_config_->stream);
+}
+```
+
+所有 buffer（`kFFNRMSNorm`、`kW1Output`、`kW2Output`、`kAttnOutput`）均为预分配固定地址，确保 CUDA Graph 录制和回放的指针一致性。
+
+### 8.6 三种模型 Fused FFN 在 Decode 阶段的完整对比
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                     Decode 阶段 Fused FFN 对比                              │
+├──────────────┬─────────────────┬─────────────────┬──────────────────────────┤
+│              │ Qwen3AWQModel   │ Qwen3SQModel    │ Qwen3VLModel            │
+├──────────────┼─────────────────┼─────────────────┼──────────────────────────┤
+│ 权重精度      │ INT4 (AWQ)      │ INT8 (SQ)       │ FP16                    │
+│ 输入精度      │ FP16            │ FP16 → INT8     │ FP16                    │
+│ Fused Kernel │ awq_fused_gate_ │ sq_fused_ffn_cu │ fused_gate_up_swiglu_   │
+│   数量       │   1 kernel      │   2 kernels     │ kernel_cu_fp16: 1 kernel│
+│ 解包指令      │ LOP3 (INT4→FP16)│ 无（INT8 直连） │ 无（FP16 直连）          │
+│ 点积指令      │ __hfma2         │ __dp4a          │ fmaf (FP32)             │
+│ 累加器        │ float[8]        │ int32 → float   │ float ×4路 ILP          │
+│ 向量化        │ uint4 (16B)     │ int4 (16B)      │ float4 (16B = 8 half)   │
+│ Grid         │(N+63)/64 blocks │(N+7)/8 blocks   │(K+7)/8 blocks           │
+│ Block        │256 threads      │256 threads      │256 threads (8 warps)    │
+│ 每 warp 输出  │ 8 通道          │ 1 通道          │ 1 通道                   │
+│ Shared Mem   │ 0               │ 0               │ 0                        │
+│ 分派方式      │ 虚函数 override  │ 虚函数 override  │ feed_forward() 内联     │
+│ CUDA Graph   │ ✓               │ ✓               │ ✓                       │
+└──────────────┴─────────────────┴─────────────────┴──────────────────────────┘
+```
+
+### 8.7 总结：Fused FFN 在不同量化后端的设计哲学
+
+1. **FP16（VL 模型 / 基类）**：权重和激活都是 FP16，直接共享输入向量做双 GEMV + SwiGLU，**1 kernel launch**，使用 warp-level FP16 fused kernel（4 路 ILP + warp shuffle），是最简洁高效的实现。
+
+2. **AWQ INT4（qwen3_awq.cpp）**：权重是 INT4 packed，需要 LOP3 解包 + per-group dequant。Fused kernel 将解包、反量化、GEMV、SwiGLU 全部融合在 **1 kernel** 中，但每个 warp 分为 Phase 1（gate）和 Phase 2（up）串行执行，通过 X 的 L2 Cache 复用节省带宽。
+
+3. **SQ INT8（qwen3_sq.cpp）**：需要先将 FP16 输入量化为 INT8（absmax + quantize），然后才能做 INT8 GEMV。因此需要 **2 kernels**（fused quantize + fused GEMV+SwiGLU），但相比标准路径仍然节省了 7 次 kernel launch 和 2 次冗余量化操作。

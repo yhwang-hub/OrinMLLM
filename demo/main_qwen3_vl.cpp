@@ -86,6 +86,8 @@ struct VLInferenceConfig {
   bool stream_output = false;
   bool verbose = false;
   bool use_cuda_graph = false;
+  bool use_fused_rope_kv = false;
+  bool use_fused_gqa = false;
   base::AttentionType attention_type = base::AttentionType::kAttentionFlash1;
 };
 
@@ -99,6 +101,8 @@ void print_usage(const char* program_name) {
             << "                       Lower = faster ViT. Suggested: 1003520, 500000, 400000\n"
             << "  --stream             Enable streaming output\n"
             << "  --cuda-graph         Enable CUDA Graph for faster decode\n"
+            << "  --fused-rope-kv      Enable fused M-RoPE + KV Cache write kernel (with --cuda-graph)\n"
+            << "  --fused-gqa          Enable fused GQA + MRoPE + KV + Attention kernel (with --cuda-graph)\n"
             << "  --attention TYPE     Attention type: mha, flash1, flash2 (default: flash1)\n"
             << "  --verbose            Enable verbose logging\n"
             << "  -h, --help           Show this help message\n"
@@ -117,6 +121,8 @@ VLInferenceConfig parse_args(int argc, char* argv[]) {
     {"max-pixels", required_argument, 0, 'x'},
     {"stream", no_argument, 0, 's'},
     {"cuda-graph", no_argument, 0, 'g'},
+    {"fused-rope-kv", no_argument, 0, 'f'},
+    {"fused-gqa", no_argument, 0, 'F'},
     {"attention", required_argument, 0, 'a'},
     {"verbose", no_argument, 0, 'v'},
     {"help", no_argument, 0, 'h'},
@@ -126,7 +132,7 @@ VLInferenceConfig parse_args(int argc, char* argv[]) {
   int opt;
   int option_index = 0;
   
-  while ((opt = getopt_long(argc, argv, "i:p:m:x:a:sgvh", long_options, &option_index)) != -1) {
+  while ((opt = getopt_long(argc, argv, "i:p:m:x:a:sfFgvh", long_options, &option_index)) != -1) {
     switch (opt) {
       case 'i':
         config.image_path = optarg;
@@ -145,7 +151,14 @@ VLInferenceConfig parse_args(int argc, char* argv[]) {
         break;
       case 'g':
         config.use_cuda_graph = true;
-        break;      case 'a': {
+        break;
+      case 'f':
+        config.use_fused_rope_kv = true;
+        break;
+      case 'F':
+        config.use_fused_gqa = true;
+        break;
+      case 'a': {
         std::string attn_str = optarg;
         if (attn_str == "mha") {
           config.attention_type = base::AttentionType::kAttentionMHA;
@@ -229,6 +242,8 @@ int run_inference(const VLInferenceConfig& config) {
   LOG(INFO) << "Max tokens: " << config.max_tokens;
   LOG(INFO) << "Stream output: " << (config.stream_output ? "enabled" : "disabled");
   LOG(INFO) << "CUDA Graph: " << (config.use_cuda_graph ? "enabled" : "disabled");
+  LOG(INFO) << "Fused RoPE+KV: " << (config.use_fused_rope_kv ? "enabled" : "disabled");
+  LOG(INFO) << "Fused GQA: " << (config.use_fused_gqa ? "enabled" : "disabled");
   LOG(INFO) << "Attention: " << base::AttentionTypeName(config.attention_type);
   
   // Create model
@@ -251,6 +266,16 @@ int run_inference(const VLInferenceConfig& config) {
   if (config.use_cuda_graph) {
     model.enable_cuda_graph(true);
     LOG(INFO) << "CUDA Graph optimization enabled";
+  }
+
+  // Enable fused kernels based on flags
+  if (config.use_fused_gqa) {
+    model.enable_fused_gqa(true);
+    model.enable_fused_rope_kv(true);  // GQA implies RoPE+KV fusion
+    LOG(INFO) << "Fused GQA + MRoPE + KV Cache + Attention kernel enabled (multi-Q-per-block)";
+  } else if (config.use_fused_rope_kv) {
+    model.enable_fused_rope_kv(true);
+    LOG(INFO) << "Fused MRoPE + KV Cache write kernel enabled";
   }
   
   // Set attention type

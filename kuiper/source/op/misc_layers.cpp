@@ -8,6 +8,7 @@
 #include "kernels/cuda/rmsnorm_kernel.cuh"
 #include "kernels/cuda/kv_cache_kernel.cuh"
 #include "kernels/cuda/fused_kernels.cuh"
+#include "kernels/cuda/fused_rope_kv_kernel.cuh"
 
 namespace op {
 
@@ -354,6 +355,90 @@ base::Status FlashAttentionDecodeGpuPosLayer::forward(const int32_t* pos_gpu,
                                                    query, mha_output, key_cache, val_cache,
                                                    cuda_config_.get());
   }
+  return base::error::Success();
+}
+
+// ==================== FusedMRoPEKVWriteLayer ====================
+
+FusedMRoPEKVWriteLayer::FusedMRoPEKVWriteLayer(base::DeviceType device_type)
+    : Layer(device_type, LayerType::kLayerUnknown, "FusedMRoPEKVWrite") {
+  reset_input_size(7);  // query, key, value, key_cache, val_cache, sin_cache, cos_cache
+  reset_output_size(0);
+}
+
+base::Status FusedMRoPEKVWriteLayer::check() const {
+  return base::error::Success();
+}
+
+base::Status FusedMRoPEKVWriteLayer::forward() {
+  return base::error::InvalidArgument("Use forward(...) with parameters");
+}
+
+base::Status FusedMRoPEKVWriteLayer::forward(
+    const int32_t* rope_pos_gpu, const int32_t* kv_cache_pos_gpu,
+    const tensor::Tensor& query, const tensor::Tensor& key,
+    const tensor::Tensor& value,
+    const tensor::Tensor& key_cache, const tensor::Tensor& val_cache,
+    const tensor::Tensor& sin_cache, const tensor::Tensor& cos_cache,
+    int32_t dim, int32_t kv_dim, int32_t head_size,
+    int32_t section0, int32_t section1, int32_t section2,
+    int32_t layer_idx, int32_t seq_len) {
+  kernel::fused_mrope_kv_write_fp16(
+      rope_pos_gpu, kv_cache_pos_gpu,
+      reinterpret_cast<half*>(const_cast<uint16_t*>(query.ptr<uint16_t>())),
+      reinterpret_cast<const half*>(key.ptr<uint16_t>()),
+      reinterpret_cast<const half*>(value.ptr<uint16_t>()),
+      reinterpret_cast<half*>(const_cast<uint16_t*>(key_cache.ptr<uint16_t>())),
+      reinterpret_cast<half*>(const_cast<uint16_t*>(val_cache.ptr<uint16_t>())),
+      sin_cache.ptr<float>(),
+      cos_cache.ptr<float>(),
+      dim, kv_dim, head_size,
+      section0, section1, section2,
+      layer_idx, seq_len,
+      cuda_config_ ? cuda_config_->stream : nullptr);
+  return base::error::Success();
+}
+
+// ==================== FusedGQAMRoPEKVDecodeLayer ====================
+
+FusedGQAMRoPEKVDecodeLayer::FusedGQAMRoPEKVDecodeLayer(base::DeviceType device_type)
+    : Layer(device_type, LayerType::kLayerUnknown, "FusedGQAMRoPEKVDecode") {
+  reset_input_size(8);
+  reset_output_size(1);
+}
+
+base::Status FusedGQAMRoPEKVDecodeLayer::check() const {
+  return base::error::Success();
+}
+
+base::Status FusedGQAMRoPEKVDecodeLayer::forward() {
+  return base::error::InvalidArgument("Use forward(...) with parameters");
+}
+
+base::Status FusedGQAMRoPEKVDecodeLayer::forward(
+    const int32_t* rope_pos_gpu, const int32_t* kv_cache_pos_gpu,
+    const tensor::Tensor& query, const tensor::Tensor& key,
+    const tensor::Tensor& value,
+    const tensor::Tensor& key_cache, const tensor::Tensor& val_cache,
+    const tensor::Tensor& output,
+    const tensor::Tensor& sin_cache, const tensor::Tensor& cos_cache,
+    int32_t dim, int32_t kv_dim, int32_t head_size,
+    int32_t section0, int32_t section1, int32_t section2,
+    int32_t layer_idx, int32_t max_seq_len) {
+  kernel::fused_gqa_mrope_kv_decode_fp16(
+      rope_pos_gpu, kv_cache_pos_gpu,
+      reinterpret_cast<const half*>(query.ptr<uint16_t>()),
+      reinterpret_cast<const half*>(key.ptr<uint16_t>()),
+      reinterpret_cast<const half*>(value.ptr<uint16_t>()),
+      reinterpret_cast<half*>(const_cast<uint16_t*>(key_cache.ptr<uint16_t>())),
+      reinterpret_cast<half*>(const_cast<uint16_t*>(val_cache.ptr<uint16_t>())),
+      reinterpret_cast<half*>(const_cast<uint16_t*>(output.ptr<uint16_t>())),
+      sin_cache.ptr<float>(),
+      cos_cache.ptr<float>(),
+      dim, kv_dim, head_size,
+      section0, section1, section2,
+      layer_idx, max_seq_len,
+      cuda_config_ ? cuda_config_->stream : nullptr);
   return base::error::Success();
 }
 

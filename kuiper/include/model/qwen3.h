@@ -31,6 +31,12 @@ struct Qwen3Layers : public QwenBaseLayers {
   std::shared_ptr<op::RMSNormDimLayer> rmsnorm_dim_layer_;
   std::shared_ptr<op::CopyToKVCacheLayer> copy_to_kv_cache_layer_;
   std::shared_ptr<op::FlashAttentionDecodeGpuPosLayer> flash_attention_decode_gpu_pos_layer_;
+  
+  // Fused M-RoPE + KV Cache Write layer for GQA decode optimization
+  std::shared_ptr<op::FusedMRoPEKVWriteLayer> fused_mrope_kv_write_layer_;
+
+  // Fused GQA + M-RoPE + KV Cache Read/Write + Attention layer for decode
+  std::shared_ptr<op::FusedGQAMRoPEKVDecodeLayer> fused_gqa_mrope_kv_decode_layer_;
 
   void to_cuda(std::shared_ptr<kernel::CudaConfig> config, bool keep_fp16_weights = true);
 };

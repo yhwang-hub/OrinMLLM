@@ -918,6 +918,14 @@ void Qwen3VLModel::create_vl_nonparam_layers() {
   
   qwen_layers_->flash_attention_decode_gpu_pos_layer_ = std::make_shared<op::FlashAttentionDecodeGpuPosLayer>(device_type_);
   qwen_layers_->flash_attention_decode_gpu_pos_layer_->set_cuda_config(cuda_config_);
+  
+  // Fused M-RoPE + KV Cache Write layer for decode optimization
+  qwen_layers_->fused_mrope_kv_write_layer_ = std::make_shared<op::FusedMRoPEKVWriteLayer>(device_type_);
+  qwen_layers_->fused_mrope_kv_write_layer_->set_cuda_config(cuda_config_);
+
+  // Fused GQA + M-RoPE + KV Cache Read/Write + Attention layer for decode
+  qwen_layers_->fused_gqa_mrope_kv_decode_layer_ = std::make_shared<op::FusedGQAMRoPEKVDecodeLayer>(device_type_);
+  qwen_layers_->fused_gqa_mrope_kv_decode_layer_->set_cuda_config(cuda_config_);
 }
 
 void Qwen3VLModel::create_vision_nonparam_layers() {
@@ -1124,36 +1132,51 @@ void Qwen3VLModel::attention_qkv_with_graph(int32_t layer_idx,
   key_norm->forward(temp_key, temp_key);
   temp_key.reshape({(int32_t)temp_key.size()});
 
-  // M-RoPE with GPU pos for CUDA Graph compatibility (decode phase uses same pos for t/h/w)
+  // M-RoPE + KV Cache Write
   const auto& section = vl_config_.text.mrope_section;
-  qwen_layers_->mrope_gpu_pos_layer_->forward(
-      rope_pos_gpu.ptr<int32_t>(),  // Use M-RoPE text position
-      config_->dim_, config_->kv_dim_, config_->head_size_,
-      section[0], section[1], section[2],
-      query, temp_key,
-      get_buffer(ModelBufferType::kSinCache),
-      get_buffer(ModelBufferType::kCosCache));
-  
-  // Copy temp_key and temp_value to KV cache at correct position
   tensor::Tensor key_cache = get_buffer(ModelBufferType::kKeyCache);
   tensor::Tensor val_cache = get_buffer(ModelBufferType::kValueCache);
-  
-  qwen_layers_->copy_to_kv_cache_layer_->forward(
-      key_cache, temp_key,
-      kv_cache_pos_gpu.ptr<int32_t>(),  // Use KV cache position
-      config_->kv_dim_,
-      layer_idx,
-      config_->seq_len_);
-      
-  qwen_layers_->copy_to_kv_cache_layer_->forward(
-      val_cache, temp_value,
-      kv_cache_pos_gpu.ptr<int32_t>(),  // Use KV cache position
-      config_->kv_dim_,
-      layer_idx,
-      config_->seq_len_);
+
+  if (use_fused_gqa_) {
+    // GQA fused path: MRoPE + KV write + attention are all done in attention_mha_with_graph
+    // Skip MRoPE and KV write here — just leave Q, K, V post-norm for the fused kernel
+  } else if (use_fused_rope_kv_) {
+    // Fused path: 1 kernel launch (M-RoPE(Q) + M-RoPE(K)→cache + V→cache)
+    qwen_layers_->fused_mrope_kv_write_layer_->forward(
+        rope_pos_gpu.ptr<int32_t>(),       // M-RoPE text position (GPU)
+        kv_cache_pos_gpu.ptr<int32_t>(),   // KV cache write position (GPU)
+        query, temp_key, temp_value,
+        key_cache, val_cache,
+        get_buffer(ModelBufferType::kSinCache),
+        get_buffer(ModelBufferType::kCosCache),
+        config_->dim_, config_->kv_dim_, config_->head_size_,
+        section[0], section[1], section[2],
+        layer_idx, config_->seq_len_);
+  } else {
+    // Non-fused path: 3 separate kernel launches
+    qwen_layers_->mrope_gpu_pos_layer_->forward(
+        rope_pos_gpu.ptr<int32_t>(),
+        config_->dim_, config_->kv_dim_, config_->head_size_,
+        section[0], section[1], section[2],
+        query, temp_key,
+        get_buffer(ModelBufferType::kSinCache),
+        get_buffer(ModelBufferType::kCosCache));
+
+    qwen_layers_->copy_to_kv_cache_layer_->forward(
+        key_cache, temp_key,
+        kv_cache_pos_gpu.ptr<int32_t>(),
+        config_->kv_dim_, layer_idx, config_->seq_len_);
+
+    qwen_layers_->copy_to_kv_cache_layer_->forward(
+        val_cache, temp_value,
+        kv_cache_pos_gpu.ptr<int32_t>(),
+        config_->kv_dim_, layer_idx, config_->seq_len_);
+  }
 }
 
-void Qwen3VLModel::attention_mha_with_graph(int32_t layer_idx, const tensor::Tensor& pos_tensor_gpu) const {
+void Qwen3VLModel::attention_mha_with_graph(int32_t layer_idx, 
+                                             const tensor::Tensor& rope_pos_gpu,
+                                             const tensor::Tensor& kv_cache_pos_gpu) const {
   CHECK(qwen_layers_ != nullptr);
   CHECK(cuda_config_ != nullptr);
   
@@ -1162,12 +1185,29 @@ void Qwen3VLModel::attention_mha_with_graph(int32_t layer_idx, const tensor::Ten
   tensor::Tensor mha_output = get_buffer(ModelBufferType::kOutputMHA);
   tensor::Tensor query = this->get_buffer(ModelBufferType::kQuery);
   
-  // FP16 data always uses Flash Attention (MHA does not support FP16)
-  if (query.data_type() == base::DataType::kDataTypeFp16 &&
+  // Fused GQA path: MRoPE + KV write + Attention in ONE kernel
+  if (use_fused_gqa_ && query.data_type() == base::DataType::kDataTypeFp16 &&
       key_cache.data_type() == base::DataType::kDataTypeFp16) {
-    // Use GPU pos version for CUDA Graph compatibility with FP16
+    tensor::Tensor temp_key = this->get_buffer(ModelBufferType::kTempKey);
+    tensor::Tensor temp_value = this->get_buffer(ModelBufferType::kTempValue);
+    const auto& section = vl_config_.text.mrope_section;
+
+    qwen_layers_->fused_gqa_mrope_kv_decode_layer_->forward(
+        rope_pos_gpu.ptr<int32_t>(),
+        kv_cache_pos_gpu.ptr<int32_t>(),
+        query, temp_key, temp_value,
+        key_cache, val_cache,
+        mha_output,
+        get_buffer(ModelBufferType::kSinCache),
+        get_buffer(ModelBufferType::kCosCache),
+        config_->dim_, config_->kv_dim_, config_->head_size_,
+        section[0], section[1], section[2],
+        layer_idx, config_->seq_len_);
+  } else if (query.data_type() == base::DataType::kDataTypeFp16 &&
+      key_cache.data_type() == base::DataType::kDataTypeFp16) {
+    // FP16: Use GPU pos version for CUDA Graph compatibility
     qwen_layers_->flash_attention_decode_gpu_pos_layer_->forward(
-        pos_tensor_gpu.ptr<int32_t>(),  // GPU memory pointer
+        kv_cache_pos_gpu.ptr<int32_t>(),  // GPU memory pointer
         config_->head_num_, config_->kv_head_num_,
         config_->head_size_, config_->kv_mul_, layer_idx,
         config_->seq_len_, config_->kv_dim_,
@@ -1176,7 +1216,7 @@ void Qwen3VLModel::attention_mha_with_graph(int32_t layer_idx, const tensor::Ten
     // Standard FP32 MHA path with GPU pos
     tensor::Tensor score_storage = get_buffer(ModelBufferType::kScoreStorage);
     qwen_layers_->mha_gpu_pos_layer_->forward(
-        pos_tensor_gpu.ptr<int32_t>(),
+        kv_cache_pos_gpu.ptr<int32_t>(),
         config_->head_num_,
         layer_idx,
         config_->seq_len_,
@@ -1191,7 +1231,7 @@ void Qwen3VLModel::attention_mha_with_graph(int32_t layer_idx, const tensor::Ten
   } else {
     // FP32 Flash Attention path with GPU pos (FA1 or FA2)
     qwen_layers_->flash_attention_decode_gpu_pos_layer_->forward(
-        pos_tensor_gpu.ptr<int32_t>(),
+        kv_cache_pos_gpu.ptr<int32_t>(),
         config_->head_num_, config_->kv_head_num_,
         config_->head_size_, config_->kv_mul_, layer_idx,
         config_->seq_len_, config_->kv_dim_,
@@ -2274,7 +2314,7 @@ base::Status Qwen3VLModel::decode_step(const tensor::Tensor& input,
         for (int32_t layer_idx = 0; layer_idx < config_->layer_num_; ++layer_idx) {
           attention_rms(layer_idx, decode_input);
           attention_qkv_with_graph(layer_idx, pos_tensor_gpu, kv_cache_pos_gpu);
-          attention_mha_with_graph(layer_idx, kv_cache_pos_gpu);
+          attention_mha_with_graph(layer_idx, pos_tensor_gpu, kv_cache_pos_gpu);
           feed_forward(layer_idx, decode_input);
         }
         cls_logits(decode_input);
@@ -2391,7 +2431,7 @@ base::Status Qwen3VLModel::decode_step_optimized(int32_t pos, int& next) const {
         for (int32_t layer_idx = 0; layer_idx < config_->layer_num_; ++layer_idx) {
           attention_rms(layer_idx, decode_input);
           attention_qkv_with_graph(layer_idx, pos_tensor_gpu, kv_cache_pos_gpu);
-          attention_mha_with_graph(layer_idx, kv_cache_pos_gpu);
+          attention_mha_with_graph(layer_idx, pos_tensor_gpu, kv_cache_pos_gpu);
           feed_forward(layer_idx, decode_input);
         }
         cls_logits(decode_input);

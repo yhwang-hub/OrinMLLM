@@ -315,6 +315,14 @@ public:
   void enable_cuda_graph(bool enable);
   bool is_cuda_graph_enabled() const;
   void invalidate_cuda_graph();
+
+  // Fused M-RoPE + KV Cache write kernel control
+  void enable_fused_rope_kv(bool enable) { use_fused_rope_kv_ = enable; }
+  bool is_fused_rope_kv_enabled() const { return use_fused_rope_kv_; }
+  
+  // Fused GQA + M-RoPE + KV Cache Read/Write + Attention kernel control
+  void enable_fused_gqa(bool enable) { use_fused_gqa_ = enable; }
+  bool is_fused_gqa_enabled() const { return use_fused_gqa_; }
   
   // Clear KV cache
   void clear_kv_cache();
@@ -378,7 +386,9 @@ private:
   void attention_qkv_with_graph(int32_t layer_idx, 
                                  const tensor::Tensor& rope_pos_gpu,
                                  const tensor::Tensor& kv_cache_pos_gpu) const;
-  void attention_mha_with_graph(int32_t layer_idx, const tensor::Tensor& kv_cache_pos_gpu) const;
+  void attention_mha_with_graph(int32_t layer_idx, 
+                                 const tensor::Tensor& rope_pos_gpu,
+                                 const tensor::Tensor& kv_cache_pos_gpu) const;
   
   // Batched operations for prefill
   void batched_attention_rms(int32_t layer_idx, const tensor::Tensor& input, 
@@ -461,6 +471,10 @@ private:
   void* vl_model_data_ = nullptr;
   size_t vl_model_file_size_ = 0;
   int vl_model_fd_ = -1;
+
+  // Fused M-RoPE + KV Cache write optimization flag
+  bool use_fused_rope_kv_ = false;
+  bool use_fused_gqa_ = false;
 };
 
 /**

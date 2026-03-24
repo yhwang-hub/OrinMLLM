@@ -201,5 +201,106 @@ class FlashAttentionDecodeGpuPosLayer : public Layer {
   base::AttentionType attention_type_ = base::AttentionType::kAttentionFlash1;
 };
 
+/**
+ * @brief FusedMRoPEKVWriteLayer: Fused M-RoPE + KV Cache Write for GQA decode
+ *
+ * Fuses three separate kernel launches into one:
+ *   1. Apply M-RoPE to Q (in-place)
+ *   2. Apply M-RoPE to K → write directly to key_cache
+ *   3. Copy V → write directly to val_cache
+ *
+ * This reduces kernel launch overhead and global memory traffic.
+ * Only used in decode phase where positions are GPU-resident (CUDA Graph compatible).
+ */
+class FusedMRoPEKVWriteLayer : public Layer {
+ public:
+  explicit FusedMRoPEKVWriteLayer(base::DeviceType device_type);
+
+  base::Status check() const override;
+  base::Status forward() override;
+
+  /**
+   * @brief Execute fused M-RoPE + KV cache write
+   *
+   * @param rope_pos_gpu    GPU pointer to M-RoPE text position
+   * @param kv_cache_pos_gpu GPU pointer to KV cache write position
+   * @param query           Q tensor [dim] (FP16, in-place RoPE)
+   * @param key             K tensor [kv_dim] (FP16, input only)
+   * @param value           V tensor [kv_dim] (FP16, input only)
+   * @param key_cache       Key cache [layer_num, seq_len, kv_dim] (FP16)
+   * @param val_cache       Value cache [layer_num, seq_len, kv_dim] (FP16)
+   * @param sin_cache       Sin cache (FP32)
+   * @param cos_cache       Cos cache (FP32)
+   * @param dim             Q total dimension
+   * @param kv_dim          KV total dimension
+   * @param head_size       Per-head dimension
+   * @param section0        M-RoPE temporal section pairs
+   * @param section1        M-RoPE height section pairs
+   * @param section2        M-RoPE width section pairs
+   * @param layer_idx       Current layer index
+   * @param seq_len         Max sequence length
+   */
+  base::Status forward(const int32_t* rope_pos_gpu, const int32_t* kv_cache_pos_gpu,
+                       const tensor::Tensor& query, const tensor::Tensor& key,
+                       const tensor::Tensor& value,
+                       const tensor::Tensor& key_cache, const tensor::Tensor& val_cache,
+                       const tensor::Tensor& sin_cache, const tensor::Tensor& cos_cache,
+                       int32_t dim, int32_t kv_dim, int32_t head_size,
+                       int32_t section0, int32_t section1, int32_t section2,
+                       int32_t layer_idx, int32_t seq_len);
+};
+
+/**
+ * @brief FusedGQAMRoPEKVDecodeLayer: Fused GQA + M-RoPE + KV Cache Read/Write for decode
+ *
+ * Fuses five operations into a single kernel launch:
+ *   1. Apply M-RoPE to Q (stays in shared memory)
+ *   2. Apply M-RoPE to K for current token
+ *   3. Write K/V to KV cache
+ *   4. GQA Flash Attention decode (Q·K + softmax + V accumulation)
+ *   5. Write attention output
+ *
+ * Replaces the separate fused_mrope_kv_write + flash_attention_decode kernels.
+ */
+class FusedGQAMRoPEKVDecodeLayer : public Layer {
+ public:
+  explicit FusedGQAMRoPEKVDecodeLayer(base::DeviceType device_type);
+
+  base::Status check() const override;
+  base::Status forward() override;
+
+  /**
+   * @brief Execute fused GQA + M-RoPE + KV cache + attention decode
+   *
+   * @param rope_pos_gpu    GPU pointer to M-RoPE text position
+   * @param kv_cache_pos_gpu GPU pointer to KV cache write position
+   * @param query           Q tensor [dim] (FP16, read-only)
+   * @param key             K tensor [kv_dim] (FP16, read-only)
+   * @param value           V tensor [kv_dim] (FP16, read-only)
+   * @param key_cache       Key cache [layer_num, seq_len, kv_dim] (FP16)
+   * @param val_cache       Value cache [layer_num, seq_len, kv_dim] (FP16)
+   * @param output          Attention output [dim] (FP16)
+   * @param sin_cache       Sin cache (FP32)
+   * @param cos_cache       Cos cache (FP32)
+   * @param dim             Q total dimension
+   * @param kv_dim          KV total dimension
+   * @param head_size       Per-head dimension
+   * @param section0        M-RoPE temporal section pairs
+   * @param section1        M-RoPE height section pairs
+   * @param section2        M-RoPE width section pairs
+   * @param layer_idx       Current layer index
+   * @param max_seq_len     Maximum sequence length
+   */
+  base::Status forward(const int32_t* rope_pos_gpu, const int32_t* kv_cache_pos_gpu,
+                       const tensor::Tensor& query, const tensor::Tensor& key,
+                       const tensor::Tensor& value,
+                       const tensor::Tensor& key_cache, const tensor::Tensor& val_cache,
+                       const tensor::Tensor& output,
+                       const tensor::Tensor& sin_cache, const tensor::Tensor& cos_cache,
+                       int32_t dim, int32_t kv_dim, int32_t head_size,
+                       int32_t section0, int32_t section1, int32_t section2,
+                       int32_t layer_idx, int32_t max_seq_len);
+};
+
 }  // namespace op
 #endif  // KUIPER_INCLUDE_OP_MISC_LAYERS_H_
