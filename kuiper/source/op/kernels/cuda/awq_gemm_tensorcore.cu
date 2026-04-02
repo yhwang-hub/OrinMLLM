@@ -2,7 +2,7 @@
  * AWQ Optimized GEMM/GEMV for KuiperLLama
  * 
  * High-performance INT4 quantized GEMM/GEMV dispatch:
- * - M=1 (decode): awq_gemm_fast_cu (fused GEMV, bandwidth-optimized)
+ * - M=1 (decode): awq_gemv_coalesced_cu (coalesced GEMV, bandwidth-optimized)
  * - M>1 (prefill): awq_gemm_vllm_cu (Tensor Core MMA with LOP3 dequant)
  * 
  * AWQ uses a specific bit packing order that is NOT sequential.
@@ -60,19 +60,11 @@ void awq_gemm_tensorcore_cu(
     ensure_initialized();
     
     if (M == 1) {
-        if (qweight_t) {
-            // Coalesced GEMV with transposed qweight layout
-            awq_gemv_coalesced_cu(
-                input, qweight_t, qzeros, scales, output,
-                in_features, out_features, group_size, stream
-            );
-        } else {
-            // Fallback: original non-coalesced GEMV
-            awq_gemm_fast_cu(
-                input, qweight, qzeros, scales, output,
-                M, in_features, out_features, group_size, stream
-            );
-        }
+        // Coalesced GEMV with transposed qweight layout
+        awq_gemv_coalesced_cu(
+            input, qweight_t, qzeros, scales, output,
+            in_features, out_features, group_size, stream
+        );
     } else {
         // Prefill: use Tensor Core MMA kernel with fused LOP3 dequant
         awq_gemm_vllm_cu(

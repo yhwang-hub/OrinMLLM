@@ -262,23 +262,10 @@ public:
       const ImageData* image_data = nullptr) const;
   
   /**
-   * @brief Prefill with multimodal input
-   * @param tokens Input token ids
-   * @param image_path Path to image (optional)
-   */
-  base::Status multimodal_prefill(const std::vector<int>& tokens,
-                                   const std::string& image_path = "") const;
-  
-  /**
    * @brief Prefill phase with embeddings
    */
   base::Status prefill(const tensor::Tensor& input_embeddings, 
                        int32_t seq_len, int32_t start_pos) const;
-  
-  /**
-   * @brief Single-token decode step
-   */
-  base::Status decode_step(const tensor::Tensor& input, int32_t pos, int& next) const;
   
   /**
    * @brief Optimized decode step that assumes embedding is already in decode_input buffer
@@ -298,13 +285,6 @@ public:
    */
   int sample_first_token() const;
   
-  /**
-   * @brief Generate response for image + text input
-   */
-  std::string generate(const std::string& image_path,
-                       const std::string& prompt,
-                       int max_tokens = 256) const;
-  
   // Configuration access
   const Qwen3VLConfig& get_vl_config() const { return vl_config_; }
   
@@ -315,14 +295,6 @@ public:
   void enable_cuda_graph(bool enable);
   bool is_cuda_graph_enabled() const;
   void invalidate_cuda_graph();
-
-  // Fused M-RoPE + KV Cache write kernel control
-  void enable_fused_rope_kv(bool enable) { use_fused_rope_kv_ = enable; }
-  bool is_fused_rope_kv_enabled() const { return use_fused_rope_kv_; }
-  
-  // Fused GQA + M-RoPE + KV Cache Read/Write + Attention kernel control
-  void enable_fused_gqa(bool enable) { use_fused_gqa_ = enable; }
-  bool is_fused_gqa_enabled() const { return use_fused_gqa_; }
   
   // Clear KV cache
   void clear_kv_cache();
@@ -400,7 +372,6 @@ private:
   void batched_attention_mha(int32_t layer_idx, const tensor::Tensor& query,
                              tensor::Tensor& mha_out, int32_t seq_len, int32_t start_pos,
                              half* score_buf, half** d_ptr_buf) const;
-  void batched_feed_forward(int32_t layer_idx, const tensor::Tensor& input, int32_t seq_len) const;
   void batched_feed_forward_optimized(int32_t layer_idx, const tensor::Tensor& input,
                                       tensor::Tensor& ffn_norm_out,
                                       tensor::Tensor& w1_out, tensor::Tensor& w3_out,
@@ -420,9 +391,6 @@ private:
   
   // Vision operation layers (wrapping kernel calls as layer->forward())
   mutable VisionVLLayers vision_vl_layers_;
-  
-  // Intermediate buffers for vision encoder
-  mutable std::vector<tensor::Tensor> vision_buffers_;
   
   // Pre-allocated workspace for vision transformer blocks
   mutable std::unique_ptr<VisionWorkspace> vision_workspace_;
@@ -460,9 +428,6 @@ private:
   // Prefill sequence length (for decode position calculation)
   mutable int prefill_seq_len_ = 0;
   
-  // Cached image data for repeated use
-  mutable ImageData cached_image_data_;
-  
   // Pre-allocated GPU pixel buffer for fused resize kernel (avoids cudaMalloc per image)
   mutable unsigned char* pixel_buf_gpu_ = nullptr;
   mutable size_t pixel_buf_gpu_capacity_ = 0;
@@ -471,10 +436,6 @@ private:
   void* vl_model_data_ = nullptr;
   size_t vl_model_file_size_ = 0;
   int vl_model_fd_ = -1;
-
-  // Fused M-RoPE + KV Cache write optimization flag
-  bool use_fused_rope_kv_ = false;
-  bool use_fused_gqa_ = false;
 };
 
 /**

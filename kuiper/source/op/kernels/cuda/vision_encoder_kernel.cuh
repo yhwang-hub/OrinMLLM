@@ -57,25 +57,6 @@ void layernorm_with_bias_cu(
     cudaStream_t stream);
 
 // ============================================================================
-// GELU Activation
-// ============================================================================
-
-/**
- * @brief GELU activation (approximate, tanh version)
- * 
- * GELU(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
- */
-__global__ void gelu_fp16_kernel(
-    const half* __restrict__ input,
-    half* __restrict__ output,
-    int size);
-
-void gelu_cu(
-    const tensor::Tensor& input,
-    tensor::Tensor& output,
-    cudaStream_t stream);
-
-// ============================================================================
 // Fused Bias + Add Residual
 // ============================================================================
 
@@ -206,15 +187,6 @@ void fused_split_rope_transpose_cu(
  * 
  * The patches are reordered to group 2x2 spatial neighbors together.
  */
-__global__ void spatial_merge_fp16_kernel(
-    const half* __restrict__ input,
-    half* __restrict__ output,
-    int grid_t,
-    int grid_h,
-    int grid_w,
-    int hidden_size,
-    int spatial_merge_size);
-
 void spatial_merge_cu(
     const tensor::Tensor& input,
     tensor::Tensor& output,
@@ -265,41 +237,6 @@ void vision_merger_mlp_cu(
     tensor::Tensor& output,
     tensor::Tensor& intermediate,
     const kernel::CudaConfig* config);
-
-// ============================================================================
-// Vision Rotary Embedding (GPU-computed)
-// ============================================================================
-
-/**
- * @brief Compute vision rotary position embeddings entirely on GPU
- * 
- * Replaces CPU computation + H2D copy with a single GPU kernel.
- * Computes cos/sin for each token in spatial merge order.
- * 
- * Layout: [h_freq(18), w_freq(18), h_freq(18), w_freq(18)] = 72 dims
- * 
- * @param cos_cache Output cos cache [num_tokens, head_dim]
- * @param sin_cache Output sin cache [num_tokens, head_dim]
- * @param num_tokens Total tokens (grid_t * grid_h * grid_w)
- * @param grid_h Grid height
- * @param grid_w Grid width
- * @param grid_t Grid temporal dimension
- * @param merge_size Spatial merge size (2)
- * @param head_dim Head dimension (72)
- * @param theta Rotary embedding base frequency (10000.0)
- * @param stream CUDA stream
- */
-void vision_rotary_emb_cu(
-    half* cos_cache,
-    half* sin_cache,
-    int num_tokens,
-    int grid_h,
-    int grid_w,
-    int grid_t,
-    int merge_size,
-    int head_dim,
-    float theta,
-    cudaStream_t stream);
 
 }  // namespace kernel
 

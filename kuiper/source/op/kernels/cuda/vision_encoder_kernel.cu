@@ -26,10 +26,6 @@ __device__ __forceinline__ float gelu_approx(float x) {
   return 0.5f * x * (1.0f + tanhf(inner));
 }
 
-__device__ __forceinline__ half gelu_approx_fp16(half x) {
-  return __float2half(gelu_approx(__half2float(x)));
-}
-
 // ============================================================================
 // LayerNorm with Bias Implementation
 // ============================================================================
@@ -296,53 +292,6 @@ void bias_gelu_cu(
 }
 
 // ============================================================================
-// GELU Activation Implementation
-// ============================================================================
-
-__global__ void gelu_fp16_kernel(
-    const half* __restrict__ input,
-    half* __restrict__ output,
-    int size) {
-  
-  // Optimized: process 8 elements per thread using float4 loads/stores
-  const int VEC = 8;
-  int base_idx = (blockIdx.x * blockDim.x + threadIdx.x) * VEC;
-  
-  if (base_idx + VEC <= size) {
-    float4 in_data = *reinterpret_cast<const float4*>(&input[base_idx]);
-    const half* in_h = reinterpret_cast<const half*>(&in_data);
-    
-    half result[8];
-    #pragma unroll
-    for (int i = 0; i < 8; i++) {
-      result[i] = __float2half(gelu_approx(__half2float(in_h[i])));
-    }
-    
-    *reinterpret_cast<float4*>(&output[base_idx]) = *reinterpret_cast<const float4*>(result);
-  } else {
-    for (int i = base_idx; i < size; i++) {
-      output[i] = gelu_approx_fp16(input[i]);
-    }
-  }
-}
-
-void gelu_cu(
-    const tensor::Tensor& input,
-    tensor::Tensor& output,
-    cudaStream_t stream) {
-  
-  int size = static_cast<int>(input.size());
-  int block_size = 256;
-  int num_vecs = (size + 7) / 8;
-  int grid_size = (num_vecs + block_size - 1) / block_size;
-  
-  gelu_fp16_kernel<<<grid_size, block_size, 0, stream>>>(
-      input.ptr<half>(),
-      output.ptr<half>(),
-      size);
-}
-
-// ============================================================================
 // Bias Add with Residual Connection
 // ============================================================================
 
@@ -591,7 +540,6 @@ void spatial_merge_cu(
     int spatial_merge_size,
     cudaStream_t stream) {
   
-  int merge_area = spatial_merge_size * spatial_merge_size;  // 4
   int num_patches = input.get_dim(0);  // grid_t * grid_h * grid_w
   
   // The data is contiguous: input[0..num_patches-1] maps directly to
@@ -1099,126 +1047,6 @@ void vision_attention_pretransposed_cu(
   
   transpose_head_token_kernel<<<trans_grid, trans_block, 0, stream>>>(
       out_transposed.ptr<half>(), output.ptr<half>(), num_tokens, num_heads, head_dim);
-}
-
-// ============================================================================
-// Vision Rotary Embedding CUDA Kernel
-// ============================================================================
-
-/**
- * Compute vision rotary position embeddings entirely on GPU.
- * 
- * For each token in spatial merge order, computes:
- *   cos_cache[token, :] = cos(freq for h and w positions)
- *   sin_cache[token, :] = sin(freq for h and w positions)
- * 
- * Layout: [h_freq(18), w_freq(18), h_freq(18), w_freq(18)] = 72 dims
- * 
- * Grid: (num_tokens)
- * Block: (head_dim/2 = 36) or 64 threads (each handles one pair of cos/sin output positions)
- */
-__global__ void vision_rotary_emb_kernel(
-    half* __restrict__ cos_cache,    // [num_tokens, head_dim]
-    half* __restrict__ sin_cache,    // [num_tokens, head_dim]
-    const int num_tokens,
-    const int grid_h,
-    const int grid_w,
-    const int grid_t,
-    const int merge_size,
-    const int head_dim,              // 72
-    const int quarter_head_dim,      // 18
-    const float theta                // 10000.0
-) {
-    const int token_idx = blockIdx.x;
-    if (token_idx >= num_tokens) return;
-    
-    const int tid = threadIdx.x;
-    if (tid >= quarter_head_dim) return;  // Only need 18 threads per token
-    
-    // Compute position IDs in spatial merge order
-    const int merged_h = grid_h / merge_size;
-    const int merged_w = grid_w / merge_size;
-    const int patches_per_frame = grid_h * grid_w;
-    const int in_frame_idx = token_idx % patches_per_frame;
-    
-    const int block_idx = in_frame_idx / (merge_size * merge_size);
-    const int in_block_idx = in_frame_idx % (merge_size * merge_size);
-    const int block_h_pos = block_idx / merged_w;
-    const int block_w_pos = block_idx % merged_w;
-    const int local_h = in_block_idx / merge_size;
-    const int local_w = in_block_idx % merge_size;
-    
-    const int h_pos = block_h_pos * merge_size + local_h;
-    const int w_pos = block_w_pos * merge_size + local_w;
-    
-    // Compute inverse frequency for this thread's dimension
-    const int half_head_dim = head_dim / 2;  // 36
-    const float inv_freq = 1.0f / powf(theta, static_cast<float>(2 * tid) / half_head_dim);
-    
-    // Compute frequencies
-    const float h_freq = static_cast<float>(h_pos) * inv_freq;
-    const float w_freq = static_cast<float>(w_pos) * inv_freq;
-    
-    // Compute cos/sin
-    float cos_h, sin_h, cos_w, sin_w;
-    sincosf(h_freq, &sin_h, &cos_h);
-    sincosf(w_freq, &sin_w, &cos_w);
-    
-    // Write to output: layout = [h_freq(18), w_freq(18), h_freq(18), w_freq(18)]
-    const int base = token_idx * head_dim;
-    // Use round-toward-zero to match CPU float_to_half() truncation behavior
-    const half cos_h_half = __float2half_rz(cos_h);
-    const half sin_h_half = __float2half_rz(sin_h);
-    const half cos_w_half = __float2half_rz(cos_w);
-    const half sin_w_half = __float2half_rz(sin_w);
-    
-    // [0:18] = height frequencies
-    cos_cache[base + tid] = cos_h_half;
-    sin_cache[base + tid] = sin_h_half;
-    
-    // [18:36] = width frequencies
-    cos_cache[base + quarter_head_dim + tid] = cos_w_half;
-    sin_cache[base + quarter_head_dim + tid] = sin_w_half;
-    
-    // [36:54] = height frequencies (repeat)
-    cos_cache[base + half_head_dim + tid] = cos_h_half;
-    sin_cache[base + half_head_dim + tid] = sin_h_half;
-    
-    // [54:72] = width frequencies (repeat)
-    cos_cache[base + half_head_dim + quarter_head_dim + tid] = cos_w_half;
-    sin_cache[base + half_head_dim + quarter_head_dim + tid] = sin_w_half;
-}
-
-void vision_rotary_emb_cu(
-    half* cos_cache,
-    half* sin_cache,
-    int num_tokens,
-    int grid_h,
-    int grid_w,
-    int grid_t,
-    int merge_size,
-    int head_dim,
-    float theta,
-    cudaStream_t stream) {
-  
-  int quarter_head_dim = head_dim / 4;  // 18
-  
-  // One block per token, quarter_head_dim threads per block (18)
-  // Round up to warp size for efficiency
-  dim3 block_size(32);  // Round up 18 to nearest warp size
-  dim3 grid_size(num_tokens);
-  
-  vision_rotary_emb_kernel<<<grid_size, block_size, 0, stream>>>(
-      cos_cache,
-      sin_cache,
-      num_tokens,
-      grid_h,
-      grid_w,
-      grid_t,
-      merge_size,
-      head_dim,
-      quarter_head_dim,
-      theta);
 }
 
 }  // namespace kernel

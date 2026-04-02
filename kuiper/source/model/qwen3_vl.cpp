@@ -918,14 +918,6 @@ void Qwen3VLModel::create_vl_nonparam_layers() {
   
   qwen_layers_->flash_attention_decode_gpu_pos_layer_ = std::make_shared<op::FlashAttentionDecodeGpuPosLayer>(device_type_);
   qwen_layers_->flash_attention_decode_gpu_pos_layer_->set_cuda_config(cuda_config_);
-  
-  // Fused M-RoPE + KV Cache Write layer for decode optimization
-  qwen_layers_->fused_mrope_kv_write_layer_ = std::make_shared<op::FusedMRoPEKVWriteLayer>(device_type_);
-  qwen_layers_->fused_mrope_kv_write_layer_->set_cuda_config(cuda_config_);
-
-  // Fused GQA + M-RoPE + KV Cache Read/Write + Attention layer for decode
-  qwen_layers_->fused_gqa_mrope_kv_decode_layer_ = std::make_shared<op::FusedGQAMRoPEKVDecodeLayer>(device_type_);
-  qwen_layers_->fused_gqa_mrope_kv_decode_layer_->set_cuda_config(cuda_config_);
 }
 
 void Qwen3VLModel::create_vision_nonparam_layers() {
@@ -1132,46 +1124,28 @@ void Qwen3VLModel::attention_qkv_with_graph(int32_t layer_idx,
   key_norm->forward(temp_key, temp_key);
   temp_key.reshape({(int32_t)temp_key.size()});
 
-  // M-RoPE + KV Cache Write
+  // M-RoPE + KV Cache Write (3 separate kernel launches)
   const auto& section = vl_config_.text.mrope_section;
   tensor::Tensor key_cache = get_buffer(ModelBufferType::kKeyCache);
   tensor::Tensor val_cache = get_buffer(ModelBufferType::kValueCache);
 
-  if (use_fused_gqa_) {
-    // GQA fused path: MRoPE + KV write + attention are all done in attention_mha_with_graph
-    // Skip MRoPE and KV write here — just leave Q, K, V post-norm for the fused kernel
-  } else if (use_fused_rope_kv_) {
-    // Fused path: 1 kernel launch (M-RoPE(Q) + M-RoPE(K)→cache + V→cache)
-    qwen_layers_->fused_mrope_kv_write_layer_->forward(
-        rope_pos_gpu.ptr<int32_t>(),       // M-RoPE text position (GPU)
-        kv_cache_pos_gpu.ptr<int32_t>(),   // KV cache write position (GPU)
-        query, temp_key, temp_value,
-        key_cache, val_cache,
-        get_buffer(ModelBufferType::kSinCache),
-        get_buffer(ModelBufferType::kCosCache),
-        config_->dim_, config_->kv_dim_, config_->head_size_,
-        section[0], section[1], section[2],
-        layer_idx, config_->seq_len_);
-  } else {
-    // Non-fused path: 3 separate kernel launches
-    qwen_layers_->mrope_gpu_pos_layer_->forward(
-        rope_pos_gpu.ptr<int32_t>(),
-        config_->dim_, config_->kv_dim_, config_->head_size_,
-        section[0], section[1], section[2],
-        query, temp_key,
-        get_buffer(ModelBufferType::kSinCache),
-        get_buffer(ModelBufferType::kCosCache));
+  qwen_layers_->mrope_gpu_pos_layer_->forward(
+      rope_pos_gpu.ptr<int32_t>(),
+      config_->dim_, config_->kv_dim_, config_->head_size_,
+      section[0], section[1], section[2],
+      query, temp_key,
+      get_buffer(ModelBufferType::kSinCache),
+      get_buffer(ModelBufferType::kCosCache));
 
-    qwen_layers_->copy_to_kv_cache_layer_->forward(
-        key_cache, temp_key,
-        kv_cache_pos_gpu.ptr<int32_t>(),
-        config_->kv_dim_, layer_idx, config_->seq_len_);
+  qwen_layers_->copy_to_kv_cache_layer_->forward(
+      key_cache, temp_key,
+      kv_cache_pos_gpu.ptr<int32_t>(),
+      config_->kv_dim_, layer_idx, config_->seq_len_);
 
-    qwen_layers_->copy_to_kv_cache_layer_->forward(
-        val_cache, temp_value,
-        kv_cache_pos_gpu.ptr<int32_t>(),
-        config_->kv_dim_, layer_idx, config_->seq_len_);
-  }
+  qwen_layers_->copy_to_kv_cache_layer_->forward(
+      val_cache, temp_value,
+      kv_cache_pos_gpu.ptr<int32_t>(),
+      config_->kv_dim_, layer_idx, config_->seq_len_);
 }
 
 void Qwen3VLModel::attention_mha_with_graph(int32_t layer_idx, 
@@ -1185,25 +1159,7 @@ void Qwen3VLModel::attention_mha_with_graph(int32_t layer_idx,
   tensor::Tensor mha_output = get_buffer(ModelBufferType::kOutputMHA);
   tensor::Tensor query = this->get_buffer(ModelBufferType::kQuery);
   
-  // Fused GQA path: MRoPE + KV write + Attention in ONE kernel
-  if (use_fused_gqa_ && query.data_type() == base::DataType::kDataTypeFp16 &&
-      key_cache.data_type() == base::DataType::kDataTypeFp16) {
-    tensor::Tensor temp_key = this->get_buffer(ModelBufferType::kTempKey);
-    tensor::Tensor temp_value = this->get_buffer(ModelBufferType::kTempValue);
-    const auto& section = vl_config_.text.mrope_section;
-
-    qwen_layers_->fused_gqa_mrope_kv_decode_layer_->forward(
-        rope_pos_gpu.ptr<int32_t>(),
-        kv_cache_pos_gpu.ptr<int32_t>(),
-        query, temp_key, temp_value,
-        key_cache, val_cache,
-        mha_output,
-        get_buffer(ModelBufferType::kSinCache),
-        get_buffer(ModelBufferType::kCosCache),
-        config_->dim_, config_->kv_dim_, config_->head_size_,
-        section[0], section[1], section[2],
-        layer_idx, config_->seq_len_);
-  } else if (query.data_type() == base::DataType::kDataTypeFp16 &&
+  if (query.data_type() == base::DataType::kDataTypeFp16 &&
       key_cache.data_type() == base::DataType::kDataTypeFp16) {
     // FP16: Use GPU pos version for CUDA Graph compatibility
     qwen_layers_->flash_attention_decode_gpu_pos_layer_->forward(
@@ -2081,28 +2037,6 @@ void Qwen3VLModel::upload_mrope_positions_to_gpu() const {
 // Prefill and Decode
 // ============================================================================
 
-base::Status Qwen3VLModel::multimodal_prefill(const std::vector<int>& tokens,
-                                               const std::string& image_path) const {
-  // Preprocess image
-  ImageData image_data;
-  if (!image_path.empty()) {
-    image_data = preprocess_image(image_path);
-  }
-  
-  // Prepare multimodal embeddings
-  auto embeddings = prepare_multimodal_embeddings(tokens, 
-      image_path.empty() ? nullptr : &image_data);
-  
-  // Run prefill
-  int seq_len = static_cast<int>(tokens.size());
-  if (!image_data.pixel_values.is_empty()) {
-    // Adjust for vision tokens
-    seq_len = seq_len - 1 + image_data.num_vision_tokens;  // Replace 1 image token
-  }
-  
-  return prefill(embeddings, seq_len, 0);
-}
-
 base::Status Qwen3VLModel::prefill(const tensor::Tensor& input_embeddings,
                                     int32_t seq_len, int32_t start_pos) const {
   // ==========================================================================
@@ -2149,7 +2083,7 @@ base::Status Qwen3VLModel::prefill(const tensor::Tensor& input_embeddings,
   tensor::Tensor value_out(activation_dtype, seq_len, kv_dim, true, alloc);
   tensor::Tensor mha_out(activation_dtype, seq_len, dim, true, alloc);
   
-  // Pre-allocate FFN buffers (previously allocated per-layer in batched_feed_forward)
+  // Pre-allocate FFN buffers
   tensor::Tensor ffn_norm_out(activation_dtype, seq_len, dim, true, alloc);
   tensor::Tensor w1_out(activation_dtype, seq_len, hidden_dim, true, alloc);
   tensor::Tensor w3_out(activation_dtype, seq_len, hidden_dim, true, alloc);
@@ -2161,9 +2095,61 @@ base::Status Qwen3VLModel::prefill(const tensor::Tensor& input_embeddings,
   int64_t score_buf_size = (int64_t)config_->head_num_ * kv_len * seq_len;
   half* score_buf = nullptr;
   cudaMalloc(&score_buf, score_buf_size * sizeof(half));
-  // Pointer arrays for cublasHgemmBatched: A[head_num] + B[head_num] + C[head_num]
+  
+  // OPTIMIZED: Precompute ALL pointer arrays for batched attention across all layers.
+  // This replaces 4 per-layer cudaMemcpyAsync from pageable stack memory (which are
+  // synchronous and force stream sync) with a single pinned async H2D transfer.
+  // Layout per layer: [step1_A(head_num), step1_B(head_num), step1_C(head_num),
+  //                    step3_A(head_num), step3_B(head_num), step3_C(head_num)]
+  const int head_num = config_->head_num_;
+  const int kv_mul = config_->kv_mul_;
+  const int head_size_val = config_->head_size_;
+  const size_t ptrs_per_step = 3 * head_num;
+  const size_t ptrs_per_layer = 2 * ptrs_per_step;  // 2 steps per layer
+  const size_t total_ptrs = config_->layer_num_ * ptrs_per_layer;
+  
   half** d_ptr_buf = nullptr;
-  cudaMalloc(&d_ptr_buf, 3 * config_->head_num_ * sizeof(half*));
+  cudaMalloc(&d_ptr_buf, total_ptrs * sizeof(half*));
+  
+  // Build pointer arrays in pinned host memory and upload once
+  {
+    half** h_ptr_buf = nullptr;
+    cudaMallocHost(&h_ptr_buf, total_ptrs * sizeof(half*));
+    
+    half* Q = const_cast<half*>(query_out.ptr<half>());
+    half* K_base = const_cast<half*>(get_buffer(ModelBufferType::kKeyCache).ptr<half>());
+    half* V_base = const_cast<half*>(get_buffer(ModelBufferType::kValueCache).ptr<half>());
+    
+    for (int l = 0; l < config_->layer_num_; l++) {
+      half** step1 = h_ptr_buf + l * ptrs_per_layer;
+      half** step3 = step1 + ptrs_per_step;
+      
+      int64_t layer_offset = (int64_t)l * config_->seq_len_ * kv_dim;
+      half* K = K_base + layer_offset;
+      half* V = V_base + layer_offset;
+      
+      for (int h = 0; h < head_num; h++) {
+        // Step 1 (Q·K^T): A=K, B=Q, C=Score
+        step1[h]              = K + (h / kv_mul) * head_size_val;
+        step1[head_num + h]   = Q + h * head_size_val;
+        step1[2*head_num + h] = score_buf + (int64_t)h * kv_len * seq_len;
+        
+        // Step 3 (Attn·V): A=V, B=Score, C=Output(reuse Q)
+        step3[h]              = V + (h / kv_mul) * head_size_val;
+        step3[head_num + h]   = score_buf + (int64_t)h * kv_len * seq_len;
+        step3[2*head_num + h] = Q + h * head_size_val;
+      }
+    }
+    
+    // Single async H2D transfer for ALL layers' pointer arrays
+    cudaMemcpyAsync(d_ptr_buf, h_ptr_buf, total_ptrs * sizeof(half*),
+                    cudaMemcpyHostToDevice, cuda_config_->stream);
+    // Stream-ordered free: h_ptr_buf can be freed after the copy is enqueued
+    // since it's pinned memory and the DMA reads it asynchronously.
+    // We sync before using d_ptr_buf anyway (cuBLAS calls are on same stream).
+    cudaStreamSynchronize(cuda_config_->stream);
+    cudaFreeHost(h_ptr_buf);
+  }
   
   // OPTIMIZED: No copy needed - use input_embeddings directly as first layer input
   // Double-buffering pointers
@@ -2198,7 +2184,7 @@ base::Status Qwen3VLModel::prefill(const tensor::Tensor& input_embeddings,
     
     // 3. Batched Multi-head attention using cuBLAS GEMM
     batched_attention_mha(layer_idx, query_out, mha_out, seq_len, start_pos,
-                          score_buf, d_ptr_buf);
+                          score_buf, d_ptr_buf + layer_idx * ptrs_per_layer);
     
     // 4. Residual add: layer_output = layer_input + mha_out (via batched_add_layer_)
     STATUS_CHECK(qwen_layers_->batched_add_layer_->forward(*layer_input, mha_out, *layer_output));
@@ -2261,129 +2247,6 @@ int Qwen3VLModel::sample_first_token() const {
   }
   
   return post_processing(pos_tensor, false);
-}
-
-base::Status Qwen3VLModel::decode_step(const tensor::Tensor& input,
-                                        int32_t pos, int& next) const {
-  // Check if CUDA Graph is enabled
-  bool use_graph = cuda_config_ && cuda_config_->use_cuda_graph && 
-                   cuda_config_->graph_context;
-  
-  if (use_graph) {
-    auto& graph_ctx = cuda_config_->graph_context;
-    auto& graph = graph_ctx->decode_graph;
-    
-    // Get fixed-address buffers for CUDA Graph
-    tensor::Tensor decode_input = get_buffer(ModelBufferType::kDecodeInput);
-    tensor::Tensor pos_tensor_gpu = get_buffer(ModelBufferType::kInputPosGPU);
-    tensor::Tensor kv_cache_pos_gpu = get_buffer(ModelBufferType::kKVCachePosGPU);
-    tensor::Tensor pos_pinned = get_buffer(ModelBufferType::kInputPosPinned);
-    tensor::Tensor kv_cache_pos_pinned = get_buffer(ModelBufferType::kKVCachePosPinned);
-    tensor::Tensor argmax_output = get_buffer(ModelBufferType::kArgmaxOutput);
-    tensor::Tensor argmax_pinned = get_buffer(ModelBufferType::kArgmaxOutputPinned);
-    
-    size_t elem_size = sizeof(uint16_t);  // FP16
-    
-    // Copy input embedding to fixed decode_input buffer
-    cudaMemcpyAsync(decode_input.ptr<void>(), input.ptr<void>(),
-                    config_->dim_ * elem_size, cudaMemcpyDeviceToDevice, 
-                    cuda_config_->stream);
-    
-    // Calculate text position for M-RoPE (decode uses same pos for t/h/w)
-    // text_pos = mrope_max_text_pos_ + (pos - prefill_seq_len_) + 1
-    int32_t text_pos = mrope_max_text_pos_ + (pos - prefill_seq_len_) + 1;
-    
-    // Update positions using pinned memory + H2D copy
-    *const_cast<int32_t*>(pos_pinned.ptr<int32_t>()) = text_pos;
-    cudaMemcpyAsync(const_cast<int32_t*>(pos_tensor_gpu.ptr<int32_t>()),
-                    pos_pinned.ptr<int32_t>(), sizeof(int32_t),
-                    cudaMemcpyHostToDevice, cuda_config_->stream);
-    *const_cast<int32_t*>(kv_cache_pos_pinned.ptr<int32_t>()) = pos;
-    cudaMemcpyAsync(const_cast<int32_t*>(kv_cache_pos_gpu.ptr<int32_t>()),
-                    kv_cache_pos_pinned.ptr<int32_t>(), sizeof(int32_t),
-                    cudaMemcpyHostToDevice, cuda_config_->stream);
-    
-    bool need_capture = graph_ctx->needs_recapture || !graph->is_valid();
-    
-    if (need_capture && !graph->is_disabled()) {
-      // Sync before capture
-      cudaStreamSynchronize(cuda_config_->stream);
-      
-      // Capture the graph
-      if (graph->begin_capture(cuda_config_->stream)) {
-        for (int32_t layer_idx = 0; layer_idx < config_->layer_num_; ++layer_idx) {
-          attention_rms(layer_idx, decode_input);
-          attention_qkv_with_graph(layer_idx, pos_tensor_gpu, kv_cache_pos_gpu);
-          attention_mha_with_graph(layer_idx, pos_tensor_gpu, kv_cache_pos_gpu);
-          feed_forward(layer_idx, decode_input);
-        }
-        cls_logits(decode_input);
-        
-        if (graph->end_capture(cuda_config_->stream)) {
-          graph_ctx->graph_recaptures++;
-          graph_ctx->needs_recapture = false;
-        }
-      }
-    }
-    
-    if (graph->is_valid()) {
-      // Launch the captured graph
-      if (graph->launch(cuda_config_->stream)) {
-        graph_ctx->graph_launches++;
-        
-        // Use optimized post_processing with pre-allocated buffers
-        tensor::Tensor forward_output = get_buffer(ModelBufferType::kForwardOutput);
-        auto* argmax_sampler = dynamic_cast<sampler::ArgmaxSampler*>(sampler_.get());
-        if (argmax_sampler) {
-          argmax_sampler->sample_prealloc(
-              forward_output.ptr<float>(), forward_output.size(),
-              reinterpret_cast<size_t*>(const_cast<int32_t*>(argmax_output.ptr<int32_t>())),
-              reinterpret_cast<size_t*>(const_cast<int32_t*>(argmax_pinned.ptr<int32_t>())),
-              cuda_config_->stream);
-          cudaStreamSynchronize(cuda_config_->stream);
-          next = static_cast<int32_t>(*reinterpret_cast<size_t*>(
-              const_cast<int32_t*>(argmax_pinned.ptr<int32_t>())));
-        } else {
-          cudaStreamSynchronize(cuda_config_->stream);
-          tensor::Tensor pos_tensor_cpu = get_buffer(ModelBufferType::kInputPos);
-          next = post_processing(pos_tensor_cpu, false);
-        }
-        return base::error::Success();
-      }
-      // If launch failed, fall through to normal execution
-      graph_ctx->invalidate();
-    }
-  }
-  
-  // Normal execution (no graph, or graph capture/launch failed)
-  tensor::Tensor pos_tensor = get_buffer(ModelBufferType::kInputPos);
-  pos_tensor.index<int32_t>(0) = pos;
-  
-  tensor::Tensor decode_input = get_buffer(ModelBufferType::kDecodeInput);
-  size_t elem_size = sizeof(uint16_t);  // FP16
-  
-  // Copy input embedding to decode input buffer
-  cudaMemcpyAsync(decode_input.ptr<void>(), input.ptr<void>(),
-                  config_->dim_ * elem_size, cudaMemcpyDeviceToDevice, 
-                  cuda_config_->stream);
-  
-  // Run transformer layers
-  for (int32_t layer_idx = 0; layer_idx < config_->layer_num_; ++layer_idx) {
-    attention_rms(layer_idx, decode_input);
-    attention_qkv(layer_idx, pos_tensor);
-    attention_mha(layer_idx, pos_tensor);
-    feed_forward(layer_idx, decode_input);
-  }
-  
-  // LM head and sampling
-  cls_logits(decode_input);
-  
-  if (cuda_config_ && cuda_config_->stream) {
-    cudaStreamSynchronize(cuda_config_->stream);
-  }
-  
-  next = post_processing(pos_tensor, false);
-  return base::error::Success();
 }
 
 base::Status Qwen3VLModel::decode_step_optimized(int32_t pos, int& next) const {
@@ -2492,75 +2355,6 @@ base::Status Qwen3VLModel::decode_step_optimized(int32_t pos, int& next) const {
   
   next = post_processing(pos_tensor, false);
   return base::error::Success();
-}
-
-// ============================================================================
-// Generation
-// ============================================================================
-
-std::string Qwen3VLModel::generate(const std::string& image_path,
-                                    const std::string& prompt,
-                                    int max_tokens) const {
-  // Tokenize prompt
-  auto tokens = encode(prompt);
-  
-  // Preprocess image ONCE and directly use the result
-  // (avoids redundant preprocess_image call that was in multimodal_prefill)
-  ImageData image_data;
-  int prefill_seq_len = static_cast<int>(tokens.size());
-  if (!image_path.empty()) {
-    image_data = preprocess_image(image_path);
-    prefill_seq_len = static_cast<int>(tokens.size()) - 1 + image_data.num_vision_tokens;
-  }
-  
-  // Prepare multimodal embeddings and run prefill directly
-  auto embeddings = prepare_multimodal_embeddings(tokens,
-      image_path.empty() ? nullptr : &image_data);
-  
-  auto status = prefill(embeddings, prefill_seq_len, 0);
-  if (!status) {
-    LOG(ERROR) << "Prefill failed: " << status.get_err_code();
-    return "";
-  }
-  
-  // Sample first token using the output from the last prefill token
-  int first_token = sample_first_token();
-  LOG(INFO) << "First generated token: " << first_token;
-  
-  if (first_token == vl_config_.special_tokens.eos_token_id) {
-    return "";
-  }
-  
-  // Decode loop
-  std::vector<int32_t> generated;
-  generated.push_back(static_cast<int32_t>(first_token));
-  
-  int next_token = -1;
-  
-  for (int i = 1; i < max_tokens; ++i) {
-    // OPTIMIZED: Embed token directly into decode_input buffer (avoids D2D copy)
-    embedding_to_decode_input(generated.back());
-    
-    // Decode step - position is prefill_seq_len + number of generated tokens - 1
-    // (because the first generated token is at position prefill_seq_len - 1's output)
-    int pos = prefill_seq_len_ + static_cast<int>(generated.size()) - 1;
-    status = decode_step_optimized(pos, next_token);
-    if (!status) {
-      LOG(ERROR) << "Decode step failed at pos=" << pos;
-      break;
-    }
-    
-    if (next_token == vl_config_.special_tokens.eos_token_id) {
-      break;
-    }
-    
-    generated.push_back(static_cast<int32_t>(next_token));
-  }
-  
-  LOG(INFO) << "Total generated tokens: " << generated.size();
-  
-  // Decode tokens to text using base class method
-  return Model::decode(generated);
 }
 
 // ============================================================================
@@ -2785,48 +2579,31 @@ void Qwen3VLModel::batched_attention_mha(int32_t layer_idx, const tensor::Tensor
                                           tensor::Tensor& mha_out, 
                                           int32_t seq_len, int32_t start_pos,
                                           half* score_buf, half** d_ptr_buf) const {
+  // d_ptr_buf points to THIS layer's precomputed pointer arrays:
+  //   [step1_A(head_num), step1_B(head_num), step1_C(head_num),
+  //    step3_A(head_num), step3_B(head_num), step3_C(head_num)]
+  // All pointer arrays were uploaded in one shot from prefill(), eliminating
+  // the 4 per-layer synchronous cudaMemcpyAsync from pageable stack memory.
   CHECK(qwen_layers_ != nullptr);
   
-  tensor::Tensor key_cache = get_buffer(ModelBufferType::kKeyCache);
-  tensor::Tensor val_cache = get_buffer(ModelBufferType::kValueCache);
-  
   const int head_num = config_->head_num_;
-  const int kv_mul = config_->kv_mul_;
   const int head_size = config_->head_size_;
   const int dim = config_->dim_;
   const int kv_dim = config_->kv_dim_;
-  const int max_seq_len = config_->seq_len_;
   const int kv_len = start_pos + seq_len;
-  const int64_t layer_offset = (int64_t)layer_idx * max_seq_len * kv_dim;
+  const size_t ptrs_per_step = 3 * head_num;
   
   half* Q = const_cast<half*>(query.ptr<half>());
-  half* K = const_cast<half*>(key_cache.ptr<half>()) + layer_offset;
-  half* V = const_cast<half*>(val_cache.ptr<half>()) + layer_offset;
   
   const float scale_f = 1.0f / sqrtf((float)head_size);
   const half alpha_scale = __float2half(scale_f);
   const half alpha_one = __float2half(1.0f);
   const half beta_zero = __float2half(0.0f);
   
-  // Use stack arrays to avoid heap allocation (max 32 heads)
-  const half* h_ptrs[3 * 32];  // A, B, C for up to 32 heads
-  half* h_C_ptrs[32];
-  
   // ============================================================
   // Step 1: Q·K^T via cublasHgemmBatched (uses tensor cores)
+  // Pointers precomputed in d_ptr_buf[0 .. ptrs_per_step)
   // ============================================================
-  for (int h = 0; h < head_num; h++) {
-    h_ptrs[h]              = K + (h / kv_mul) * head_size;   // A = K (GQA mapped)
-    h_ptrs[head_num + h]   = Q + h * head_size;              // B = Q
-    h_C_ptrs[h]            = score_buf + (int64_t)h * kv_len * seq_len;  // C = Score
-  }
-  
-  // Single H2D copy for all pointer arrays
-  cudaMemcpyAsync(d_ptr_buf, h_ptrs, 2 * head_num * sizeof(half*),
-                  cudaMemcpyHostToDevice, cuda_config_->stream);
-  cudaMemcpyAsync(d_ptr_buf + 2 * head_num, h_C_ptrs, head_num * sizeof(half*),
-                  cudaMemcpyHostToDevice, cuda_config_->stream);
-  
   cublasHgemmBatched(cuda_config_->cublas_handle,
                      CUBLAS_OP_T, CUBLAS_OP_N,
                      kv_len, seq_len, head_size,
@@ -2845,26 +2622,18 @@ void Qwen3VLModel::batched_attention_mha(int32_t layer_idx, const tensor::Tensor
   
   // ============================================================
   // Step 3: Attn·V via cublasHgemmBatched (uses tensor cores)
+  // Pointers precomputed in d_ptr_buf[ptrs_per_step .. 2*ptrs_per_step)
   // ============================================================
-  for (int h = 0; h < head_num; h++) {
-    h_ptrs[h]              = V + (h / kv_mul) * head_size;   // A = V (GQA mapped)
-    h_ptrs[head_num + h]   = score_buf + (int64_t)h * kv_len * seq_len;  // B = Attn
-    h_C_ptrs[h]            = Q + h * head_size;              // C = O (reuse query buf)
-  }
-  
-  cudaMemcpyAsync(d_ptr_buf, h_ptrs, 2 * head_num * sizeof(half*),
-                  cudaMemcpyHostToDevice, cuda_config_->stream);
-  cudaMemcpyAsync(d_ptr_buf + 2 * head_num, h_C_ptrs, head_num * sizeof(half*),
-                  cudaMemcpyHostToDevice, cuda_config_->stream);
+  half** step3 = d_ptr_buf + ptrs_per_step;
   
   cublasHgemmBatched(cuda_config_->cublas_handle,
                      CUBLAS_OP_N, CUBLAS_OP_N,
                      head_size, seq_len, kv_len,
                      &alpha_one,
-                     (const half**)d_ptr_buf, kv_dim,
-                     (const half**)(d_ptr_buf + head_num), kv_len,
+                     (const half**)step3, kv_dim,
+                     (const half**)(step3 + head_num), kv_len,
                      &beta_zero,
-                     d_ptr_buf + 2 * head_num, dim,
+                     step3 + 2 * head_num, dim,
                      head_num);
   
   // ============================================================
@@ -2882,81 +2651,6 @@ void Qwen3VLModel::batched_attention_mha(int32_t layer_idx, const tensor::Tensor
               Q, dim,
               &beta_zero,
               mha_out.ptr<half>(), dim);
-}
-
-void Qwen3VLModel::batched_feed_forward(int32_t layer_idx, const tensor::Tensor& input, 
-                                         int32_t seq_len) const {
-  CHECK(qwen_layers_ != nullptr);
-  
-  auto alloc = base::CUDADeviceAllocatorFactory::get_instance();
-  base::DataType activation_dtype = input.data_type();
-  size_t elem_size = (activation_dtype == base::DataType::kDataTypeFp16) 
-      ? sizeof(uint16_t) : sizeof(float);
-  
-  // FFN RMSNorm - use layer forward call
-  const auto& ffn_rmsnorm = qwen_layers_->rmsnorm_layers_.at(layer_idx + config_->layer_num_);
-  
-  tensor::Tensor ffn_norm_out(activation_dtype, seq_len, config_->dim_, true, alloc);
-  STATUS_CHECK(ffn_rmsnorm->forward(input, ffn_norm_out));
-  
-  // Batched W1 (gate) and W3 (up)
-  const auto& w1_layer = qwen_layers_->w1_layers_.at(layer_idx);
-  const auto& w3_layer = qwen_layers_->w3_layers_.at(layer_idx);
-  
-  auto w1_matmul = std::dynamic_pointer_cast<op::MatmulLayer>(w1_layer);
-  auto w3_matmul = std::dynamic_pointer_cast<op::MatmulLayer>(w3_layer);
-  CHECK_NE(w1_matmul, nullptr) << "W1 layer is not a MatmulLayer";
-  CHECK_NE(w3_matmul, nullptr) << "W3 layer is not a MatmulLayer";
-  
-  int32_t hidden_dim = config_->hidden_dim_;
-  tensor::Tensor w1_out(activation_dtype, seq_len, hidden_dim, true, alloc);
-  tensor::Tensor w3_out(activation_dtype, seq_len, hidden_dim, true, alloc);
-  
-  const half alpha = __float2half(1.0f);
-  const half beta = __float2half(0.0f);
-  
-  // W1: [seq_len, hidden_dim] = [seq_len, dim] @ [dim, hidden_dim]^T
-  cublasHgemm(cuda_config_->cublas_handle,
-              CUBLAS_OP_T, CUBLAS_OP_N,
-              hidden_dim, seq_len, config_->dim_,
-              &alpha,
-              w1_matmul->get_weight(0).ptr<half>(), config_->dim_,
-              ffn_norm_out.ptr<half>(), config_->dim_,
-              &beta,
-              w1_out.ptr<half>(), hidden_dim);
-  
-  // W3: [seq_len, hidden_dim] = [seq_len, dim] @ [dim, hidden_dim]^T
-  cublasHgemm(cuda_config_->cublas_handle,
-              CUBLAS_OP_T, CUBLAS_OP_N,
-              hidden_dim, seq_len, config_->dim_,
-              &alpha,
-              w3_matmul->get_weight(0).ptr<half>(), config_->dim_,
-              ffn_norm_out.ptr<half>(), config_->dim_,
-              &beta,
-              w3_out.ptr<half>(), hidden_dim);
-  
-  // Batched SwiGLU via batched_swiglu_layer_: w1_out = silu(w1_out) * w3_out
-  STATUS_CHECK(qwen_layers_->batched_swiglu_layer_->forward(w1_out, w3_out, w1_out));
-  
-  // Batched W2 (down)
-  const auto& w2_layer = qwen_layers_->w2_layers_.at(layer_idx);
-  auto w2_matmul = std::dynamic_pointer_cast<op::MatmulLayer>(w2_layer);
-  CHECK_NE(w2_matmul, nullptr) << "W2 layer is not a MatmulLayer";
-  
-  tensor::Tensor w2_out(activation_dtype, seq_len, config_->dim_, true, alloc);
-  
-  // W2: [seq_len, dim] = [seq_len, hidden_dim] @ [hidden_dim, dim]^T
-  cublasHgemm(cuda_config_->cublas_handle,
-              CUBLAS_OP_T, CUBLAS_OP_N,
-              config_->dim_, seq_len, hidden_dim,
-              &alpha,
-              w2_matmul->get_weight(0).ptr<half>(), hidden_dim,
-              w1_out.ptr<half>(), hidden_dim,
-              &beta,
-              w2_out.ptr<half>(), config_->dim_);
-  
-  // Residual add via batched_add_layer_: input = input + w2_out
-  STATUS_CHECK(qwen_layers_->batched_add_layer_->forward(input, w2_out, input));
 }
 
 void Qwen3VLModel::batched_feed_forward_optimized(
