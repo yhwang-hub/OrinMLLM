@@ -1301,7 +1301,9 @@ ImageData Qwen3VLModel::preprocess_image(const std::string& image_path, int max_
   }
   
   // 2. Smart resize on CPU using stb (bit-exact match with baseline)
-  int factor = vl_config_.vision.patch_size;  // 16
+  // Factor must be patch_size * spatial_merge_size to ensure grid dimensions
+  // are even (required by the 2x2 spatial merger)
+  int factor = vl_config_.vision.patch_size * vl_config_.vision.spatial_merge_size;
   constexpr int min_pixels = 56 * 56;  // 3136
   auto [resized_pixels, new_width, new_height] = image_utils::smart_resize(
       pixels, width, height, min_pixels, max_pixels, factor);

@@ -307,7 +307,6 @@ private:
   void init_mem() override;
   base::Status create_layers() override;
   void create_param_layers() override;
-  void create_nonparam_layers() override;
   void create_param_quant_layers() override;
   
   // Sub-functions for create_nonparam_layers (split for readability)
@@ -319,9 +318,13 @@ private:
   void generate_mrope_positions(const std::vector<int>& tokens,
                                 int image_token_pos, int num_vision_tokens,
                                 int grid_h, int grid_w) const;
-  
+
+protected:
   // Sub-functions for prefill (split for readability)
+  void create_nonparam_layers() override;
   void upload_mrope_positions_to_gpu() const;
+
+private:
   
   // Vision encoder forward pass
   tensor::Tensor vision_patch_embed(const ImageData& image_data) const;
@@ -379,7 +382,7 @@ private:
   
   int32_t post_processing(const tensor::Tensor& pos, bool is_prompt) const override;
 
-private:
+protected:
   Qwen3VLConfig vl_config_;
   std::shared_ptr<kernel::CudaConfig> cuda_config_;
   

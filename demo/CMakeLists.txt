@@ -52,4 +52,12 @@ if (QWEN3_VL_SUPPORT)
     target_link_libraries(qwen3_vl_infer llama)
     target_link_libraries(qwen3_vl_infer absl::base absl::strings absl::strings_internal re2::re2 nlohmann_json::nlohmann_json)
     set_target_properties(qwen3_vl_infer PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
+    # Qwen3.5-9B hybrid vision-language model
+    message(STATUS "LINK QWEN3_5 SUPPORT (Hybrid VL Model)")
+    add_executable(qwen3_5_infer main_qwen3_5.cpp)
+    target_link_directories(qwen3_5_infer PUBLIC ${PROJECT_SOURCE_DIR}/lib)
+    target_link_libraries(qwen3_5_infer llama)
+    target_link_libraries(qwen3_5_infer absl::base absl::strings absl::strings_internal re2::re2 nlohmann_json::nlohmann_json)
+    set_target_properties(qwen3_5_infer PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 endif ()
