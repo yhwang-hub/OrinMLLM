@@ -324,9 +324,10 @@ class Timer {
 struct PerfStats {
   int32_t prompt_len = 0;           // prompt长度（完整prompt的token数）
   int32_t prefill_tokens = 0;       // 实际经过forward pass的prefill token数
-  int32_t decode_steps = 0;         // decode步数
+  int32_t decode_steps = 0;         // decode步数（含warmup）
   double prefill_time_ms = 0.0;     // prefill时间(ms)
-  double decode_time_ms = 0.0;      // decode时间(ms)
+  double decode_time_ms = 0.0;      // decode时间(ms)（含warmup）
+  double graph_warmup_time_ms = 0.0; // CUDA Graph首次捕获的warmup时间(ms)
   int32_t kv_reuse_len = 0;         // KV cache复用长度
   int32_t total_context_len = 0;    // 总上下文长度（用于计算 attention 范围）
   int32_t prev_output_tokens = 0;   // 上一轮对话输出的token数（多轮对话中计入prefill统计）
@@ -356,6 +357,14 @@ struct PerfStats {
   }
   
   double decode_throughput() const {
+    // 排除CUDA Graph首次捕获的warmup开销，计算稳态decode吞吐量
+    double effective_time = decode_time_ms - graph_warmup_time_ms;
+    int effective_steps = graph_warmup_time_ms > 0 ? (decode_steps - 1) : decode_steps;
+    return (effective_time > 0 && effective_steps > 0) ? (effective_steps * 1000.0 / effective_time) : 0;
+  }
+
+  double total_decode_throughput() const {
+    // 含warmup的总体decode吞吐量
     return decode_time_ms > 0 ? (decode_steps * 1000.0 / decode_time_ms) : 0;
   }
   
@@ -418,9 +427,17 @@ struct PerfStats {
         LOG(INFO) << "  (avg attention range: " << (int)avg_attention_len() 
                   << ", normalized throughput: " << normalized_prefill_throughput() << " tokens/s)";
       }
-      LOG(INFO) << "Decode: " << decode_steps << " tokens, " 
-                << decode_time_ms << " ms, " 
-                << decode_throughput() << " tokens/s";
+      if (graph_warmup_time_ms > 0) {
+        LOG(INFO) << "Decode: " << decode_steps << " tokens, " 
+                  << decode_time_ms << " ms, " 
+                  << decode_throughput() << " tokens/s (steady-state)";
+        LOG(INFO) << "  (graph warmup: " << graph_warmup_time_ms << " ms, "
+                  << "overall: " << total_decode_throughput() << " tokens/s)";
+      } else {
+        LOG(INFO) << "Decode: " << decode_steps << " tokens, " 
+                  << decode_time_ms << " ms, " 
+                  << decode_throughput() << " tokens/s";
+      }
       int32_t final_ctx_len = prompt_len + decode_steps;
       LOG(INFO) << "  (final context: " << final_ctx_len << " tokens)";
       LOG(INFO) << "===============================";
@@ -436,6 +453,9 @@ struct PerfStats {
       }
       std::cerr << " | Decode: " << decode_steps << " tokens, " 
                 << decode_throughput() << " tokens/s";
+      if (graph_warmup_time_ms > 0) {
+        std::cerr << " (warmup: " << (int)graph_warmup_time_ms << "ms)";
+      }
       int32_t final_ctx_len = prompt_len + decode_steps;
       std::cerr << " (ctx: " << final_ctx_len << ")]" << std::endl;
     }
@@ -1228,10 +1248,24 @@ std::string generate_response(
     std::vector<int32_t> single_token(1);
     tensor::Tensor pos_tensor = model.get_buffer(model::ModelBufferType::kInputPos);
     
+    // 检测是否需要CUDA Graph warmup（首次decode时触发graph capture，开销较大）
+    bool need_graph_warmup = false;
+    {
+        auto cuda_cfg = model.get_cuda_config();
+        if (cuda_cfg && cuda_cfg->should_use_graph() && cuda_cfg->graph_context) {
+            need_graph_warmup = !cuda_cfg->graph_context->decode_graph->is_valid();
+        }
+    }
+    bool is_warmup_step = need_graph_warmup;
+    
     while (decode_steps < config.max_tokens) {
         if (model.is_sentence_ending(next)) {
             break;
         }
+        
+        // 对首次decode step单独计时（包含CUDA Graph capture开销）
+        Timer warmup_timer;
+        if (is_warmup_step) warmup_timer.start();
         
         single_token[0] = next;
         const auto& token_embedding = model.embedding(single_token);
@@ -1243,6 +1277,11 @@ std::string generate_response(
         if (!decode_status) {
             LOG(ERROR) << "Decode failed: " << decode_status.get_err_code();
             break;
+        }
+        
+        if (is_warmup_step) {
+            stats.graph_warmup_time_ms = warmup_timer.elapsed_ms();
+            is_warmup_step = false;
         }
         
         conv.append_token(next);
@@ -1616,10 +1655,24 @@ void run_benchmark(
         std::vector<int32_t> single_token(1);
         tensor::Tensor pos_tensor = model.get_buffer(model::ModelBufferType::kInputPos);
         
+        // 检测是否需要CUDA Graph warmup
+        bool need_graph_warmup_bench = false;
+        double bench_warmup_time_ms = 0.0;
+        {
+            auto cuda_cfg = model.get_cuda_config();
+            if (cuda_cfg && cuda_cfg->should_use_graph() && cuda_cfg->graph_context) {
+                need_graph_warmup_bench = !cuda_cfg->graph_context->decode_graph->is_valid();
+            }
+        }
+        bool is_warmup_step_bench = need_graph_warmup_bench;
+        
         Timer decode_timer;
         decode_timer.start();
         
         for (int step = 0; step < decode_tokens; ++step) {
+            Timer warmup_timer;
+            if (is_warmup_step_bench) warmup_timer.start();
+            
             single_token[0] = next;
             const auto& token_embedding = model.embedding(single_token);
             
@@ -1630,6 +1683,11 @@ void run_benchmark(
             if (!decode_status) {
                 LOG(ERROR) << "Decode failed at step " << step;
                 break;
+            }
+            
+            if (is_warmup_step_bench) {
+                bench_warmup_time_ms = warmup_timer.elapsed_ms();
+                is_warmup_step_bench = false;
             }
             
             pos++;
@@ -1644,13 +1702,24 @@ void run_benchmark(
         
         result.decode_time_ms = decode_timer.elapsed_ms();
         result.output_tokens = actual_decode_steps;
-        result.decode_throughput = actual_decode_steps * 1000.0 / result.decode_time_ms;
-        result.decode_latency_ms = result.decode_time_ms / actual_decode_steps;
+        // 使用排除warmup的稳态吞吐量
+        if (bench_warmup_time_ms > 0 && actual_decode_steps > 1) {
+            double steady_time = result.decode_time_ms - bench_warmup_time_ms;
+            int steady_steps = actual_decode_steps - 1;
+            result.decode_throughput = steady_steps * 1000.0 / steady_time;
+            result.decode_latency_ms = steady_time / steady_steps;
+        } else {
+            result.decode_throughput = actual_decode_steps * 1000.0 / result.decode_time_ms;
+            result.decode_latency_ms = result.decode_time_ms / actual_decode_steps;
+        }
         
         LOG(INFO) << "  Decode: " << actual_decode_steps << " tokens, " 
                   << result.decode_time_ms << " ms, " 
                   << result.decode_throughput << " tokens/s, "
                   << result.decode_latency_ms << " ms/token";
+        if (bench_warmup_time_ms > 0) {
+            LOG(INFO) << "  (graph warmup: " << bench_warmup_time_ms << " ms)";
+        }
         LOG(INFO) << "";
         
         results.push_back(result);
