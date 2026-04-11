@@ -82,7 +82,8 @@ void flash_attention_prefill_fp16_cu(
     const tensor::Tensor& output,
     const tensor::Tensor& key_cache,
     const tensor::Tensor& value_cache,
-    CudaConfig* config
+    CudaConfig* config,
+    bool is_causal = true
 );
 
 /**

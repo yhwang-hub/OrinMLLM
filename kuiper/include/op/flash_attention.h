@@ -101,6 +101,8 @@ class FlashAttentionPrefillLayer : public Layer {
   void set_use_fp16(bool use_fp16) { use_fp16_ = use_fp16; }
   void set_attention_type(base::AttentionType type) { attention_type_ = type; }
   base::AttentionType get_attention_type() const { return attention_type_; }
+  void set_is_causal(bool is_causal) { is_causal_ = is_causal; }
+  bool is_causal() const { return is_causal_; }
 
  private:
   int32_t head_num_ = 0;
@@ -111,6 +113,7 @@ class FlashAttentionPrefillLayer : public Layer {
   int32_t start_pos_ = 0;
   int32_t layer_idx_ = 0;
   bool use_fp16_ = false;
+  bool is_causal_ = true;
   base::AttentionType attention_type_ = base::AttentionType::kAttentionFlash1;
 };
 

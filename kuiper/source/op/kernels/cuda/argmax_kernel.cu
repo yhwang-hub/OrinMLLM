@@ -1,6 +1,7 @@
 #include "../kernels_interface.h"
 #include "argmax_kernel.cuh"
 #include "tensor/tensor.h"
+#include <float.h>
 namespace kernel {
 __forceinline__ __device__ void warp_reduce_argmax(float& val, size_t& ptr) {
   float tmp_val;
@@ -101,6 +102,59 @@ void argmax_kernel_cu_prealloc(const float* input_ptr, size_t size,
     argmax_kernel_fp32<<<1, 512>>>(input_ptr, size, output_gpu);
     cudaMemcpy(output_pinned, output_gpu, sizeof(size_t), cudaMemcpyDeviceToHost);
   }
+}
+
+// Batched FP16 argmax kernel: one block per row
+// Input: [batch, row_size] FP16, Output: [batch] int32
+__global__ void batched_argmax_fp16_kernel(
+    const half* __restrict__ input,   // [batch, row_size]
+    int32_t* __restrict__ output,     // [batch]
+    int32_t row_size) {
+  const int row = blockIdx.x;
+  const int tid = threadIdx.x;
+  const half* row_ptr = input + (size_t)row * row_size;
+
+  float best_val = -FLT_MAX;
+  int32_t best_idx = 0;
+
+  for (int i = tid; i < row_size; i += blockDim.x) {
+    float v = __half2float(row_ptr[i]);
+    if (v > best_val) { best_val = v; best_idx = i; }
+  }
+
+  // Warp-level reduction
+  for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+    float other_val = __shfl_down_sync(0xFFFFFFFF, best_val, offset);
+    int32_t other_idx = __shfl_down_sync(0xFFFFFFFF, best_idx, offset);
+    if (other_val > best_val) { best_val = other_val; best_idx = other_idx; }
+  }
+
+  // Block-level reduction via shared memory
+  __shared__ float s_val[32];
+  __shared__ int32_t s_idx[32];
+  int lane = tid % warpSize;
+  int wid = tid / warpSize;
+  if (lane == 0) { s_val[wid] = best_val; s_idx[wid] = best_idx; }
+  __syncthreads();
+
+  if (tid < blockDim.x / warpSize) {
+    best_val = s_val[tid]; best_idx = s_idx[tid];
+    for (int offset = (blockDim.x / warpSize) / 2; offset > 0; offset >>= 1) {
+      float other_val = __shfl_down_sync(0xFFFFFFFF, best_val, offset);
+      int32_t other_idx = __shfl_down_sync(0xFFFFFFFF, best_idx, offset);
+      if (other_val > best_val) { best_val = other_val; best_idx = other_idx; }
+    }
+    if (tid == 0) output[row] = best_idx;
+  }
+}
+
+void batched_argmax_fp16_cu(const void* input, int32_t* output_gpu, int32_t* output_cpu,
+                            int32_t batch, int32_t row_size, void* stream) {
+  cudaStream_t s = stream ? static_cast<cudaStream_t>(stream) : nullptr;
+  batched_argmax_fp16_kernel<<<batch, 256, 0, s>>>(
+      static_cast<const half*>(input), output_gpu, row_size);
+  cudaMemcpyAsync(output_cpu, output_gpu, batch * sizeof(int32_t),
+                  cudaMemcpyDeviceToHost, s);
 }
 
 }  // namespace kernel

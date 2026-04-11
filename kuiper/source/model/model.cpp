@@ -67,10 +67,12 @@ base::Status Model::read_model_file() {
   // magic = 0x616b3432 = "ak42" for Qwen2.5
   // magic = 0x616b3437 = "ak47" for Qwen3
   // magic = 0x616b3438 = "ak48" for Qwen3 AWQ
-  if (magic == 0x616b3432 || magic == 0x616b3437 || magic == 0x616b3438 || magic == 0x73713438) {
-    bool is_qwen3_format = (magic == 0x616b3437 || magic == 0x616b3438 || magic == 0x73713438);
+  // magic = 0x64663136 = "df16" for DFlash
+  if (magic == 0x616b3432 || magic == 0x616b3437 || magic == 0x616b3438 || magic == 0x73713438 || magic == 0x64663136) {
+    bool is_qwen3_format = (magic == 0x616b3437 || magic == 0x616b3438 || magic == 0x73713438 || magic == 0x64663136);
     bool is_awq_format = (magic == 0x616b3438);
     bool is_sq_format = (magic == 0x73713438);
+    bool is_dflash_format = (magic == 0x64663136);
     
     if (fread(&version, sizeof(int32_t), 1, file) != 1) {
       return error::ModelParseError("Failed to read version from model file.");
@@ -105,6 +107,10 @@ base::Status Model::read_model_file() {
       // INT8 quantized format
       is_quant_model_ = true;
       LOG(INFO) << "Loading INT8 quantized model format";
+    } else if (version == 7) {
+      // DFlash FP16 draft model format
+      is_fp16_model_ = true;
+      LOG(INFO) << "Loading DFlash FP16 draft model format";
     }
     
     // Read config field by field to avoid structure size mismatch
@@ -217,8 +223,9 @@ base::Status Model::read_model_file() {
   // Legacy format header size: 7 x int32_t = 28 bytes (without QWEN3_SUPPORT field)
   constexpr size_t kLegacyHeaderSize = 7 * sizeof(int32_t);  // 28 bytes
   
-  if (magic == 0x616b3432 || magic == 0x616b3437 || magic == 0x616b3438 || magic == 0x73713438) {
-    // Versioned format: 256 byte header (for ak42, ak47, ak48/AWQ, and sq48/SQ)
+  if (magic == 0x616b3432 || magic == 0x616b3437 || magic == 0x616b3438 || magic == 0x73713438 ||
+      magic == 0x64663136) {
+    // Versioned format: 256 byte header (for ak42, ak47, ak48/AWQ, sq48/SQ, and df16/DFlash)
     raw_model_data_->weight_data =
         static_cast<int8_t*>(raw_model_data_->data) + 256;
   } else if (!is_quant_model_) {

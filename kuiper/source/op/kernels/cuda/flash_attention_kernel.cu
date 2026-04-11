@@ -564,7 +564,8 @@ __global__ void flash_attention_prefill_kernel_fp16(
     const int kv_mul,
     const int dim,
     const int kv_dim,
-    const float scale
+    const float scale,
+    const bool is_causal
 ) {
     const int head = blockIdx.x;
     const int seq_idx = blockIdx.y;
@@ -575,7 +576,7 @@ __global__ void flash_attention_prefill_kernel_fp16(
     const int kv_head = head / kv_mul;
     const int head_offset = kv_head * head_size;
     const int cur_pos = start_pos + seq_idx;
-    const int kv_len = cur_pos + 1;
+    const int kv_len = is_causal ? (cur_pos + 1) : (start_pos + seq_len);
     const int head_size_h2 = head_size / 2;
     
     // Shared memory layout:
@@ -877,7 +878,8 @@ void flash_attention_prefill_fp16_cu(
     const tensor::Tensor& output,
     const tensor::Tensor& key_cache,
     const tensor::Tensor& value_cache,
-    CudaConfig* config
+    CudaConfig* config,
+    bool is_causal
 ) {
     const int layer_offset = layer_index * max_seq_len * kv_dim;
     const int dim = head_num * head_size;
@@ -900,7 +902,7 @@ void flash_attention_prefill_fp16_cu(
     flash_attention_prefill_kernel_fp16<<<grid, block, smem_size, stream>>>(
         Q, K, V, O,
         seq_len, start_pos, head_num, kv_head_num, head_size, kv_mul,
-        dim, kv_dim, scale
+        dim, kv_dim, scale, is_causal
     );
 }
 

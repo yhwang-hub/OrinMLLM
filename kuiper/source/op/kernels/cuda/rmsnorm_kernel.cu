@@ -542,4 +542,29 @@ void rmsnorm_kernel_cu_dim(const tensor::Tensor& input, const tensor::Tensor& we
   }
 }
 
+// ======================== FP32 → FP16 clamped conversion ========================
+static __global__ void fp32_to_fp16_clamp_kernel(const float* __restrict__ in,
+                                                  half* __restrict__ out,
+                                                  int n) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < n) {
+    float v = in[idx];
+    // Clamp to FP16 representable range to prevent INF
+    v = fmaxf(-65504.0f, fminf(65504.0f, v));
+    out[idx] = __float2half_rn(v);
+  }
+}
+
+void fp32_to_fp16_clamp_cu(const float* in, void* out, int n, void* stream) {
+  constexpr int threads = 256;
+  int blocks = (n + threads - 1) / threads;
+  if (stream) {
+    fp32_to_fp16_clamp_kernel<<<blocks, threads, 0, static_cast<cudaStream_t>(stream)>>>(
+        in, reinterpret_cast<half*>(out), n);
+  } else {
+    fp32_to_fp16_clamp_kernel<<<blocks, threads>>>(
+        in, reinterpret_cast<half*>(out), n);
+  }
+}
+
 }  // namespace kernel

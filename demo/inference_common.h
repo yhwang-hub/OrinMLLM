@@ -6,6 +6,8 @@
 #include <vector>
 #include <chrono>
 #include <functional>
+#include <iomanip>
+#include <cstring>
 #include <cuda_runtime.h>
 #include <glog/logging.h>
 #include "nlohmann/json.hpp"
@@ -13,6 +15,13 @@
 #include <base/prefix_cache.h>
 #include <base/alloc.h>
 #include "model/model.h"
+#include "model/qwen3_dflash.h"
+
+// Forward declaration for batched FP16 argmax kernel
+namespace kernel {
+void batched_argmax_fp16_cu(const void* input, int32_t* output_gpu, int32_t* output_cpu,
+                            int32_t batch, int32_t row_size, void* stream);
+}
 
 namespace inference {
 
@@ -137,6 +146,8 @@ struct InferenceConfig {
   bool benchmark_mode = false;       // 是否运行性能基准测试
   int benchmark_decode_tokens = 1024; // benchmark模式下的decode token数
   base::AttentionType attention_type = base::AttentionType::kAttentionFlash1; // 注意力计算类型
+  bool use_dflash = false;           // DFlash speculative decoding
+  std::string dflash_model_path;     // Path to DFlash draft model bin
   
   // 解析命令行参数
   static InferenceConfig parse_args(int argc, char* argv[], int start_idx = 3) {
@@ -201,6 +212,10 @@ struct InferenceConfig {
         config.benchmark_decode_tokens = std::atoi(argv[i + 1]);
         if (config.benchmark_decode_tokens <= 0) config.benchmark_decode_tokens = 1024;
         ++i;
+      } else if (arg == "--use-dflash" && i + 1 < argc) {
+        config.use_dflash = true;
+        config.dflash_model_path = argv[i + 1];
+        ++i;
       }
     }
     
@@ -223,6 +238,9 @@ struct InferenceConfig {
     LOG(INFO) << "Max context: " << max_context_len;
     if (interactive_mode) {
       LOG(INFO) << "Max history turns: " << max_history_turns;
+    }
+    if (use_dflash) {
+      LOG(INFO) << "DFlash: enabled (" << dflash_model_path << ")";
     }
     LOG(INFO) << "===============================";
   }
@@ -248,6 +266,7 @@ inline void print_usage(const char* program_name, const std::string& model_desc)
   LOG(INFO) << "  --max-tokens N     Set maximum number of tokens to generate (default: 256)";
   LOG(INFO) << "  --max-history N    Set maximum history turns in interactive mode (default: 10)";
   LOG(INFO) << "  --max-context N    Set maximum context length (default: 8192)";
+  LOG(INFO) << "  --use-dflash PATH  Enable DFlash speculative decoding with draft model at PATH";
   LOG(INFO) << "";
   LOG(INFO) << "Interactive Commands:";
   LOG(INFO) << "  /clear             Clear conversation history and KV cache";
@@ -1337,9 +1356,15 @@ void run_interactive(
     ModelType& model,
     const InferenceConfig& config,
     PrefixCacheManager* cache_manager,
-    const ModelInferConfig& model_config) {
+    const ModelInferConfig& model_config,
+    model::Qwen3DFlashModel* dflash_model = nullptr) {
     
     MultiTurnConversation conv;
+    // When DFlash is enabled, disable thinking mode for better acceptance
+    if (dflash_model && config.use_dflash) {
+        conv.set_system_prompt(
+            "You are Qwen, created by Alibaba Cloud. You are a helpful assistant. /no_think");
+    }
     PerfStats cumulative_stats;
     int32_t prev_decode_steps = 0;  // 上一轮对话的decode输出token数
     
@@ -1358,7 +1383,7 @@ void run_interactive(
         if (cache_manager) {
             cache_manager->clear();
         }
-        prev_decode_steps = 0;  // 清空KV cache时重置上一轮输出计数
+        prev_decode_steps = 0;
     };
     
     while (true) {
@@ -1375,12 +1400,21 @@ void run_interactive(
             if (cache_manager) {
                 cache_manager->clear();
             }
-            prev_decode_steps = 0;  // 截断历史时重置上一轮输出计数
+            prev_decode_steps = 0;
         }
         
         PerfStats stats;
-        std::string response = generate_response(model, conv, user_input, config, stats,
-                                                 cache_manager, model_config);
+        std::string response;
+        
+        if (dflash_model && config.use_dflash) {
+            // DFlash speculative decoding path
+            response = generate_response_dflash(model, *dflash_model, conv, user_input,
+                                                config, stats, cache_manager, model_config);
+        } else {
+            // Standard autoregressive decode path
+            response = generate_response(model, conv, user_input, config, stats,
+                                         cache_manager, model_config);
+        }
         
         // 多轮对话：将上一轮输出token数计入本轮prefill统计
         // 因为上一轮输出的token包含在本轮的prompt中，是需要"处理"的一部分
@@ -1763,11 +1797,357 @@ void run_benchmark(
     LOG(INFO) << "";
 }
 
+// ==================== DFlash Speculative Decoding ====================
+
+/// FP16→FP32 conversion on CPU (for argmax on FP16 logits)
+inline float fp16_to_fp32_cpu(uint16_t h) {
+    uint32_t sign = ((uint32_t)(h >> 15)) << 31;
+    uint32_t exp = (h >> 10) & 0x1F;
+    uint32_t mant = (uint32_t)(h & 0x3FF) << 13;
+    if (exp == 0) { float r; uint32_t f = sign; memcpy(&r, &f, 4); return r; }
+    if (exp == 31) { float r; uint32_t f = sign | 0x7F800000 | mant; memcpy(&r, &f, 4); return r; }
+    uint32_t f = sign | ((exp + 112) << 23) | mant;
+    float r; memcpy(&r, &f, 4); return r;
+}
+
+/// Argmax on a row of FP16 values on CPU
+inline int32_t argmax_fp16_row(const uint16_t* data, int32_t n) {
+    int32_t best = 0;
+    float best_val = fp16_to_fp32_cpu(data[0]);
+    for (int32_t i = 1; i < n; i++) {
+        float val = fp16_to_fp32_cpu(data[i]);
+        if (val > best_val) { best_val = val; best = i; }
+    }
+    return best;
+}
+
 /**
- * @brief 通用模型推理入口
- * 
- * 封装了模型初始化、配置和运行的通用流程。
- * 
+ * @brief DFlash speculative decoding generate function.
+ *
+ * Algorithm:
+ *   1. Target prefill with hidden state capture at layers [1,9,17,25,33]
+ *   2. Fuse captured hidden states → DFlash context
+ *   3. DFlash draft forward: [next, mask, ..., mask] → block_size draft tokens
+ *   4. Target verify: prefill draft tokens, get all-position logits + new hidden states
+ *   5. Accept consecutive matching tokens, get bonus token
+ *   6. Repeat from step 3
+ */
+template<typename TargetModelType>
+std::string generate_response_dflash(
+    TargetModelType& target_model,
+    model::Qwen3DFlashModel& draft_model,
+    MultiTurnConversation& conv,
+    const std::string& user_input,
+    const InferenceConfig& config,
+    PerfStats& stats,
+    PrefixCacheManager* cache_manager,
+    const ModelInferConfig& model_config) {
+    
+    std::string full_prompt = conv.get_full_prompt(user_input);
+    // When DFlash is enabled, prepend thinking closure to force non-thinking mode
+    // Qwen3 template appends <think>\n\n</think>\n\n when enable_thinking=false
+    full_prompt += "<think>\n\n</think>\n\n";
+    auto tokens = target_model.encode(full_prompt);
+    std::vector<int32_t> tokens_i32(tokens.begin(), tokens.end());
+    int32_t total_len = static_cast<int32_t>(tokens_i32.size());
+    stats.prompt_len = total_len;
+    
+    int32_t max_seq_len = target_model.get_config()->seq_len_;
+    if (total_len + config.max_tokens > max_seq_len) {
+        return "[Context length exceeded. Please use /clear to start a new conversation.]";
+    }
+    
+    // === Prefix cache / KV reuse ===
+    int32_t start_pos = 0;
+    bool used_radix_cache = false;
+    std::vector<int32_t> matched_prefix;
+    
+    if (config.use_prefix_cache && cache_manager) {
+        auto match_result = cache_manager->match(tokens_i32);
+        if (match_result.cache_hit && match_result.matched_tokens > 0) {
+            start_pos = match_result.matched_tokens;
+            stats.kv_reuse_len = match_result.matched_tokens;
+            used_radix_cache = true;
+            matched_prefix = match_result.matched_prefix;
+        } else {
+            target_model.clear_kv_cache();
+            conv.reset_kv_state();
+        }
+    } else {
+        int32_t common = conv.compute_common_prefix_len(tokens_i32);
+        int32_t cached = static_cast<int32_t>(conv.get_cached_tokens().size());
+        if (cached > 0 && common == cached && common > 0) {
+            start_pos = common;
+            stats.kv_reuse_len = common;
+        } else if (cached > 0) {
+            target_model.clear_kv_cache();
+            conv.reset_kv_state();
+        }
+    }
+    stats.prefill_tokens = total_len - start_pos;
+    stats.total_context_len = total_len;
+    
+    // === DFlash config ===
+    const auto& dflash_cfg = draft_model.get_dflash_config();
+    int32_t block_size = dflash_cfg.block_size;
+    int32_t mask_token_id = dflash_cfg.mask_token_id;
+    std::vector<int32_t> capture_layer_ids(dflash_cfg.target_layer_ids.begin(),
+                                            dflash_cfg.target_layer_ids.end());
+    int32_t dim = target_model.get_config()->dim_;
+    int32_t vocab_size = target_model.get_config()->vocab_size_;
+    base::DataType fp16_type = base::DataType::kDataTypeFp16;
+    size_t elem_size = sizeof(uint16_t);
+    
+    auto cuda_alloc = base::CUDADeviceAllocatorFactory::get_instance();
+    
+    // === Prefill with hidden state capture ===
+    Timer prefill_timer;
+    prefill_timer.start();
+    
+    std::vector<tensor::Tensor> captured_hidden;
+    
+    if (stats.prefill_tokens > 0) {
+        if (start_pos > 0) {
+            std::vector<int> new_tokens(tokens.begin() + start_pos, tokens.end());
+            const auto& emb = target_model.embedding(new_tokens);
+            target_model.prefill_with_capture(emb.input_embeddings, stats.prefill_tokens,
+                                               start_pos, capture_layer_ids, captured_hidden);
+        } else {
+            const auto& emb = target_model.embedding(tokens);
+            target_model.prefill_with_capture(emb.input_embeddings, total_len, 0,
+                                               capture_layer_ids, captured_hidden);
+        }
+    }
+    if (target_model.get_cuda_config())
+        cudaStreamSynchronize(target_model.get_cuda_config()->stream);
+    stats.prefill_time_ms = prefill_timer.elapsed_ms();
+    
+    if (start_pos > 0 && !used_radix_cache) {
+        const auto& cached = conv.get_cached_tokens();
+        std::vector<int32_t> new_cached(cached.begin(), cached.begin() + start_pos);
+        new_cached.insert(new_cached.end(), tokens_i32.begin() + start_pos, tokens_i32.end());
+        conv.update_cached_tokens(new_cached);
+    } else {
+        conv.update_cached_tokens(tokens_i32);
+    }
+    
+    // === Fuse initial captured hidden states → context buffer ===
+    int32_t prefill_ctx_len = (start_pos > 0) ? stats.prefill_tokens : total_len;
+    
+    tensor::Tensor fused_initial = draft_model.extract_and_fuse_context(captured_hidden, prefill_ctx_len);
+    if (draft_model.get_cuda_config())
+        cudaStreamSynchronize(draft_model.get_cuda_config()->stream);
+    
+    // Allocate growing fused context buffer [max_seq_len, dim] on GPU
+    tensor::Tensor context_buffer(fp16_type, max_seq_len, dim, true, cuda_alloc);
+    int32_t context_len = 0;
+    
+    // If we have KV reuse, the context buffer should start after the reused portion
+    // But the captured hidden only covers the new prefill portion
+    // For simplicity, context_len tracks the fused context length
+    // The DFlash model will use context_buffer[0:context_len] as its cross-attention context
+    // Use synchronous copy to ensure context is ready before decode loop
+    cudaMemcpy(const_cast<void*>(context_buffer.get_buffer()->ptr()),
+               fused_initial.get_buffer()->ptr(),
+               (size_t)prefill_ctx_len * dim * elem_size,
+               cudaMemcpyDeviceToDevice);
+    context_len = prefill_ctx_len;
+    
+    // === Sample first token ===
+    tensor::Tensor forward_output = target_model.get_buffer(model::ModelBufferType::kForwardOutput);
+    std::vector<float> logits_cpu(forward_output.size());
+    cudaMemcpy(logits_cpu.data(), forward_output.template ptr<float>(),
+               forward_output.size() * sizeof(float), cudaMemcpyDeviceToHost);
+    int32_t next = sample_argmax(logits_cpu);
+    
+    // === Speculative Decode Loop ===
+    Timer decode_timer;
+    decode_timer.start();
+    
+    std::vector<int32_t> generated_tokens;
+    int32_t pos = total_len;  // next KV cache position to write
+    int decode_steps = 0;
+    int total_draft_tokens = 0;
+    int total_accepted_tokens = 0;
+    
+    // Output first token
+    if (!model_config.should_skip(next)) {
+        generated_tokens.push_back(next);
+        if (config.stream_output) {
+            std::string t = static_cast<model::Model&>(target_model).decode(next);
+            if (!t.empty()) { printf("%s", t.c_str()); fflush(stdout); }
+        }
+    }
+    conv.append_token(next);
+    decode_steps++;
+    
+    // Pre-allocate buffers for the decode loop
+    // GPU argmax buffers (avoid 4.8MB D2H transfer per iteration)
+    tensor::Tensor argmax_gpu_buf(base::DataType::kDataTypeInt32, block_size, true, cuda_alloc);
+    std::vector<int32_t> argmax_cpu_buf(block_size);
+    
+    // FP16 logits buffers on GPU for lm_head output
+    tensor::Tensor draft_logits_gpu(fp16_type, block_size, vocab_size, true, cuda_alloc);
+    tensor::Tensor verify_logits_gpu(fp16_type, block_size, vocab_size, true, cuda_alloc);
+    
+    while (decode_steps < config.max_tokens) {
+        if (target_model.is_sentence_ending(next)) break;
+        if (pos + block_size > max_seq_len) break;
+        
+        // --- Step 1: Create draft block tokens: [next, MASK, MASK, ..., MASK] ---
+        std::vector<int> draft_input(block_size);
+        draft_input[0] = next;
+        for (int i = 1; i < block_size; ++i) draft_input[i] = mask_token_id;
+        
+        // --- Step 2: Get draft embeddings from target model ---
+        const auto& draft_emb = target_model.embedding(draft_input);
+        
+        // --- Step 3: Create context view (full context) ---
+        tensor::Tensor context_view(fp16_type, context_len * dim, false, nullptr,
+            const_cast<void*>(context_buffer.get_buffer()->ptr()));
+        context_view.set_device_type(base::DeviceType::kDeviceCUDA);
+        
+        // --- Step 4: Run DFlash draft forward ---
+        auto draft_status = draft_model.draft_forward(
+            draft_emb.input_embeddings, context_view,
+            context_len, block_size, pos);
+        if (!draft_status) {
+            LOG(WARNING) << "DFlash draft_forward failed.";
+            break;
+        }
+        
+        // --- Step 5: LM Head + GPU Argmax on draft output ---
+        if (draft_model.get_cuda_config())
+            cudaStreamSynchronize(draft_model.get_cuda_config()->stream);
+        tensor::Tensor& draft_output = draft_model.get_draft_output();
+        target_model.batched_lm_head(draft_output, draft_logits_gpu, block_size);
+        if (target_model.get_cuda_config())
+            cudaStreamSynchronize(target_model.get_cuda_config()->stream);
+        kernel::batched_argmax_fp16_cu(
+            draft_logits_gpu.template ptr<uint16_t>(),
+            argmax_gpu_buf.template ptr<int32_t>(),
+            argmax_cpu_buf.data(),
+            block_size, vocab_size,
+            target_model.get_cuda_config() ? target_model.get_cuda_config()->stream : nullptr);
+        cudaStreamSynchronize(target_model.get_cuda_config()->stream);
+        
+        std::vector<int32_t> draft_tokens(block_size);
+        draft_tokens[0] = next;
+        for (int i = 1; i < block_size; i++)
+            draft_tokens[i] = argmax_cpu_buf[i];
+        
+        total_draft_tokens += block_size - 1;
+        
+        // --- Step 6: Target model verifies ---
+        std::vector<int> draft_tokens_int(draft_tokens.begin(), draft_tokens.end());
+        const auto& verify_emb = target_model.embedding(draft_tokens_int);
+        std::vector<tensor::Tensor> new_captured_hidden;
+        auto verify_status = target_model.prefill_verify(
+            verify_emb.input_embeddings, block_size, pos,
+            capture_layer_ids, new_captured_hidden, verify_logits_gpu);
+        if (!verify_status) {
+            LOG(WARNING) << "prefill_verify failed.";
+            break;
+        }
+        if (target_model.get_cuda_config())
+            cudaStreamSynchronize(target_model.get_cuda_config()->stream);
+        
+        // --- Step 7: GPU Argmax on verify logits ---
+        kernel::batched_argmax_fp16_cu(
+            verify_logits_gpu.template ptr<uint16_t>(),
+            argmax_gpu_buf.template ptr<int32_t>(),
+            argmax_cpu_buf.data(),
+            block_size, vocab_size,
+            target_model.get_cuda_config() ? target_model.get_cuda_config()->stream : nullptr);
+        cudaStreamSynchronize(target_model.get_cuda_config()->stream);
+        
+        std::vector<int32_t> target_tokens(block_size);
+        for (int i = 0; i < block_size; i++)
+            target_tokens[i] = argmax_cpu_buf[i];
+        
+        // --- Step 8: Accept consecutive matches ---
+        int accepted = 0;
+        bool hit_eos = false;
+        for (int i = 0; i < block_size - 1; i++) {
+            if (draft_tokens[i + 1] == target_tokens[i]) {
+                accepted++;
+                if (target_model.is_sentence_ending(draft_tokens[i + 1])) {
+                    hit_eos = true;
+                    break;
+                }
+            } else break;
+        }
+        total_accepted_tokens += accepted;
+        
+        // --- Step 9: Output accepted tokens ---
+        for (int i = 1; i <= accepted; i++) {
+            conv.append_token(draft_tokens[i]);
+            if (!model_config.should_skip(draft_tokens[i])) {
+                generated_tokens.push_back(draft_tokens[i]);
+                if (config.stream_output) {
+                    std::string t = static_cast<model::Model&>(target_model).decode(draft_tokens[i]);
+                    if (!t.empty()) { printf("%s", t.c_str()); fflush(stdout); }
+                }
+            }
+            decode_steps++;
+        }
+        if (hit_eos) break;
+        
+        // --- Step 10: Bonus token ---
+        next = target_tokens[accepted];
+        conv.append_token(next);
+        if (!model_config.should_skip(next)) {
+            generated_tokens.push_back(next);
+            if (config.stream_output) {
+                std::string t = static_cast<model::Model&>(target_model).decode(next);
+                if (!t.empty()) { printf("%s", t.c_str()); fflush(stdout); }
+            }
+        }
+        decode_steps++;
+        
+        // --- Step 11: Update context with new fused hidden states ---
+        int32_t fuse_len = accepted + 1;
+        tensor::Tensor new_fused = draft_model.extract_and_fuse_context(new_captured_hidden, fuse_len);
+        if (draft_model.get_cuda_config())
+            cudaStreamSynchronize(draft_model.get_cuda_config()->stream);
+        cudaMemcpy(
+            static_cast<char*>(const_cast<void*>(context_buffer.get_buffer()->ptr()))
+                + (size_t)context_len * dim * elem_size,
+            new_fused.get_buffer()->ptr(),
+            (size_t)fuse_len * dim * elem_size,
+            cudaMemcpyDeviceToDevice);
+        context_len += fuse_len;
+        
+        pos += accepted + 1;
+    }
+    
+    if (target_model.get_cuda_config())
+        cudaStreamSynchronize(target_model.get_cuda_config()->stream);
+    stats.decode_time_ms = decode_timer.elapsed_ms();
+    stats.decode_steps = decode_steps;
+    
+    // Log speculative decode statistics
+    if (total_draft_tokens > 0) {
+        double acceptance_rate = (double)total_accepted_tokens / total_draft_tokens * 100.0;
+        LOG(INFO) << "DFlash speculative decode: " << total_accepted_tokens << "/" 
+                  << total_draft_tokens << " tokens accepted (" 
+                  << std::fixed << std::setprecision(1) << acceptance_rate << "%)";
+    }
+    
+    // Register to RadixTree PrefixCache
+    if (config.use_prefix_cache && cache_manager) {
+        auto final_tokens = conv.get_cached_tokens();
+        cache_manager->register_prefix(final_tokens, static_cast<int32_t>(final_tokens.size()));
+        if (!matched_prefix.empty()) {
+            cache_manager->release(matched_prefix);
+        }
+    }
+    
+    if (generated_tokens.empty()) return "";
+    return static_cast<model::Model&>(target_model).decode(generated_tokens);
+}
+
+/**
  * @tparam ModelType 模型类型
  * @param argc 命令行参数个数
  * @param argv 命令行参数
@@ -1831,8 +2211,28 @@ int run_model_inference(
     model.enable_fused_ffn(config.use_fused_ffn);
     model.set_attention_type(config.attention_type);
     
-    if (config.use_cuda_graph) {
+    if (config.use_cuda_graph && !config.use_dflash) {
+        // Disable CUDA Graph when using DFlash (speculative decode changes execution pattern)
         model.enable_cuda_graph(true);
+    }
+    
+    // 初始化 DFlash draft model（如果启用）
+    std::unique_ptr<model::Qwen3DFlashModel> dflash_model;
+    if (config.use_dflash) {
+        if (config.dflash_model_path.empty()) {
+            LOG(FATAL) << "--use-dflash requires a path to the DFlash draft model bin file";
+        }
+        LOG(INFO) << "Loading DFlash draft model from: " << config.dflash_model_path;
+        dflash_model = std::make_unique<model::Qwen3DFlashModel>(
+            base::TokenizerType::kEncodeBpe, tokenizer_path,
+            config.dflash_model_path.c_str(), false);
+        auto dflash_status = dflash_model->init(base::DeviceType::kDeviceCUDA);
+        if (!dflash_status) {
+            LOG(FATAL) << "DFlash model init failed: " << dflash_status.get_err_code();
+        }
+        dflash_model->enable_fused_ffn(config.use_fused_ffn);
+        dflash_model->set_attention_type(config.attention_type);
+        LOG(INFO) << "DFlash draft model loaded successfully!";
     }
     
     config.print();
@@ -1841,7 +2241,8 @@ int run_model_inference(
     if (config.benchmark_mode) {
         run_benchmark(model, config, model_config);
     } else if (config.interactive_mode) {
-        run_interactive(model, config, cache_manager.get(), model_config);
+        run_interactive(model, config, cache_manager.get(), model_config,
+                        dflash_model ? dflash_model.get() : nullptr);
     } else {
         run_single_inference(model, config, cache_manager.get(), model_config);
     }

@@ -103,6 +103,23 @@ class QwenBaseModel : public Model {
   base::Status prefill(const tensor::Tensor& input, int32_t seq_len, int32_t start_pos) const;
   base::Status decode(const tensor::Tensor& input, int32_t pos, int& next) const;
 
+  // === Speculative Decoding Support ===
+  /// Prefill that also captures hidden states at specified target layers.
+  base::Status prefill_with_capture(
+      const tensor::Tensor& input, int32_t seq_len, int32_t start_pos,
+      const std::vector<int32_t>& capture_layer_ids,
+      std::vector<tensor::Tensor>& captured_hidden) const;
+
+  /// Prefill for draft verification: captures hidden states AND produces logits at ALL positions.
+  base::Status prefill_verify(
+      const tensor::Tensor& input, int32_t seq_len, int32_t start_pos,
+      const std::vector<int32_t>& capture_layer_ids,
+      std::vector<tensor::Tensor>& captured_hidden,
+      tensor::Tensor& all_logits) const;
+
+  /// Apply lm_head only (no norm) to batched hidden states [n, dim] → [n, vocab_size] FP16.
+  void batched_lm_head(const tensor::Tensor& hidden, tensor::Tensor& logits, int32_t n) const;
+
   // === CUDA Graph management ===
   void enable_cuda_graph(bool enable) {
     if (cuda_config_) {

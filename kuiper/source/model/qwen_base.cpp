@@ -568,6 +568,182 @@ base::Status QwenBaseModel::prefill(const tensor::Tensor& input, int32_t seq_len
   return base::error::Success();
 }
 
+// ==================== Speculative Decoding Support ====================
+
+base::Status QwenBaseModel::prefill_with_capture(
+    const tensor::Tensor& input, int32_t seq_len, int32_t start_pos,
+    const std::vector<int32_t>& capture_layer_ids,
+    std::vector<tensor::Tensor>& captured_hidden) const {
+  if (input.is_empty()) {
+    return base::error::InvalidArgument("The input tensor is empty.");
+  }
+  if (device_type_ != base::DeviceType::kDeviceCUDA) {
+    return base::error::InternalError("Batched prefill only supports CUDA device");
+  }
+
+  auto* layers = get_base_layers();
+  std::shared_ptr<base::DeviceAllocator> alloc = base::CUDADeviceAllocatorFactory::get_instance();
+
+  base::DataType activation_dtype = input.data_type();
+  size_t elem_size = (activation_dtype == base::DataType::kDataTypeFp16)
+      ? sizeof(uint16_t) : sizeof(float);
+
+  int32_t dim = config_->dim_;
+  int32_t hidden_dim = config_->hidden_dim_;
+
+  // Pre-allocate captured hidden states
+  captured_hidden.resize(capture_layer_ids.size());
+
+  // Double-buffering for hidden states (same as prefill)
+  tensor::Tensor hidden_buf0(activation_dtype, seq_len, dim, true, alloc);
+  tensor::Tensor hidden_buf1(activation_dtype, seq_len, dim, true, alloc);
+  tensor::Tensor rms_out(activation_dtype, seq_len, dim, true, alloc);
+  tensor::Tensor query_out(activation_dtype, seq_len, dim, true, alloc);
+  tensor::Tensor key_out(activation_dtype, seq_len, config_->kv_dim_, true, alloc);
+  tensor::Tensor value_out(activation_dtype, seq_len, config_->kv_dim_, true, alloc);
+  tensor::Tensor mha_out(activation_dtype, seq_len, dim, true, alloc);
+  tensor::Tensor wo_out(activation_dtype, seq_len, dim, true, alloc);
+  tensor::Tensor ffn_norm_out(activation_dtype, seq_len, dim, true, alloc);
+  tensor::Tensor w1_out(activation_dtype, seq_len, hidden_dim, true, alloc);
+  tensor::Tensor w3_out(activation_dtype, seq_len, hidden_dim, true, alloc);
+  tensor::Tensor w2_out(activation_dtype, seq_len, dim, true, alloc);
+
+  tensor::Tensor* hidden_buffers[2] = {&hidden_buf0, &hidden_buf1};
+
+  for (int32_t layer_idx = 0; layer_idx < config_->layer_num_; ++layer_idx) {
+    const tensor::Tensor* layer_input;
+    tensor::Tensor* layer_output;
+
+    if (layer_idx == 0) {
+      layer_input = &input;
+      layer_output = hidden_buffers[0];
+    } else {
+      layer_input = hidden_buffers[(layer_idx - 1) % 2];
+      layer_output = hidden_buffers[layer_idx % 2];
+    }
+
+    batched_attention_rms(layer_idx, *layer_input, rms_out, seq_len);
+    batched_attention_qkv(layer_idx, rms_out, query_out, key_out, value_out,
+                          seq_len, start_pos);
+    batched_attention_mha(layer_idx, query_out, mha_out, wo_out, seq_len, start_pos);
+    STATUS_CHECK(layers->batched_add_layer_->forward(*layer_input, wo_out, *layer_output));
+    batched_feed_forward_optimized(layer_idx, *layer_output, ffn_norm_out,
+                                   w1_out, w3_out, w2_out, seq_len);
+
+    // Capture hidden state if this layer is in capture_layer_ids
+    for (size_t ci = 0; ci < capture_layer_ids.size(); ++ci) {
+      if (capture_layer_ids[ci] == layer_idx) {
+        captured_hidden[ci] = tensor::Tensor(activation_dtype, seq_len, dim, true, alloc);
+        cudaMemcpyAsync(const_cast<void*>(captured_hidden[ci].get_buffer()->ptr()),
+                        layer_output->get_buffer()->ptr(),
+                        (size_t)seq_len * dim * elem_size,
+                        cudaMemcpyDeviceToDevice, cuda_config_->stream);
+      }
+    }
+  }
+
+  // cls_logits on last token (same as regular prefill)
+  tensor::Tensor* final_hidden = hidden_buffers[(config_->layer_num_ - 1) % 2];
+  void* last_token_ptr = static_cast<char*>(
+      const_cast<void*>(final_hidden->get_buffer()->ptr())) +
+      (seq_len - 1) * dim * elem_size;
+  tensor::Tensor last_hidden(activation_dtype, dim, false, nullptr, last_token_ptr);
+  last_hidden.set_device_type(device_type_);
+  cls_logits(last_hidden);
+
+  return base::error::Success();
+}
+
+base::Status QwenBaseModel::prefill_verify(
+    const tensor::Tensor& input, int32_t seq_len, int32_t start_pos,
+    const std::vector<int32_t>& capture_layer_ids,
+    std::vector<tensor::Tensor>& captured_hidden,
+    tensor::Tensor& all_logits) const {
+  if (input.is_empty()) {
+    return base::error::InvalidArgument("The input tensor is empty.");
+  }
+  if (device_type_ != base::DeviceType::kDeviceCUDA) {
+    return base::error::InternalError("Batched prefill only supports CUDA device");
+  }
+
+  auto* layers = get_base_layers();
+  std::shared_ptr<base::DeviceAllocator> alloc = base::CUDADeviceAllocatorFactory::get_instance();
+
+  base::DataType activation_dtype = input.data_type();
+  size_t elem_size = (activation_dtype == base::DataType::kDataTypeFp16)
+      ? sizeof(uint16_t) : sizeof(float);
+
+  int32_t dim = config_->dim_;
+  int32_t hidden_dim = config_->hidden_dim_;
+
+  captured_hidden.resize(capture_layer_ids.size());
+
+  tensor::Tensor hidden_buf0(activation_dtype, seq_len, dim, true, alloc);
+  tensor::Tensor hidden_buf1(activation_dtype, seq_len, dim, true, alloc);
+  tensor::Tensor rms_out(activation_dtype, seq_len, dim, true, alloc);
+  tensor::Tensor query_out(activation_dtype, seq_len, dim, true, alloc);
+  tensor::Tensor key_out(activation_dtype, seq_len, config_->kv_dim_, true, alloc);
+  tensor::Tensor value_out(activation_dtype, seq_len, config_->kv_dim_, true, alloc);
+  tensor::Tensor mha_out(activation_dtype, seq_len, dim, true, alloc);
+  tensor::Tensor wo_out(activation_dtype, seq_len, dim, true, alloc);
+  tensor::Tensor ffn_norm_out(activation_dtype, seq_len, dim, true, alloc);
+  tensor::Tensor w1_out(activation_dtype, seq_len, hidden_dim, true, alloc);
+  tensor::Tensor w3_out(activation_dtype, seq_len, hidden_dim, true, alloc);
+  tensor::Tensor w2_out(activation_dtype, seq_len, dim, true, alloc);
+
+  tensor::Tensor* hidden_buffers[2] = {&hidden_buf0, &hidden_buf1};
+
+  for (int32_t layer_idx = 0; layer_idx < config_->layer_num_; ++layer_idx) {
+    const tensor::Tensor* layer_input;
+    tensor::Tensor* layer_output;
+
+    if (layer_idx == 0) {
+      layer_input = &input;
+      layer_output = hidden_buffers[0];
+    } else {
+      layer_input = hidden_buffers[(layer_idx - 1) % 2];
+      layer_output = hidden_buffers[layer_idx % 2];
+    }
+
+    batched_attention_rms(layer_idx, *layer_input, rms_out, seq_len);
+    batched_attention_qkv(layer_idx, rms_out, query_out, key_out, value_out,
+                          seq_len, start_pos);
+    batched_attention_mha(layer_idx, query_out, mha_out, wo_out, seq_len, start_pos);
+    STATUS_CHECK(layers->batched_add_layer_->forward(*layer_input, wo_out, *layer_output));
+    batched_feed_forward_optimized(layer_idx, *layer_output, ffn_norm_out,
+                                   w1_out, w3_out, w2_out, seq_len);
+
+    for (size_t ci = 0; ci < capture_layer_ids.size(); ++ci) {
+      if (capture_layer_ids[ci] == layer_idx) {
+        captured_hidden[ci] = tensor::Tensor(activation_dtype, seq_len, dim, true, alloc);
+        cudaMemcpyAsync(const_cast<void*>(captured_hidden[ci].get_buffer()->ptr()),
+                        layer_output->get_buffer()->ptr(),
+                        (size_t)seq_len * dim * elem_size,
+                        cudaMemcpyDeviceToDevice, cuda_config_->stream);
+      }
+    }
+  }
+
+  // Apply final norm + lm_head to ALL positions (not just last token!)
+  tensor::Tensor* final_hidden = hidden_buffers[(config_->layer_num_ - 1) % 2];
+
+  // Final RMSNorm on all positions
+  const auto& final_norm = layers->rmsnorm_layers_.at(2 * config_->layer_num_);
+  tensor::Tensor normed(activation_dtype, seq_len, dim, true, alloc);
+  STATUS_CHECK(final_norm->forward(*final_hidden, normed));
+
+  // lm_head (cls_layer) on all positions: [seq_len, dim] → [seq_len, vocab_size]
+  batched_lm_head(normed, all_logits, seq_len);
+
+  return base::error::Success();
+}
+
+void QwenBaseModel::batched_lm_head(const tensor::Tensor& hidden,
+                                    tensor::Tensor& logits, int32_t n) const {
+  auto* layers = get_base_layers();
+  batched_matmul_forward(layers->cls_layer_, hidden, logits, n);
+}
+
 // ==================== Decode ====================
 
 base::Status QwenBaseModel::decode(const tensor::Tensor& input, int32_t pos, int& next) const {

@@ -182,7 +182,7 @@ base::Status FlashAttentionPrefillLayer::forward() {
           start_pos_, cur_seq_len_, head_num_, kv_head_num_, head_size_,
           kv_mul, layer_idx_, max_seq_len_, kv_dim,
           query, output, key_cache, value_cache,
-          cuda_config_.get());
+          cuda_config_.get(), is_causal_);
     }
   } else {
     if (attention_type_ == base::AttentionType::kAttentionFlash2) {
