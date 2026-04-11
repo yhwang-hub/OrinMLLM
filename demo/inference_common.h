@@ -2128,6 +2128,10 @@ std::string generate_response_dflash(
     
     // Log speculative decode statistics
     if (total_draft_tokens > 0) {
+        if (config.stream_output) {
+            printf("\n");
+            fflush(stdout);
+        }
         double acceptance_rate = (double)total_accepted_tokens / total_draft_tokens * 100.0;
         LOG(INFO) << "DFlash speculative decode: " << total_accepted_tokens << "/" 
                   << total_draft_tokens << " tokens accepted (" 
