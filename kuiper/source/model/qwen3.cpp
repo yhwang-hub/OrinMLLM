@@ -229,10 +229,12 @@ base::Status Qwen3Model::init(base::DeviceType device_type) {
 
   init_mem();
   // Initialize sin/cos cache via layer forward
+  LOG(INFO) << "init_mem: all buffers allocated, calling sin_cos_cache forward";
   CHECK_NE(qwen_layers_->sin_cos_cache_layer_, nullptr);
   qwen_layers_->sin_cos_cache_layer_->forward(config_->head_size_, config_->seq_len_,
                                               get_buffer(ModelBufferType::kSinCache),
                                               get_buffer(ModelBufferType::kCosCache));
+  LOG(INFO) << "init_mem: sin_cos_cache forward done";
 
   sampler_ = std::make_unique<sampler::ArgmaxSampler>(device_type_);
   return error::Success();
@@ -241,12 +243,14 @@ base::Status Qwen3Model::init(base::DeviceType device_type) {
 
 void Qwen3Model::create_nonparam_layers() {
   CHECK(qwen_layers_ != nullptr);
+  int32_t attn_dim_for_layers = config_->head_num_ * config_->head_size_;
   qwen_layers_->rope_layer_ = std::make_shared<op::RoPELayer>(
-      device_type_, config_->dim_, config_->kv_dim_, config_->head_size_);
+      device_type_, attn_dim_for_layers, config_->kv_dim_, config_->head_size_);
 
   qwen_layers_->mha_layer_ = std::make_shared<op::MultiHeadAttention>(
       device_type_, 0, config_->kv_mul_, config_->kv_dim_, config_->seq_len_, config_->head_num_,
       config_->head_size_);
+  // Note: attn_dim_for_layers = n_heads * head_dim (may differ from dim_ for Qwen3-4B)
 
   qwen_layers_->add_layer_ = std::make_shared<op::VecAddLayer>(device_type_);
 
@@ -272,10 +276,10 @@ void Qwen3Model::create_nonparam_layers() {
       device_type_, config_->dim_, config_->hidden_dim_, is_fp16_model_, false);
   
   qwen_layers_->rope_gpu_pos_layer_ = std::make_shared<op::RoPEGpuPosLayer>(
-      device_type_, config_->dim_, config_->kv_dim_, config_->head_size_, is_fp16_model_);
+      device_type_, attn_dim_for_layers, config_->kv_dim_, config_->head_size_, is_fp16_model_);
   
   qwen_layers_->batched_rope_layer_ = std::make_shared<op::BatchedRoPELayer>(
-      device_type_, config_->dim_, config_->kv_dim_, config_->head_size_,
+      device_type_, attn_dim_for_layers, config_->kv_dim_, config_->head_size_,
       config_->head_num_, config_->kv_head_num_);
   
   // Create batched add/swiglu layers for prefill (support any-dim tensors)
@@ -485,8 +489,9 @@ void Qwen3Model::create_param_layers_fp16() {
   pos += config_->vocab_size_ * dim;
 
   // 5. wq layers
+  int32_t fp16_attn_dim = config_->head_num_ * config_->head_size_;
   for (int32_t i = 0; i < config_->layer_num_; ++i) {
-    auto wq = std::make_shared<op::MatmulLayer>(device_type_, dim, dim, false);
+    auto wq = std::make_shared<op::MatmulLayer>(device_type_, fp16_attn_dim, dim, false);
     wq->set_weight_fp16(0, {dim, dim}, raw_model_data_->weight(pos),
                         cpu_device_type);
     qwen_layers_->wq_layers_.push_back(wq);
@@ -515,7 +520,7 @@ void Qwen3Model::create_param_layers_fp16() {
 
   // 8. wo layers
   for (int32_t i = 0; i < config_->layer_num_; ++i) {
-    auto wo = std::make_shared<op::MatmulLayer>(device_type_, dim, dim, false);
+    auto wo = std::make_shared<op::MatmulLayer>(device_type_, dim, fp16_attn_dim, false);
     wo->set_weight_fp16(0, {dim, dim}, raw_model_data_->weight(pos),
                         cpu_device_type);
     qwen_layers_->wo_layers_.push_back(wo);
@@ -600,8 +605,9 @@ void Qwen3Model::init_mem() {
   if (device_type_ == base::DeviceType::kDeviceCUDA) {
     CHECK_NE(cuda_config_, nullptr);
     // Keep FP16 weights on GPU for FP16 models to save memory and enable FP16 compute
+    LOG(INFO) << "init_mem: calling to_cuda...";
     qwen_layers_->to_cuda(cuda_config_, is_fp16_model_);
-    
+    LOG(INFO) << "init_mem: to_cuda done";
 
   }
 
@@ -619,9 +625,14 @@ void Qwen3Model::init_mem() {
     LOG(INFO) << "Using FP16 activation buffers for pure FP16 compute path";
   }
 
-  // For Qwen3: dim_ is the model dimension (4096), hidden_dim_ is intermediate_size (12288)
+  // For Qwen3: dim_ is the model hidden dimension, immediate_dim_ is intermediate_size
+  // attn_dim = n_heads * head_dim (may differ from dim_ for models like Qwen3-4B)
   int32_t model_dim = config_->dim_;
+  int32_t attn_dim = config_->head_num_ * config_->head_size_;
   int32_t intermediate_dim = config_->immediate_dim_;
+  LOG(INFO) << "init_mem: model_dim=" << model_dim << ", attn_dim=" << attn_dim
+            << ", kv_dim=" << config_->kv_dim_ << ", intermediate=" << intermediate_dim
+            << ", seq_len=" << config_->seq_len_ << ", head_size=" << config_->head_size_;
 
   tensor::Tensor input_tokens(base::DataType::kDataTypeInt32, 1, true, alloc_cpu);
   tensor::Tensor input_embeddings(activation_dtype, 1, model_dim, true,
@@ -630,6 +641,7 @@ void Qwen3Model::init_mem() {
   CHECK(insert_buffer(ModelBufferType::kInputTokens, input_tokens));
   CHECK(insert_buffer(ModelBufferType::kInputEmbeddings, input_embeddings));
 
+  LOG(INFO) << "init_mem: allocating sin/cos cache size=" << config_->head_size_ * config_->seq_len_;
   tensor::Tensor sin_cache(base::DataType::kDataTypeFp32, config_->head_size_ * config_->seq_len_,
                            true, alloc);
   tensor::Tensor cos_cache(base::DataType::kDataTypeFp32, config_->head_size_ * config_->seq_len_,
@@ -639,7 +651,7 @@ void Qwen3Model::init_mem() {
   CHECK(insert_buffer(ModelBufferType::kCosCache, cos_cache));
 
   tensor::Tensor rms_output(activation_dtype, model_dim, true, alloc);
-  tensor::Tensor out_mha(activation_dtype, config_->dim_, true, alloc);
+  tensor::Tensor out_mha(activation_dtype, attn_dim, true, alloc);
 
   CHECK(insert_buffer(ModelBufferType::kOutputRMSNorm, rms_output));
   CHECK(insert_buffer(ModelBufferType::kOutputMHA, out_mha));
@@ -653,6 +665,7 @@ void Qwen3Model::init_mem() {
   CHECK(insert_buffer(ModelBufferType::kW3Output, w3_output));
 
   // kv cache - use FP16 for memory efficiency and bandwidth when model is FP16
+  LOG(INFO) << "init_mem: allocating KV cache size=" << config_->layer_num_ << "x" << config_->seq_len_ << "x" << config_->kv_dim_;
   tensor::Tensor key_cache(activation_dtype, config_->layer_num_, config_->seq_len_,
                            config_->kv_dim_, true, alloc);
   tensor::Tensor value_cache(activation_dtype, config_->layer_num_, config_->seq_len_,
@@ -662,8 +675,11 @@ void Qwen3Model::init_mem() {
   CHECK(insert_buffer(ModelBufferType::kValueCache, value_cache));
 
   // Wq query output
-  tensor::Tensor query(activation_dtype, config_->dim_, true, alloc);
+  LOG(INFO) << "init_mem: allocating query buf size=" << attn_dim;
+  tensor::Tensor query(activation_dtype, attn_dim, true, alloc);
+  LOG(INFO) << "init_mem: query allocated, inserting...";
   CHECK(insert_buffer(ModelBufferType::kQuery, query));
+  LOG(INFO) << "init_mem: query inserted";
 
   // Pos tensor - on CPU for normal path
   tensor::Tensor pos_tensor(base::DataType::kDataTypeInt32, 1, true, alloc_cpu);
@@ -969,8 +985,9 @@ void Qwen3Model::batched_attention_qkv(int32_t layer_idx, const tensor::Tensor& 
   // Create reshaped tensor views for per-head normalization
   // Query: original shape [seq_len, dim] -> view as [seq_len * head_num, head_size]
   // Key: original shape [seq_len, kv_dim] -> view as [seq_len * kv_head_num, head_size]
+  int32_t q_total_dim = config_->head_num_ * config_->head_size_;  // = attn_dim
   auto q_buffer = std::make_shared<base::Buffer>(
-      seq_len * config_->dim_ * elem_size, nullptr,
+      seq_len * q_total_dim * elem_size, nullptr,
       const_cast<void*>(query_out.get_buffer()->ptr()), true);
   tensor::Tensor q_reshaped(activation_dtype, 
                             seq_len * config_->head_num_, config_->head_size_, 

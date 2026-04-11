@@ -505,16 +505,17 @@ base::Status QwenBaseModel::prefill(const tensor::Tensor& input, int32_t seq_len
       ? sizeof(uint16_t) : sizeof(float);
 
   int32_t dim = config_->dim_;
+  int32_t attn_dim = config_->head_num_ * config_->head_size_;  // may differ from dim
   int32_t hidden_dim = config_->hidden_dim_;
 
   // Double-buffering for hidden states
   tensor::Tensor hidden_buf0(activation_dtype, seq_len, dim, true, alloc);
   tensor::Tensor hidden_buf1(activation_dtype, seq_len, dim, true, alloc);
   tensor::Tensor rms_out(activation_dtype, seq_len, dim, true, alloc);
-  tensor::Tensor query_out(activation_dtype, seq_len, dim, true, alloc);
+  tensor::Tensor query_out(activation_dtype, seq_len, attn_dim, true, alloc);
   tensor::Tensor key_out(activation_dtype, seq_len, config_->kv_dim_, true, alloc);
   tensor::Tensor value_out(activation_dtype, seq_len, config_->kv_dim_, true, alloc);
-  tensor::Tensor mha_out(activation_dtype, seq_len, dim, true, alloc);
+  tensor::Tensor mha_out(activation_dtype, seq_len, attn_dim, true, alloc);
   tensor::Tensor wo_out(activation_dtype, seq_len, dim, true, alloc);
 
   // Pre-allocate FFN buffers

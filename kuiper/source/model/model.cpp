@@ -67,13 +67,16 @@ base::Status Model::read_model_file() {
   // magic = 0x616b3432 = "ak42" for Qwen2.5
   // magic = 0x616b3437 = "ak47" for Qwen3
   // magic = 0x616b3438 = "ak48" for Qwen3 AWQ
+  // magic = 0x73713438 = "sq48" for Qwen3 SmoothQuant
   // magic = 0x64663136 = "df16" for DFlash
-  if (magic == 0x616b3432 || magic == 0x616b3437 || magic == 0x616b3438 || magic == 0x73713438 || magic == 0x64663136) {
-    bool is_qwen3_format = (magic == 0x616b3437 || magic == 0x616b3438 || magic == 0x73713438 || magic == 0x64663136);
+  // magic = 0x66703838 = "fp88" for FP8
+  if (magic == 0x616b3432 || magic == 0x616b3437 || magic == 0x616b3438 || magic == 0x73713438 || magic == 0x64663136 || magic == 0x66703838) {
+    bool is_qwen3_format = (magic == 0x616b3437 || magic == 0x616b3438 || magic == 0x73713438 || magic == 0x64663136 || magic == 0x66703838);
     bool is_awq_format = (magic == 0x616b3438);
     bool is_sq_format = (magic == 0x73713438);
     bool is_dflash_format = (magic == 0x64663136);
-    
+    bool is_fp8_format = (magic == 0x66703838);
+
     if (fread(&version, sizeof(int32_t), 1, file) != 1) {
       return error::ModelParseError("Failed to read version from model file.");
     }
@@ -99,6 +102,11 @@ base::Status Model::read_model_file() {
       is_sq_model_ = true;
       is_fp16_model_ = true;  // SQ uses FP16 for non-quantized weights
       LOG(INFO) << "Loading SmoothQuant INT8 model format (Qwen3)";
+    } else if (version == 7) {
+      // FP8 E4M3 block-quantized format for Qwen3
+      is_fp8_model_ = true;
+      is_fp16_model_ = true;  // FP8 uses FP16 for non-quantized weights
+      LOG(INFO) << "Loading FP8 E4M3 block-quantized model format (Qwen3)";
     } else if (version == 1) {
       // FP32 format with header
       is_fp16_model_ = false;
@@ -145,6 +153,19 @@ base::Status Model::read_model_file() {
       config.immediate_dim_ = config.hidden_dim;
 #endif
 
+      // For FP8 format, read block_size (stored in header, reading to advance file pointer)
+      if (is_fp8_format) {
+        int32_t fp8_block_size = 0;
+        if (fread(&fp8_block_size, sizeof(int32_t), 1, file) != 1) {
+          return error::ModelParseError("Failed to read block_size from FP8 model file.");
+        }
+        LOG(INFO) << "FP8 block_size: " << fp8_block_size;
+      }
+
+      // Override head_size_ and kv_dim_ for models with head_dim != dim/n_heads (e.g. Qwen3-4B)
+      // This is set after generate_model_infos which computes head_size_ = dim/n_heads
+      // Must be deferred until after generate_model_infos call below
+
       // For AWQ format, read group_size
       if (is_awq_format) {
         if (fread(&group_size_, sizeof(int32_t), 1, file) != 1) {
@@ -167,6 +188,15 @@ base::Status Model::read_model_file() {
     // Override shared weight flag from file
     config_->is_shared_weight_ = (shared_classifier != 0);
     LOG(INFO) << "is_shared_weight_: " << config_->is_shared_weight_;
+
+    // Override head_size_ and kv_dim_ for Qwen3 with explicit head_dim
+    if (is_qwen3_format && head_dim > 0 && head_dim != config_->head_size_) {
+      LOG(INFO) << "Overriding head_size_ from " << config_->head_size_ << " to " << head_dim
+                << " (Qwen3 explicit head_dim)";
+      config_->head_size_ = head_dim;
+      config_->kv_dim_ = config_->kv_head_num_ * head_dim;
+      LOG(INFO) << "Updated kv_dim_=" << config_->kv_dim_;
+    }
     
   } else {
     // Legacy format: config starts at offset 0
@@ -222,10 +252,10 @@ base::Status Model::read_model_file() {
   // Set weight_data pointer based on format
   // Legacy format header size: 7 x int32_t = 28 bytes (without QWEN3_SUPPORT field)
   constexpr size_t kLegacyHeaderSize = 7 * sizeof(int32_t);  // 28 bytes
-  
+
   if (magic == 0x616b3432 || magic == 0x616b3437 || magic == 0x616b3438 || magic == 0x73713438 ||
-      magic == 0x64663136) {
-    // Versioned format: 256 byte header (for ak42, ak47, ak48/AWQ, sq48/SQ, and df16/DFlash)
+      magic == 0x64663136 || magic == 0x66703838) {
+    // Versioned format: 256 byte header (for ak42, ak47, ak48/AWQ, sq48/SQ, df16/DFlash, and fp88/FP8)
     raw_model_data_->weight_data =
         static_cast<int8_t*>(raw_model_data_->data) + 256;
   } else if (!is_quant_model_) {

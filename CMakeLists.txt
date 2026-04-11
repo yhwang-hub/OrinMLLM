@@ -6,6 +6,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_CUDA_COMPILER "/usr/local/cuda/bin/nvcc")
 
 project(llama_infer CXX CUDA)
+set(CMAKE_CUDA_ARCHITECTURES 86)
 include(cmake/cuda.cmake)
 
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
