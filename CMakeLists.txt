@@ -115,7 +115,12 @@ target_include_directories(llama PUBLIC ${glog_INCLUDE_DIR})
 target_include_directories(llama PUBLIC ${PROJECT_SOURCE_DIR}/kuiper/include)
 target_include_directories(llama PUBLIC ${Armadillo_INCLUDE_DIR})
 target_include_directories(llama PUBLIC ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
-target_include_directories(llama PUBLIC ${PROJECT_SOURCE_DIR}/3rdparty/cutlass/include)
+# CUTLASS: use -DCUTLASS_DIR to override
+set(CUTLASS_DIR "${PROJECT_SOURCE_DIR}/3rdparty/cutlass" CACHE PATH "Path to CUTLASS library")
+if(NOT EXISTS "${CUTLASS_DIR}/include/cutlass/cutlass.h")
+  message(FATAL_ERROR "CUTLASS not found at ${CUTLASS_DIR}. Set -DCUTLASS_DIR=/path/to/cutlass")
+endif()
+target_include_directories(llama PUBLIC ${CUTLASS_DIR}/include)
 
 if(USE_CPM)
   # Add sentencepiece include directory
