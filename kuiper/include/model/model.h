@@ -43,6 +43,8 @@ class Model {
 
   bool is_sq_model() const { return is_sq_model_; }
 
+  bool is_fp8_model() const { return is_fp8_model_; }
+
   virtual std::string decode(int32_t token_idx) const;
 
   virtual std::string decode(std::vector<int32_t> token_idxs) const;
@@ -94,6 +96,7 @@ class Model {
   bool is_fp16_model_ = false;  // FP16 model flag (version 3)
   bool is_awq_model_ = false;   // AWQ INT4 model flag (version 5)
   bool is_sq_model_ = false;    // SmoothQuant INT8 model flag (version 6)
+  bool is_fp8_model_ = false;   // FP8 E4M3 block-quantized model flag (version 7)
   std::unique_ptr<TransformerConfig> config_;
 
   std::string token_path_;
