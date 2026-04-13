@@ -11,8 +11,8 @@ OrinMLLM is an inference framework purpose-built for deploying large language mo
 - **Model Export Tools** — A collection of Python scripts to convert HuggingFace-format model weights into the framework's optimized binary format.
 - **Custom GPU Operators** — Hand-tuned CUDA kernels for MHA (Multi-Head Attention), Flash Attention, RMSNorm, GEMM, RoPE, SwiGLU, Fused FFN, and more, all optimized for the Jetson Orin GPU architecture.
 - **Inference Optimizations** — Integration of numerous LLM serving techniques including KV Cache, Prefix Cache (Radix Tree), CUDA Graph capture/replay, operator fusion, streaming output, and multi-turn conversation support.
-- **Broad Model Support** — Currently supports the **Qwen2.5 / Qwen3** families of large language models and the **Qwen3-VL** vision-language multimodal model.
-- **Multiple Quantization Schemes** — Supports FP32, FP16, AWQ, and SmoothQuant data types for flexible deployment under different memory and latency budgets.
+- **Broad Model Support** — Currently supports the **Qwen2.5 / Qwen3 / Qwen3.5** families of large language models and the **Qwen3-VL** vision-language multimodal model.
+- **Multiple Quantization Schemes** — Supports FP32, FP16, FP8, AWQ, SmoothQuant, and DFlash data types for flexible deployment under different memory and latency budgets.
 
 > More model architectures and quantization methods will be supported in future releases.
 
@@ -21,11 +21,12 @@ OrinMLLM is an inference framework purpose-built for deploying large language mo
 
 ## Supported Models
 
-| Model | FP32 | FP16 | AWQ | SmoothQuant |
-|:---|:---:|:---:|:---:|:---:|
-| Qwen2.5-7B | ✅ | ✅ | — | — |
-| Qwen3-8B | — | ✅ | ✅ | ✅ |
-| Qwen3-VL-8B | — | ✅ | — | — |
+| Model | FP32 | FP16 | FP8 | AWQ | SmoothQuant | DFlash |
+|:---|:---:|:---:|:---:|:---:|:---:|:---:|
+| Qwen2.5-7B | ✅ | ✅ | — | — | — | — |
+| Qwen3-8B | — | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Qwen3-VL-8B | — | ✅ | — | — | — | — |
+| Qwen3.5-9B | — | ✅ | — | — | — | — |
 
 > More models and quantization combinations will be added in future updates.
 
@@ -161,7 +162,39 @@ Repeat with the appropriate model name for other models (e.g., `Qwen/Qwen2.5-7B`
 
 ---
 
-### 1. Qwen3-8B FP16
+### 1. Qwen2.5-7B FP32
+
+**Export & Run:**
+
+```bash
+cd OrinMLLM
+python tools/export_qwen2.5-7B.py Qwen2.5-7B.bin --hf Qwen2.5-7B-Instruct
+
+./build/demo/qwen_infer \
+    Qwen2.5-7B.bin \
+    Qwen2.5-7B-Instruct/tokenizer.json \
+    --stream --max-tokens 1024 --prefix-cache --interactive
+```
+
+---
+
+### 2. Qwen2.5-7B FP16
+
+**Export & Run:**
+
+```bash
+cd OrinMLLM
+python tools/export_qwen2.5-7B-fp16.py Qwen2.5-7B-fp16.bin --dtype fp16 --hf Qwen2.5-7B-Instruct
+
+./build/demo/qwen_infer \
+    Qwen2.5-7B-fp16.bin \
+    Qwen2.5-7B-Instruct/tokenizer.json \
+    --stream --max-tokens 1024 --prefix-cache --interactive
+```
+
+---
+
+### 3. Qwen3-8B FP16
 
 **Export & Run:**
 
@@ -177,7 +210,29 @@ python tools/export_qwen3-8B-fp16.py Qwen3-8B-fp16.bin --dtype fp16 --hf Qwen3-8
 
 ---
 
-### 2. Qwen3-8B AWQ
+### 4. Qwen3-8B FP16 DFlash
+
+> **Note:** DFlash is an optimized inference mode that uses a separate DFlash-format weight file alongside the standard FP16 weights.
+
+**Export & Run:**
+
+```bash
+cd OrinMLLM
+
+modelscope download --model z-lab/Qwen3-8B-DFlash-b16 --local_dir ./Qwen3-8B-DFlash-b16
+python tools/export_qwen3-8B-fp16.py Qwen3-8B-fp16.bin --dtype fp16 --hf Qwen3-8B
+python tools/export_qwen3-8B-DFlash-fp16.py Qwen3-8B-DFlash-fp16.bin --dtype fp16 --hf Qwen3-8B-DFlash-b16
+
+./build/demo/qwen3_infer \
+    Qwen3-8B-fp16.bin \
+    Qwen3-8B/tokenizer.json \
+    --stream --max-tokens 1024 --prefix-cache --interactive \
+    --use-dflash Qwen3-8B-DFlash-fp16.bin
+```
+
+---
+
+### 5. Qwen3-8B AWQ
 
 > **Note:** `Qwen3-8B-awq` refers to a HuggingFace-format model that has been pre-quantized with AWQ.
 
@@ -195,7 +250,7 @@ python tools/export_qwen3-8B-awq.py Qwen3-8B-awq.bin --hf Qwen3-8B-awq
 
 ---
 
-### 3. Qwen3-8B SmoothQuant
+### 6. Qwen3-8B SmoothQuant
 
 > **Note:** `Qwen3-8B-sq` refers to a HuggingFace-format model that has been pre-quantized with SmoothQuant.
 
@@ -213,7 +268,23 @@ python tools/export_qwen3-8B-sq.py Qwen3-8B-sq.bin --hf Qwen3-8B-sq
 
 ---
 
-### 4. Qwen3-VL-8B FP16 (Vision-Language)
+### 7. Qwen3-8B FP8
+
+**Export & Run:**
+
+```bash
+cd OrinMLLM
+python tools/export_qwen3-8B-fp8.py Qwen3-8B-fp8.bin --hf Qwen3-8B
+
+./build/demo/qwen3_infer \
+    Qwen3-8B-fp8.bin \
+    Qwen3-8B/tokenizer.json \
+    --stream --max-tokens 1024 --prefix-cache --interactive
+```
+
+---
+
+### 8. Qwen3-VL-8B FP16 (Vision-Language)
 
 **Export & Run:**
 
@@ -224,6 +295,24 @@ python tools/export_qwen3-VL-8B-fp16.py Qwen3-VL-8B-fp16.bin --hf Qwen3-VL-8B-In
 ./build/demo/qwen3_vl_infer \
     Qwen3-VL-8B-fp16.bin \
     Qwen3-VL-8B-Instruct/tokenizer.json \
+    --image hf_infer/demo.jpeg \
+    --prompt "Describe this image." \
+    --cuda-graph --fused-rope-kv --stream --max-pixel 500000
+```
+
+---
+
+### 9. Qwen3.5-9B FP16 (Vision-Language)
+
+**Export & Run:**
+
+```bash
+cd OrinMLLM
+python tools/export_qwen3-5-9B-fp16.py Qwen3.5-9B-fp16.bin --dtype fp16 --hf Qwen3.5-9B
+
+./build/demo/qwen3_5_infer \
+    Qwen3.5-9B-fp16.bin \
+    Qwen3.5-9B/tokenizer.json \
     --image hf_infer/demo.jpeg \
     --prompt "Describe this image." \
     --cuda-graph --stream --max-pixel 500000
