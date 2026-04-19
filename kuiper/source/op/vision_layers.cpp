@@ -2,6 +2,9 @@
 #include "kernels/cuda/vision_encoder_kernel.cuh"
 #include "kernels/cuda/fused_kernels.cuh"
 #include "kernels/cuda/flash_attention_kernel.cuh"
+#include "kernels/cpu/image_preprocess_kernel.h"
+#include <cuda_runtime.h>
+#include <cublas_v2.h>
 
 namespace op {
 
@@ -305,6 +308,22 @@ base::Status FusedNormalizePatchesLayer::forward(const unsigned char* pixels_gpu
   return base::error::Success();
 }
 
+base::Status FusedNormalizePatchesLayer::forward_resize(
+    const unsigned char* src_pixels_gpu, half* patches_gpu,
+    int32_t src_h, int32_t src_w, int32_t dst_h, int32_t dst_w,
+    int32_t patch_size, int32_t temporal_patch_size,
+    float mean_r, float mean_g, float mean_b,
+    float std_r, float std_g, float std_b,
+    cudaStream_t stream) {
+  kernel::fused_resize_normalize_patches_cu(src_pixels_gpu, patches_gpu,
+                                             src_h, src_w, dst_h, dst_w,
+                                             patch_size, temporal_patch_size,
+                                             mean_r, mean_g, mean_b,
+                                             std_r, std_g, std_b,
+                                             stream ? stream : (cuda_config_ ? cuda_config_->stream : nullptr));
+  return base::error::Success();
+}
+
 // ==================== CausalSoftmaxLayer ====================
 
 CausalSoftmaxLayer::CausalSoftmaxLayer(base::DeviceType device_type)
@@ -326,6 +345,271 @@ base::Status CausalSoftmaxLayer::forward(half* scores, int32_t head_num, int32_t
                                           cudaStream_t stream) {
   kernel::causal_softmax_fp16_cu(scores, head_num, seq_len, kv_len, start_pos,
                                   stream ? stream : (cuda_config_ ? cuda_config_->stream : nullptr));
+  return base::error::Success();
+}
+
+// ==================== LoadImageLayer ====================
+
+LoadImageLayer::LoadImageLayer(base::DeviceType device_type)
+    : Layer(device_type, LayerType::kLayerUnknown, "LoadImage") {}
+
+base::Status LoadImageLayer::check() const { return base::error::Success(); }
+base::Status LoadImageLayer::forward() { return base::error::InvalidArgument("Use forward(...) with parameters"); }
+
+base::Status LoadImageLayer::forward(const std::string& path,
+                                      std::vector<uint8_t>& result_pixels,
+                                      int& width, int& height, int& channels) {
+  result_pixels = kernel::load_image_cpu(path, width, height, channels);
+  if (result_pixels.empty()) {
+    return base::error::InternalError("Failed to load image: " + path);
+  }
+  return base::error::Success();
+}
+
+// ==================== SmartResizeLayer ====================
+
+SmartResizeLayer::SmartResizeLayer(base::DeviceType device_type)
+    : Layer(device_type, LayerType::kLayerUnknown, "SmartResize") {}
+
+base::Status SmartResizeLayer::check() const { return base::error::Success(); }
+base::Status SmartResizeLayer::forward() { return base::error::InvalidArgument("Use forward(...) with parameters"); }
+
+base::Status SmartResizeLayer::forward(const std::vector<uint8_t>& pixels,
+                                        int src_width, int src_height,
+                                        int min_pixels, int max_pixels, int factor,
+                                        std::vector<uint8_t>& result_pixels,
+                                        int& new_width, int& new_height) {
+  auto [resized, w, h] = kernel::smart_resize_cpu(pixels, src_width, src_height,
+                                                    min_pixels, max_pixels, factor);
+  result_pixels = std::move(resized);
+  new_width = w;
+  new_height = h;
+  return base::error::Success();
+}
+
+// ==================== VisionRotaryEmbLayer ====================
+
+VisionRotaryEmbLayer::VisionRotaryEmbLayer(base::DeviceType device_type)
+    : Layer(device_type, LayerType::kLayerUnknown, "VisionRotaryEmb") {}
+
+base::Status VisionRotaryEmbLayer::check() const { return base::error::Success(); }
+base::Status VisionRotaryEmbLayer::forward() { return base::error::InvalidArgument("Use forward(...) with parameters"); }
+
+base::Status VisionRotaryEmbLayer::forward(std::vector<uint16_t>& cos_data,
+                                            std::vector<uint16_t>& sin_data,
+                                            int grid_h, int grid_w, int grid_t,
+                                            int num_heads, int hidden_size, int spatial_merge_size) {
+  kernel::compute_vision_rotary_emb_cpu(cos_data, sin_data, grid_h, grid_w, grid_t,
+                                         num_heads, hidden_size, spatial_merge_size);
+  return base::error::Success();
+}
+
+// ==================== GenerateMRoPEPositionsLayer ====================
+
+GenerateMRoPEPositionsLayer::GenerateMRoPEPositionsLayer(base::DeviceType device_type)
+    : Layer(device_type, LayerType::kLayerUnknown, "GenerateMRoPEPositions") {}
+
+GenerateMRoPEPositionsLayer::~GenerateMRoPEPositionsLayer() {
+  if (mrope_pos_gpu_) {
+    cudaFree(mrope_pos_gpu_);
+    mrope_pos_gpu_ = nullptr;
+  }
+  if (mrope_pos_pinned_) {
+    cudaFreeHost(mrope_pos_pinned_);
+    mrope_pos_pinned_ = nullptr;
+  }
+}
+
+base::Status GenerateMRoPEPositionsLayer::check() const { return base::error::Success(); }
+base::Status GenerateMRoPEPositionsLayer::forward() { return base::error::InvalidArgument("Use forward(...) with parameters"); }
+
+base::Status GenerateMRoPEPositionsLayer::forward(
+    const std::vector<int>& tokens,
+    int image_token_pos, int num_vision_tokens,
+    int grid_h, int grid_w,
+    std::vector<int32_t>& mrope_pos_t,
+    std::vector<int32_t>& mrope_pos_h,
+    std::vector<int32_t>& mrope_pos_w,
+    int& max_text_pos,
+    int32_t*& pos_t_gpu, int32_t*& pos_h_gpu, int32_t*& pos_w_gpu,
+    cudaStream_t stream) {
+  
+  // Step 1: Generate positions on CPU
+  max_text_pos = kernel::generate_mrope_positions_cpu(
+      mrope_pos_t, mrope_pos_h, mrope_pos_w,
+      tokens, image_token_pos, num_vision_tokens, grid_h, grid_w);
+  
+  // Step 2: Upload to GPU (fused from upload_mrope_positions_to_gpu)
+  size_t total_positions = mrope_pos_t.size();
+  if (total_positions == 0) {
+    pos_t_gpu = pos_h_gpu = pos_w_gpu = nullptr;
+    return base::error::Success();
+  }
+  
+  // Grow GPU allocation if needed
+  if (total_positions > mrope_pos_gpu_capacity_) {
+    if (mrope_pos_gpu_) cudaFree(mrope_pos_gpu_);
+    cudaMalloc(&mrope_pos_gpu_, 3 * total_positions * sizeof(int32_t));
+    mrope_pos_gpu_capacity_ = total_positions;
+    
+    if (total_positions > mrope_pos_pinned_capacity_) {
+      if (mrope_pos_pinned_) cudaFreeHost(mrope_pos_pinned_);
+      cudaMallocHost(&mrope_pos_pinned_, 3 * total_positions * sizeof(int32_t));
+      mrope_pos_pinned_capacity_ = total_positions;
+    }
+  }
+  
+  // Pack into contiguous pinned memory
+  int32_t* pinned_t = mrope_pos_pinned_;
+  int32_t* pinned_h = mrope_pos_pinned_ + total_positions;
+  int32_t* pinned_w = mrope_pos_pinned_ + 2 * total_positions;
+  memcpy(pinned_t, mrope_pos_t.data(), total_positions * sizeof(int32_t));
+  memcpy(pinned_h, mrope_pos_h.data(), total_positions * sizeof(int32_t));
+  memcpy(pinned_w, mrope_pos_w.data(), total_positions * sizeof(int32_t));
+  
+  // Single async H2D transfer
+  cudaMemcpyAsync(mrope_pos_gpu_, mrope_pos_pinned_,
+                  3 * total_positions * sizeof(int32_t), cudaMemcpyHostToDevice,
+                  stream);
+  
+  // Set output pointers
+  pos_t_gpu = mrope_pos_gpu_;
+  pos_h_gpu = mrope_pos_gpu_ + total_positions;
+  pos_w_gpu = mrope_pos_gpu_ + 2 * total_positions;
+  
+  return base::error::Success();
+}
+
+base::Status GenerateMRoPEPositionsLayer::upload(
+    const std::vector<int32_t>& mrope_pos_t,
+    const std::vector<int32_t>& mrope_pos_h,
+    const std::vector<int32_t>& mrope_pos_w,
+    int32_t*& pos_t_gpu, int32_t*& pos_h_gpu, int32_t*& pos_w_gpu,
+    cudaStream_t stream) {
+  size_t total_positions = mrope_pos_t.size();
+  if (total_positions == 0) {
+    pos_t_gpu = pos_h_gpu = pos_w_gpu = nullptr;
+    return base::error::Success();
+  }
+  if (total_positions > mrope_pos_gpu_capacity_) {
+    if (mrope_pos_gpu_) cudaFree(mrope_pos_gpu_);
+    cudaMalloc(&mrope_pos_gpu_, 3 * total_positions * sizeof(int32_t));
+    mrope_pos_gpu_capacity_ = total_positions;
+    if (total_positions > mrope_pos_pinned_capacity_) {
+      if (mrope_pos_pinned_) cudaFreeHost(mrope_pos_pinned_);
+      cudaMallocHost(&mrope_pos_pinned_, 3 * total_positions * sizeof(int32_t));
+      mrope_pos_pinned_capacity_ = total_positions;
+    }
+  }
+  int32_t* pinned_t = mrope_pos_pinned_;
+  int32_t* pinned_h = mrope_pos_pinned_ + total_positions;
+  int32_t* pinned_w = mrope_pos_pinned_ + 2 * total_positions;
+  memcpy(pinned_t, mrope_pos_t.data(), total_positions * sizeof(int32_t));
+  memcpy(pinned_h, mrope_pos_h.data(), total_positions * sizeof(int32_t));
+  memcpy(pinned_w, mrope_pos_w.data(), total_positions * sizeof(int32_t));
+  cudaMemcpyAsync(mrope_pos_gpu_, mrope_pos_pinned_,
+                  3 * total_positions * sizeof(int32_t), cudaMemcpyHostToDevice, stream);
+  pos_t_gpu = mrope_pos_gpu_;
+  pos_h_gpu = mrope_pos_gpu_ + total_positions;
+  pos_w_gpu = mrope_pos_gpu_ + 2 * total_positions;
+  return base::error::Success();
+}
+
+// ==================== VisionPatchEmbedLayer ====================
+
+VisionPatchEmbedLayer::VisionPatchEmbedLayer(base::DeviceType device_type)
+    : Layer(device_type, LayerType::kLayerUnknown, "VisionPatchEmbed") {}
+
+base::Status VisionPatchEmbedLayer::check() const { return base::error::Success(); }
+base::Status VisionPatchEmbedLayer::forward() { return base::error::InvalidArgument("Use forward(...) with parameters"); }
+
+base::Status VisionPatchEmbedLayer::forward(const tensor::Tensor& pixel_values,
+                                             const tensor::Tensor& weight,
+                                             const tensor::Tensor& bias,
+                                             tensor::Tensor& output,
+                                             int num_patches, int hidden_size, int patch_dim,
+                                             kernel::CudaConfig* cuda_config) {
+  if (!cuda_config) cuda_config = cuda_config_.get();
+  
+  // GEMM: output = pixel_values @ weight^T + bias
+  const half alpha = __float2half(1.0f);
+  const half beta = __float2half(0.0f);
+  
+  cublasHgemm(cuda_config->cublas_handle,
+              CUBLAS_OP_T, CUBLAS_OP_N,
+              hidden_size, num_patches, patch_dim,
+              &alpha,
+              weight.ptr<half>(), patch_dim,
+              pixel_values.ptr<half>(), patch_dim,
+              &beta,
+              output.ptr<half>(), hidden_size);
+  
+  // Add bias
+  kernel::bias_add_residual_cu(output, bias, tensor::Tensor(), output,
+                               cuda_config->stream);
+  
+  return base::error::Success();
+}
+
+// ==================== BatchedGemmLayer ====================
+
+BatchedGemmLayer::BatchedGemmLayer(base::DeviceType device_type)
+    : Layer(device_type, LayerType::kLayerUnknown, "BatchedGemm") {}
+
+base::Status BatchedGemmLayer::check() const { return base::error::Success(); }
+base::Status BatchedGemmLayer::forward() { return base::error::InvalidArgument("Use forward(...) with parameters"); }
+
+base::Status BatchedGemmLayer::forward(const half* A, const half* B, half* C,
+                                        int M, int N, int K,
+                                        bool trans_a, bool trans_b,
+                                        float alpha_f, float beta_f,
+                                        int lda, int ldb, int ldc,
+                                        kernel::CudaConfig* cuda_config) {
+  if (!cuda_config) cuda_config = cuda_config_.get();
+  
+  const half alpha = __float2half(alpha_f);
+  const half beta = __float2half(beta_f);
+  
+  cublasOperation_t op_a = trans_a ? CUBLAS_OP_T : CUBLAS_OP_N;
+  cublasOperation_t op_b = trans_b ? CUBLAS_OP_T : CUBLAS_OP_N;
+  
+  cublasHgemm(cuda_config->cublas_handle,
+              op_a, op_b,
+              M, N, K,
+              &alpha,
+              A, lda,
+              B, ldb,
+              &beta,
+              C, ldc);
+  
+  return base::error::Success();
+}
+
+base::Status BatchedGemmLayer::forward_batched(const half** A_array, const half** B_array, half** C_array,
+                                                int M, int N, int K,
+                                                bool trans_a, bool trans_b,
+                                                float alpha_f, float beta_f,
+                                                int lda, int ldb, int ldc,
+                                                int batch_count,
+                                                kernel::CudaConfig* cuda_config) {
+  if (!cuda_config) cuda_config = cuda_config_.get();
+  
+  const half alpha = __float2half(alpha_f);
+  const half beta = __float2half(beta_f);
+  
+  cublasOperation_t op_a = trans_a ? CUBLAS_OP_T : CUBLAS_OP_N;
+  cublasOperation_t op_b = trans_b ? CUBLAS_OP_T : CUBLAS_OP_N;
+  
+  cublasHgemmBatched(cuda_config->cublas_handle,
+                     op_a, op_b,
+                     M, N, K,
+                     &alpha,
+                     A_array, lda,
+                     B_array, ldb,
+                     &beta,
+                     C_array, ldc,
+                     batch_count);
+  
   return base::error::Success();
 }
 

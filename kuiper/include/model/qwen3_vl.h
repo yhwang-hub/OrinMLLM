@@ -192,6 +192,13 @@ struct VisionVLLayers {
   std::shared_ptr<op::FusedMultimodalEmbedLayer> fused_multimodal_embed_layer_;
   std::shared_ptr<op::FusedNormalizePatchesLayer> fused_normalize_patches_layer_;
   std::shared_ptr<op::CausalSoftmaxLayer> causal_softmax_layer_;
+  // New layers for refactored code
+  std::shared_ptr<op::LoadImageLayer> load_image_layer_;
+  std::shared_ptr<op::SmartResizeLayer> smart_resize_layer_;
+  std::shared_ptr<op::VisionRotaryEmbLayer> vision_rotary_emb_layer_;
+  std::shared_ptr<op::GenerateMRoPEPositionsLayer> generate_mrope_positions_layer_;
+  std::shared_ptr<op::VisionPatchEmbedLayer> vision_patch_embed_layer_;
+  std::shared_ptr<op::BatchedGemmLayer> batched_gemm_layer_;
 };
 
 /**
@@ -314,15 +321,9 @@ private:
   void create_vl_nonparam_layers();
   void create_vision_nonparam_layers();
   
-  // Sub-function for prepare_multimodal_embeddings (M-RoPE position generation)
-  void generate_mrope_positions(const std::vector<int>& tokens,
-                                int image_token_pos, int num_vision_tokens,
-                                int grid_h, int grid_w) const;
-
 protected:
   // Sub-functions for prefill (split for readability)
   void create_nonparam_layers() override;
-  void upload_mrope_positions_to_gpu() const;
 
 private:
   
@@ -416,17 +417,10 @@ protected:
   mutable std::vector<int32_t> mrope_pos_w_;  // Width positions
   mutable int mrope_max_text_pos_ = 0;        // Track max text position for decode
   
-  // GPU-resident M-RoPE position arrays for batched kernel
-  // OPTIMIZED: Use single contiguous allocation for all 3 arrays
-  mutable int32_t* mrope_pos_gpu_ = nullptr;  // Contiguous: [t, h, w] interleaved
-  mutable int32_t* mrope_pos_t_gpu_ = nullptr;  // Points into mrope_pos_gpu_
+  // GPU-resident M-RoPE position pointers (managed by GenerateMRoPEPositionsLayer)
+  mutable int32_t* mrope_pos_t_gpu_ = nullptr;
   mutable int32_t* mrope_pos_h_gpu_ = nullptr;
   mutable int32_t* mrope_pos_w_gpu_ = nullptr;
-  mutable size_t mrope_pos_gpu_capacity_ = 0;  // Allocated capacity per array
-  
-  // Pinned host memory for M-RoPE positions (async transfer)
-  mutable int32_t* mrope_pos_pinned_ = nullptr;
-  mutable size_t mrope_pos_pinned_capacity_ = 0;
   
   // Prefill sequence length (for decode position calculation)
   mutable int prefill_seq_len_ = 0;
@@ -440,43 +434,6 @@ protected:
   size_t vl_model_file_size_ = 0;
   int vl_model_fd_ = -1;
 };
-
-/**
- * @brief Image preprocessing utilities
- */
-namespace image_utils {
-
-/**
- * @brief Load image from file path
- * @param path Image file path
- * @param width Output image width
- * @param height Output image height
- * @param channels Output channels (should be 3 for RGB)
- * @return Raw pixel data (HWC format, uint8)
- */
-std::vector<uint8_t> load_image(const std::string& path, 
-                                 int& width, int& height, int& channels);
-
-/**
- * @brief Smart resize for Qwen3-VL
- * Resize image to match patch_size * merge_size requirements
- * 
- * @param pixels Input pixels
- * @param src_width Source width
- * @param src_height Source height
- * @param min_pixels Minimum total pixels (default: 256*28*28 = 200704)
- * @param max_pixels Maximum total pixels (default: 1280*28*28 = 1003520)
- * @param factor Must be divisible by (patch_size * merge_size = 16*2 = 32)
- * @return Resized pixels and new dimensions
- */
-std::tuple<std::vector<uint8_t>, int, int> smart_resize(
-    const std::vector<uint8_t>& pixels,
-    int src_width, int src_height,
-    int min_pixels = 200704,
-    int max_pixels = 1003520,
-    int factor = 32);
-
-} // namespace image_utils
 
 }  // namespace model
 

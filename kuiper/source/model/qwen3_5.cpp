@@ -1305,7 +1305,10 @@ base::Status Qwen35Model::prefill(const tensor::Tensor& input_embeddings,
     }
     mrope_max_text_pos_ = seq_len - 1;
   }
-  upload_mrope_positions_to_gpu();
+  vision_vl_layers_.generate_mrope_positions_layer_->upload(
+      mrope_pos_t_, mrope_pos_h_, mrope_pos_w_,
+      mrope_pos_t_gpu_, mrope_pos_h_gpu_, mrope_pos_w_gpu_,
+      cuda_config_->stream);
 
   auto alloc = base::CUDADeviceAllocatorFactory::get_instance();
   auto act = DataType::kDataTypeFp16;

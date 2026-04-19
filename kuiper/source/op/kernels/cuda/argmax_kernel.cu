@@ -104,7 +104,148 @@ void argmax_kernel_cu_prealloc(const float* input_ptr, size_t size,
   }
 }
 
-// Batched FP16 argmax kernel: one block per row
+// ---------------------------------------------------------------------------
+// 9.8 optimization: fast two-stage argmax over large vocab (e.g. 151936).
+// Original single-block argmax_kernel_fp32 underutilizes the GPU (~253us/call
+// with <<<1, 512>>> on Jetson Orin).  This version uses multi-block parallel
+// reduction to a small partials array, then a final reduction block.
+// ---------------------------------------------------------------------------
+namespace {
+constexpr int kArgmaxStage1Blocks = 32;
+constexpr int kArgmaxStage1Threads = 256;
+
+__global__ void argmax_stage1_fp32_kernel(const float* __restrict__ input,
+                                          size_t size,
+                                          float* __restrict__ partial_vals,
+                                          size_t* __restrict__ partial_idxs) {
+  const int tid = threadIdx.x;
+  const int bid = blockIdx.x;
+  const size_t gtid = static_cast<size_t>(bid) * blockDim.x + tid;
+  const size_t gstride = static_cast<size_t>(gridDim.x) * blockDim.x;
+
+  float best_val = -FLT_MAX;
+  size_t best_idx = SIZE_MAX;
+  for (size_t i = gtid; i < size; i += gstride) {
+    float v = input[i];
+    if (v > best_val || (v == best_val && i < best_idx)) {
+      best_val = v;
+      best_idx = i;
+    }
+  }
+
+  __shared__ float s_val[32];
+  __shared__ size_t s_idx[32];
+  const int lane = tid & 31;
+  const int wid  = tid >> 5;
+
+  // Warp reduce
+  #pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    float v_other   = __shfl_down_sync(0xFFFFFFFF, best_val, offset);
+    size_t i_other  = __shfl_down_sync(0xFFFFFFFF, best_idx, offset);
+    if (v_other > best_val || (v_other == best_val && i_other < best_idx)) {
+      best_val = v_other;
+      best_idx = i_other;
+    }
+  }
+  if (lane == 0) { s_val[wid] = best_val; s_idx[wid] = best_idx; }
+  __syncthreads();
+
+  const int num_warps = blockDim.x / 32;
+  if (wid == 0) {
+    if (tid < num_warps) {
+      best_val = s_val[tid];
+      best_idx = s_idx[tid];
+    } else {
+      best_val = -FLT_MAX;
+      best_idx = SIZE_MAX;
+    }
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      float v_other  = __shfl_down_sync(0xFFFFFFFF, best_val, offset);
+      size_t i_other = __shfl_down_sync(0xFFFFFFFF, best_idx, offset);
+      if (v_other > best_val || (v_other == best_val && i_other < best_idx)) {
+        best_val = v_other;
+        best_idx = i_other;
+      }
+    }
+    if (tid == 0) {
+      partial_vals[bid] = best_val;
+      partial_idxs[bid] = best_idx;
+    }
+  }
+}
+
+__global__ void argmax_stage2_fp32_kernel(const float* __restrict__ partial_vals,
+                                          const size_t* __restrict__ partial_idxs,
+                                          int num_partials,
+                                          size_t* __restrict__ output_idx) {
+  const int tid = threadIdx.x;
+  float best_val = -FLT_MAX;
+  size_t best_idx = SIZE_MAX;
+  if (tid < num_partials) {
+    best_val = partial_vals[tid];
+    best_idx = partial_idxs[tid];
+  }
+  #pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    float v_other  = __shfl_down_sync(0xFFFFFFFF, best_val, offset);
+    size_t i_other = __shfl_down_sync(0xFFFFFFFF, best_idx, offset);
+    if (v_other > best_val || (v_other == best_val && i_other < best_idx)) {
+      best_val = v_other;
+      best_idx = i_other;
+    }
+  }
+  if (tid == 0) *output_idx = best_idx;
+}
+
+// Persistent scratch for the two-stage argmax (one per process, small).
+struct ArgmaxScratch {
+  float*  partial_vals = nullptr;
+  size_t* partial_idxs = nullptr;
+  int capacity = 0;
+};
+static ArgmaxScratch g_argmax_scratch;
+
+void ensure_argmax_scratch(int num_partials) {
+  if (g_argmax_scratch.capacity >= num_partials) return;
+  if (g_argmax_scratch.partial_vals) cudaFree(g_argmax_scratch.partial_vals);
+  if (g_argmax_scratch.partial_idxs) cudaFree(g_argmax_scratch.partial_idxs);
+  cudaMalloc(&g_argmax_scratch.partial_vals, num_partials * sizeof(float));
+  cudaMalloc(&g_argmax_scratch.partial_idxs, num_partials * sizeof(size_t));
+  g_argmax_scratch.capacity = num_partials;
+}
+}  // anonymous namespace
+
+void argmax_fp32_fast_cu(const float* input_ptr, size_t size,
+                         size_t* output_gpu, size_t* output_pinned,
+                         void* stream) {
+  cudaStream_t s = stream ? static_cast<cudaStream_t>(stream) : nullptr;
+  // Size threshold: only use two-stage for large vocab.  Below this, a single
+  // block is already fast enough.
+  const int num_blocks = (size >= 32 * 1024)
+                        ? kArgmaxStage1Blocks
+                        : 1;
+  if (num_blocks == 1) {
+    argmax_kernel_fp32<<<1, 512, 0, s>>>(input_ptr, size, output_gpu);
+  } else {
+    ensure_argmax_scratch(num_blocks);
+    argmax_stage1_fp32_kernel<<<num_blocks, kArgmaxStage1Threads, 0, s>>>(
+        input_ptr, size,
+        g_argmax_scratch.partial_vals,
+        g_argmax_scratch.partial_idxs);
+    // Stage 2: final reduction in a single warp.  num_blocks must be <= 32.
+    argmax_stage2_fp32_kernel<<<1, 32, 0, s>>>(
+        g_argmax_scratch.partial_vals,
+        g_argmax_scratch.partial_idxs,
+        num_blocks,
+        output_gpu);
+  }
+  cudaMemcpyAsync(output_pinned, output_gpu, sizeof(size_t),
+                  cudaMemcpyDeviceToHost, s);
+}
+
+
 // Input: [batch, row_size] FP16, Output: [batch] int32
 __global__ void batched_argmax_fp16_kernel(
     const half* __restrict__ input,   // [batch, row_size]

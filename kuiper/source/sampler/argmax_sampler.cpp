@@ -15,7 +15,8 @@ size_t ArgmaxSampler::sample(const float* logits, size_t size, void* stream) {
 void ArgmaxSampler::sample_prealloc(const float* logits, size_t size,
                                      size_t* output_gpu, size_t* output_pinned, void* stream) {
   if (device_type_ == base::DeviceType::kDeviceCUDA) {
-    kernel::argmax_kernel_cu_prealloc(logits, size, output_gpu, output_pinned, stream);
+    // 9.8 optimization: use fast two-stage argmax for large vocab.
+    kernel::argmax_fp32_fast_cu(logits, size, output_gpu, output_pinned, stream);
   }
 }
 }  // namespace sampler
