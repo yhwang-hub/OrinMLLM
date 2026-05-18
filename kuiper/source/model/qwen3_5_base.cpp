@@ -764,6 +764,9 @@ void Qwen35Model::clear_all_state() {
     cudaMemset(s.conv_state.ptr<void>(), 0, s.conv_state.byte_size());
     cudaMemset(s.ssm_state.ptr<void>(), 0, s.ssm_state.byte_size());
   }
+
+  // KV/GDN states changed; any existing decode graph is stale.
+  invalidate_cuda_graph();
 }
 
 }  // namespace model

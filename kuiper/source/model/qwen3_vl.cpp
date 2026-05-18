@@ -1015,6 +1015,9 @@ void Qwen3VLModel::clear_kv_cache() {
     cudaMemsetAsync(const_cast<void*>(value_cache.get_buffer()->ptr()), 0,
                     value_cache.size() * sizeof(uint16_t), cuda_config_->stream);
     cudaStreamSynchronize(cuda_config_->stream);
+
+    // KV cache state changed; decode graph must be recaptured before reuse.
+    invalidate_cuda_graph();
   }
 }
 

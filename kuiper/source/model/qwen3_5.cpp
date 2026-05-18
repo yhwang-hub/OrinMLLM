@@ -361,7 +361,7 @@ void Qwen35Model::q35_cls_logits(const tensor::Tensor& input) const {
 base::Status Qwen35Model::decode_step_optimized(int32_t pos, int& next) const {
   auto stream = cuda_config_->stream;
   int n_layers = q35_config_.num_hidden_layers;
-  bool use_graph = cuda_config_ && cuda_config_->use_cuda_graph;
+  bool use_graph = cuda_config_ && cuda_config_->should_use_graph();
 
   tensor::Tensor decode_input = get_buffer(ModelBufferType::kDecodeInput);
 
