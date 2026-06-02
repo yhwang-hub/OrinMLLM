@@ -43,7 +43,7 @@ void DeviceAllocator::memcpy(const void* src_ptr, void* dest_ptr, size_t byte_si
 }
 
 void DeviceAllocator::memset_zero(void* ptr, size_t byte_size, void* stream,
-                                  bool need_sync) {
+                                  bool need_sync) const {
     CHECK(device_type_ != common::DeviceType::kDeviceUnknown);
     if (device_type_ == common::DeviceType::kDeviceCPU) {
         std::memset(ptr, 0, byte_size);

@@ -2,12 +2,14 @@
 
 namespace memory {
 
-CUDADeviceAllocator::CUDADeviceAllocator() : DeviceAllocator(common::DeviceType::kDeviceCUDA) {}
+CUDADeviceAllocator::CUDADeviceAllocator()
+    : DeviceAllocator(common::DeviceType::kDeviceCUDA, common::MemoryType::kMemoryCUDA) {}
 
 void* CUDADeviceAllocator::allocate(size_t byte_size) const {
     if (!byte_size) {
         return nullptr;
     }
+    std::lock_guard<std::mutex> lock(mutex_);
     int id = -1;
     cudaError_t state = cudaGetDevice(&id);
     CHECK(state == cudaSuccess);
@@ -76,6 +78,7 @@ void CUDADeviceAllocator::release(void* ptr) const {
     if (!ptr) {
         return;
     }
+    std::lock_guard<std::mutex> lock(mutex_);
     if (cuda_buffers_map_.empty()) {
         return;
     }
@@ -121,5 +124,33 @@ void CUDADeviceAllocator::release(void* ptr) const {
     CHECK(state == cudaSuccess) << "Error: CUDA error when release memory on device";
 }
 std::shared_ptr<CUDADeviceAllocator> CUDADeviceAllocatorFactory::instance = nullptr;
+
+CUDAZeroCopyAllocator::CUDAZeroCopyAllocator()
+    : DeviceAllocator(common::DeviceType::kDeviceCUDA, common::MemoryType::kMemoryCUDAZeroCopy) {}
+
+void* CUDAZeroCopyAllocator::allocate(size_t byte_size) const {
+    if (!byte_size) {
+        return nullptr;
+    }
+    void* ptr = nullptr;
+    // Unified (managed) memory: a single pointer addressable by both host and device.
+    // On integrated platforms such as Jetson Orin host and device share the same physical
+    // DRAM, so managed memory avoids explicit H2D/D2H copies entirely (true zero-copy).
+    cudaError_t state = cudaMallocManaged(&ptr, byte_size);
+    if (state != cudaSuccess) {
+        LOG(ERROR) << "Failed to allocate unified/zero-copy memory: "
+                   << cudaGetErrorString(state);
+        return nullptr;
+    }
+    return ptr;
+}
+
+void CUDAZeroCopyAllocator::release(void* ptr) const {
+    if (ptr) {
+        cudaFree(ptr);
+    }
+}
+
+std::shared_ptr<CUDAZeroCopyAllocator> CUDAZeroCopyAllocatorFactory::instance = nullptr;
 
 }

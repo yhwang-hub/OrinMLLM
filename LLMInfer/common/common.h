@@ -126,6 +126,14 @@ inline size_t DataTypeSize(DataType data_type) {
     }
 }
 
+class NoCopyable {
+protected:
+    NoCopyable() = default;
+    ~NoCopyable() = default;
+    NoCopyable(const NoCopyable&) = delete;
+    NoCopyable& operator=(const NoCopyable&) = delete;
+};
+
 class Status {
 public:
     Status(StatusCode code = StatusCode::kSuccess, std::string err_message = "");

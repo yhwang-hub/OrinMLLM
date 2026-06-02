@@ -2,7 +2,8 @@
 
 namespace memory {
 
-CPUDeviceAllocator::CPUDeviceAllocator() : DeviceAllocator(common::DeviceType::kDeviceCPU) {}
+CPUDeviceAllocator::CPUDeviceAllocator()
+    : DeviceAllocator(common::DeviceType::kDeviceCPU, common::MemoryType::kMemoryCPU) {}
 
 void* CPUDeviceAllocator::allocate(size_t byte_size) const {
     if (!byte_size) {
@@ -19,7 +20,8 @@ void CPUDeviceAllocator::release(void* ptr) const {
     }
 }
 
-CPUPinnedAllocator::CPUPinnedAllocator() : DeviceAllocator(common::DeviceType::kDeviceCPU) {}
+CPUPinnedAllocator::CPUPinnedAllocator()
+    : DeviceAllocator(common::DeviceType::kDeviceCPU, common::MemoryType::kMemoryCPUPinned) {}
 
 void* CPUPinnedAllocator::allocate(size_t byte_size) const {
     if (!byte_size) {

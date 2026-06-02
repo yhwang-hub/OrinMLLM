@@ -2,6 +2,8 @@
 
 #include <map>
 #include <memory>
+#include <mutex>
+#include <vector>
 #include <cuda_runtime_api.h>
 #include <cstdlib>
 #include "common.h"
@@ -10,8 +12,12 @@ namespace memory {
 
 class DeviceAllocator {
 public:
-    explicit DeviceAllocator(common::DeviceType device_type) : device_type_(device_type) {}
+    explicit DeviceAllocator(common::DeviceType device_type,
+                             common::MemoryType memory_type = common::MemoryType::kMemoryUnknown)
+        : device_type_(device_type), memory_type_(memory_type) {}
+    virtual ~DeviceAllocator() = default;
     virtual common::DeviceType device_type() const { return device_type_; }
+    virtual common::MemoryType memory_type() const { return memory_type_; }
     virtual void release(void* ptr) const = 0;
     virtual void* allocate(size_t byte_size) const = 0;
     virtual void memcpy(const void* src_ptr, void* dest_ptr, size_t byte_size,
@@ -21,6 +27,7 @@ public:
 
 private:
     common::DeviceType device_type_ = common::DeviceType::kDeviceUnknown;
+    common::MemoryType memory_type_ = common::MemoryType::kMemoryUnknown;
 };
 
 struct CudaMemoryBuffer {
@@ -40,9 +47,10 @@ public:
     void release(void* ptr) const override;
 
 private:
+    mutable std::mutex mutex_;
     mutable std::map<int, size_t> no_busy_cnt_;
     mutable std::map<int, std::vector<CudaMemoryBuffer>> big_buffers_map_;
-    mutable std::map<int, std::vector<CudaMemoryBuffer>> small_buffers_map_;
+    mutable std::map<int, std::vector<CudaMemoryBuffer>> cuda_buffers_map_;
 };
 
 class CPUDeviceAllocator : public DeviceAllocator {
@@ -66,30 +74,58 @@ public:
     void release(void* ptr) const override;
 };
 
+// Process-wide singleton factories. The allocators keep a memory pool, so they must
+// be shared across every Buffer/Tensor that talks to the same device.
 class CPUDeviceAllocatorFactory {
 public:
-    static std::shared_ptr<CPUDeviceAllocator> create() {
-        if (instance_ == nullptr) {
-            instance_ = std::make_shared<CPUDeviceAllocator>();
+    static std::shared_ptr<CPUDeviceAllocator> get_instance() {
+        if (instance == nullptr) {
+            instance = std::make_shared<CPUDeviceAllocator>();
         }
-        return instance_;
+        return instance;
     }
 
 private:
-    static std::shared_ptr<CPUDeviceAllocator> instance_;
+    static std::shared_ptr<CPUDeviceAllocator> instance;
+};
+
+class CPUPinnedAllocatorFactory {
+public:
+    static std::shared_ptr<CPUPinnedAllocator> get_instance() {
+        if (instance == nullptr) {
+            instance = std::make_shared<CPUPinnedAllocator>();
+        }
+        return instance;
+    }
+
+private:
+    static std::shared_ptr<CPUPinnedAllocator> instance;
 };
 
 class CUDADeviceAllocatorFactory {
 public:
-    static std::shared_ptr<CUDADeviceAllocator> create() {
-        if (instance_ == nullptr) {
-            instance_ = std::make_shared<CUDADeviceAllocator>();
+    static std::shared_ptr<CUDADeviceAllocator> get_instance() {
+        if (instance == nullptr) {
+            instance = std::make_shared<CUDADeviceAllocator>();
         }
-        return instance_;
+        return instance;
     }
 
 private:
-    static std::shared_ptr<CUDADeviceAllocator> instance_;
+    static std::shared_ptr<CUDADeviceAllocator> instance;
+};
+
+class CUDAZeroCopyAllocatorFactory {
+public:
+    static std::shared_ptr<CUDAZeroCopyAllocator> get_instance() {
+        if (instance == nullptr) {
+            instance = std::make_shared<CUDAZeroCopyAllocator>();
+        }
+        return instance;
+    }
+
+private:
+    static std::shared_ptr<CUDAZeroCopyAllocator> instance;
 };
 
 }
